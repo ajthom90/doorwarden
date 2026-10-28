@@ -122,3 +122,13 @@ func TestConfigCaps(t *testing.T) {
 		t.Fatal("missing")
 	}
 }
+
+func TestNewRejectsUnknownKeys(t *testing.T) {
+	reg(t, "t-req", factory(dns.Capabilities{}), dns.ConfigSchema{Fields: []dns.Field{
+		{Name: "api_token", Secret: true, Required: true}, {Name: "opt"},
+	}}, dns.Capabilities{})
+	_, err := dns.New("t-req", map[string]any{"api_token": "ref", "opt": "x", "wildcrd": true}, nil)
+	if err == nil || !strings.Contains(err.Error(), `"wildcrd"`) || !strings.Contains(err.Error(), "valid fields: api_token, opt") {
+		t.Fatalf("err = %v", err)
+	}
+}

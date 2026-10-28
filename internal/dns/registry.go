@@ -52,13 +52,32 @@ func Register(typ string, f Factory, schema ConfigSchema, caps Capabilities) {
 	registry[typ] = entry{f, schema, caps}
 }
 
-// New constructs a provider of the given type, checking required fields first.
+// New constructs a provider of the given type. Unknown config keys are
+// rejected (a typo must not silently change behaviour), then required fields
+// are checked. Every key a provider honours must be declared in its schema.
 func New(typ string, cfg map[string]any, sr SecretResolver) (Provider, error) {
 	mu.RLock()
 	e, ok := registry[typ]
 	mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("dns: unknown provider type %q (known types: %s)", typ, strings.Join(Types(), ", "))
+	}
+	valid := make([]string, 0, len(e.schema.Fields))
+	known := make(map[string]bool, len(e.schema.Fields))
+	for _, f := range e.schema.Fields {
+		valid = append(valid, f.Name)
+		known[f.Name] = true
+	}
+	sort.Strings(valid)
+	keys := make([]string, 0, len(cfg))
+	for k := range cfg {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if !known[k] {
+			return nil, fmt.Errorf("dns: provider type %q: unknown config field %q (valid fields: %s)", typ, k, strings.Join(valid, ", "))
+		}
 	}
 	for _, f := range e.schema.Fields {
 		if !f.Required {
