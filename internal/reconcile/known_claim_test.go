@@ -34,21 +34,27 @@ func renderWinners(routes []store.Route) (winner map[string]string, count map[st
 	return winner, count
 }
 
-// assertRendererAgrees checks, after a cycle was applied, that every hostname
-// has exactly one row and that the renderer's pick is the service Plan routed
-// there (a Published RouteWrite) or, when Plan routed nobody, the row that
-// Plan left serving.
-func assertRendererAgrees(t *testing.T, e *e2e, acts []Action) {
+// assertRendererAgrees checks, after a cycle was applied, that every
+// hostname has exactly one row and that, for EVERY hostname Plan resolved,
+// the renderer's pick equals Plan's winner whenever the winner has a
+// persisted row at that hostname. e.cycle calls it after every cycle unless
+// e.crashWindow is set.
+func assertRendererAgrees(t *testing.T, e *e2e) {
 	t.Helper()
-	w, n := renderWinners(listRoutes(t, e.st))
+	rows := listRoutes(t, e.st)
+	w, n := renderWinners(rows)
 	for h, c := range n {
-		if c != 1 {
-			t.Fatalf("hostname %s has %d rows: %+v", h, c, listRoutes(t, e.st))
+		if c != 1 && !e.crashWindow {
+			t.Fatalf("hostname %s has %d rows: %+v", h, c, rows)
 		}
 	}
-	for _, a := range ofKind(acts, RouteWrite) {
-		if a.Svc != nil && a.Svc.State == model.StatePublished && w[a.Host] != a.Key {
-			t.Fatalf("plan routed %s to %s, renderer picks %q", a.Host, a.Key, w[a.Host])
+	byKey := map[string]store.Route{}
+	for _, r := range rows {
+		byKey[r.Key] = r
+	}
+	for h, pw := range e.winners {
+		if r, ok := byKey[pw.key]; ok && r.Hostname == h && w[h] != pw.key {
+			t.Fatalf("plan winner for %s is %s, renderer picks %q", h, pw.key, w[h])
 		}
 	}
 }
@@ -82,7 +88,6 @@ func TestE2EErroredKnownServiceKeepsHostnameClaim(t *testing.T) {
 			if _, ok := e.route("docker:new"); ok {
 				t.Fatal("docker:new persisted")
 			}
-			assertRendererAgrees(t, e, acts)
 		})
 	}
 }
@@ -101,7 +106,6 @@ func TestE2EInvalidLabelKnownServiceKeepsClaim(t *testing.T) {
 	if sk := ofKind(forKey(acts, "static:app"), Skip); len(sk) != 1 || !strings.Contains(sk[0].Reason, "app.example.test") {
 		t.Fatalf("want a Skip reporting the label problem, got %v", sums(acts))
 	}
-	assertRendererAgrees(t, e, acts)
 }
 
 func TestE2ESameSourceStoppedKnownVsPublishedNewcomer(t *testing.T) {
@@ -122,7 +126,6 @@ func TestE2ESameSourceStoppedKnownVsPublishedNewcomer(t *testing.T) {
 			if len(rs) != 1 || rs[0].Key != newK || rs[0].Hostname != "app.example.test" {
 				t.Fatalf("rows %+v", rs)
 			}
-			assertRendererAgrees(t, e, acts)
 		})
 	}
 }
@@ -145,7 +148,6 @@ func TestE2EStoppedThenPublishedAtNewHostnameMovesRoute(t *testing.T) {
 	if len(rs) != 1 || rs[0].Hostname != "renamed.example.test" {
 		t.Fatalf("route did not move: %+v", rs)
 	}
-	assertRendererAgrees(t, e, acts)
 }
 
 func TestPlanNonPublishedKnownUsesKnownZoneForZonePlanning(t *testing.T) {
@@ -193,4 +195,185 @@ func TestPlanPublishedInvalidBackendFallbackIsVisible(t *testing.T) {
 	if len(ofKind(got, Skip)) != 0 || ofKind(got, RouteWrite)[0].Reason != "" {
 		t.Fatalf("valid backend: %v", sums(got))
 	}
+}
+
+// --- fix round 3: Published holders with invalid labels -----------------
+
+func TestE2EPublishedInvalidLabelHolderLosesToRoutableNewcomer(t *testing.T) {
+	for name, mut := range map[string]func(*model.Service){
+		"name !!!":       func(s *model.Service) { s.Name = "!!!" },
+		"zone gone.test": func(s *model.Service) { s.Zone = "gone.test" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newE2E(t)
+			e.cycle([]model.Service{pub("docker:app", "app", "example.test", 8080)})
+			e.now = t0.Add(time.Hour)
+			holder := pub("docker:app", "app", "example.test", 8080)
+			mut(&holder)
+			newcomer := pub("docker:new", "app", "example.test", 9090)
+			acts := e.cycle([]model.Service{holder, newcomer})
+			got := sums(forKey(acts, "docker:app"))
+			if len(got) != 3 || !strings.HasPrefix(got[0], "Invalid ") || !strings.HasPrefix(got[1], "Conflict ") ||
+				got[2] != "RouteRemove example.test app.example.test docker:app" {
+				t.Fatalf("holder actions %v", got)
+			}
+			if rw := ofKind(acts, RouteWrite); len(rw) != 1 || rw[0].Key != "docker:new" {
+				t.Fatalf("RouteWrites %v", sums(rw))
+			}
+			rs := listRoutes(t, e.st)
+			if len(rs) != 1 || rs[0].Key != "docker:new" {
+				t.Fatalf("rows %+v", rs)
+			}
+			if e.winners["app.example.test"].key != "docker:new" {
+				t.Fatalf("plan winner %+v", e.winners["app.example.test"])
+			}
+			// next cycle: forgotten holder gets Invalid only, still one row
+			e.now = t0.Add(2 * time.Hour)
+			acts = e.cycle([]model.Service{holder, newcomer})
+			assertNone(t, acts, RouteRemove)
+		})
+	}
+}
+
+func TestE2EHigherRankedInvalidHolderKeepsHostname(t *testing.T) {
+	e := newE2E(t)
+	e.cycle([]model.Service{pub("static:app", "app", "example.test", 8080)})
+	before := e.mustRoute("static:app")
+	e.now = t0.Add(time.Hour)
+	holder := pub("static:app", "!!!", "example.test", 8080)
+	acts := e.cycle([]model.Service{holder, pub("docker:new", "app", "example.test", 9090)})
+	if inv := ofKind(forKey(acts, "static:app"), Invalid); len(inv) != 1 {
+		t.Fatalf("want Invalid for holder, got %v", sums(acts))
+	}
+	assertSums(t, forKey(acts, "docker:new"), "Conflict example.test app.example.test docker:new")
+	assertNone(t, acts, RouteRemove, RouteWrite)
+	if got := e.mustRoute("static:app"); !reflect.DeepEqual(got, before) {
+		t.Fatalf("holder row changed %+v", got)
+	}
+}
+
+func TestPlanPublishedInvalidHolderZoneRemovedFromConfig(t *testing.T) {
+	// The holder's Known zone (and label zone) is no longer configured.
+	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
+	s := pub("docker:app", "app", "old.test", 8080)
+	obs := Observed{Foreign: listed("example.test", "old.test"),
+		Owned: []store.DNSRecord{owned("old.test", "app.old.test", "A", target, "docker:app")},
+		Known: knownMap(known("docker:app", "old.test", "app.old.test", nil))}
+	got := Plan([]model.Service{s}, obs, cfg, t0)
+	if len(got) != 1 || got[0].Kind != Invalid || got[0].Key != "docker:app" {
+		t.Fatalf("want only Invalid, got %v", sums(got))
+	}
+}
+
+func TestE2EStoppedHolderVsBackendlessPublishedNewcomer(t *testing.T) {
+	// Same source: neither is in the serving tier, so the key decides; the
+	// newcomer is not routable, so the holder's route is never removed.
+	for _, newK := range []string{"docker:a_new", "docker:z_new"} {
+		t.Run(newK, func(t *testing.T) {
+			e := newE2E(t)
+			e.cycle([]model.Service{pub("docker:m_old", "app", "example.test", 8080)})
+			before := e.mustRoute("docker:m_old")
+			e.now = t0.Add(time.Hour)
+			stopped := svc("docker:m_old", "app", "example.test", model.StateStopped, "", 0)
+			newcomer := svc(newK, "app", "example.test", model.StatePublished, "", 0)
+			acts := e.cycle([]model.Service{stopped, newcomer})
+			assertNone(t, acts, RouteRemove)
+			if got := e.mustRoute("docker:m_old"); !reflect.DeepEqual(got, before) {
+				t.Fatalf("holder row changed %+v", got)
+			}
+			if rs := listRoutes(t, e.st); len(rs) != 1 {
+				t.Fatalf("rows %+v", rs)
+			}
+		})
+	}
+}
+
+func TestPlanStoppedRouteWriteInUnconfiguredZoneSaysSo(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", ""))
+	s := svc("docker:app", "app", "example.test", model.StateStopped, "", 0)
+	obs := Observed{Known: knownMap(known("docker:app", "old.test", "app.old.test", nil)),
+		LastKnown: map[string]model.Backend{"docker:app": {Scheme: "http", Host: "198.51.100.5", Port: 80}}}
+	got := Plan([]model.Service{s}, obs, cfg, t0)
+	rw := ofKind(got, RouteWrite)
+	if len(rw) != 1 || rw[0].Zone != "old.test" || rw[0].Host != "app.old.test" ||
+		!strings.Contains(rw[0].Reason, "zone old.test is no longer configured") {
+		t.Fatalf("got %v", sums(got))
+	}
+	assertNone(t, got, DNSEnsure, CertEnsure, RouteRemove)
+}
+
+// --- fix round 3: services removed but still within grace ----------------
+
+func TestE2EAbsentInGraceYieldsToPublishedNewcomer(t *testing.T) {
+	// static:app is removed from the config (its route waits for the grace
+	// period) while docker:new is Published at the same hostname: the removed
+	// service yields to the present one at once, whatever its source rank.
+	for _, scheduled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "same cycle", true: "after schedule"}[scheduled], func(t *testing.T) {
+			e := newE2E(t)
+			e.cycle([]model.Service{pub("static:app", "app", "example.test", 8080)})
+			if scheduled {
+				e.now = t0.Add(time.Hour)
+				e.cycle(nil)
+				if r := e.mustRoute("static:app"); r.RemovedAfter == nil {
+					t.Fatal("not scheduled")
+				}
+			}
+			e.now = t0.Add(2 * time.Hour)
+			acts := e.cycle([]model.Service{pub("docker:new", "app", "example.test", 9090)})
+			assertSums(t, forKey(acts, "static:app"), "RouteRemove example.test app.example.test static:app")
+			assertNone(t, acts, Conflict, ScheduleRemoval, DNSDelete)
+			rs := listRoutes(t, e.st)
+			if len(rs) != 1 || rs[0].Key != "docker:new" {
+				t.Fatalf("rows %+v", rs)
+			}
+		})
+	}
+}
+
+func TestE2EAbsentInGraceKeepsRouteAgainstNonRoutableNewcomer(t *testing.T) {
+	e := newE2E(t)
+	e.cycle([]model.Service{pub("docker:old", "app", "example.test", 8080)})
+	e.now = t0.Add(time.Hour)
+	pending := svc("docker:new", "app", "example.test", model.StatePending, "198.51.100.5", 9090)
+	acts := e.cycle([]model.Service{pending})
+	assertSums(t, acts, "ScheduleRemoval example.test app.example.test docker:old")
+	if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != "docker:old" {
+		t.Fatalf("rows %+v", rs)
+	}
+}
+
+func TestPlanAbsentPastGraceKeepsDNSDeleteForItsOwnHostname(t *testing.T) {
+	// the absent service is the only claimant of its hostname: it must not
+	// count as "another service now uses this hostname"
+	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
+	obs := Observed{Foreign: listed("example.test"),
+		Owned: []store.DNSRecord{owned("example.test", "app.example.test", "A", target, "docker:app")},
+		Known: knownMap(known("docker:app", "example.test", "app.example.test", tp(t0.Add(-time.Second))))}
+	assertSums(t, Plan(nil, obs, cfg, t0),
+		"RouteRemove example.test app.example.test docker:app",
+		"DNSDelete example.test app.example.test docker:app [app.example.test A 192.0.2.10]")
+}
+
+func TestE2EPhantomAndOutrankingNewcomerShareButAgree(t *testing.T) {
+	// docker is down: its route stays (phantom) and a higher-ranked static
+	// service takes the hostname. Both rows exist during the outage; the
+	// renderer serves Plan's winner. When docker is back the phantom is a
+	// present loser and its row is removed: one row again.
+	e := newE2E(t)
+	dock := pub("docker:app", "app", "example.test", 8080)
+	e.cycle([]model.Service{dock})
+	e.now = t0.Add(time.Hour)
+	e.crashWindow = true
+	st := pub("static:app", "app", "example.test", 9000)
+	e.cycle([]model.Service{st}, "docker")
+	w, n := renderWinners(listRoutes(t, e.st))
+	if n["app.example.test"] != 2 || w["app.example.test"] != "static:app" || e.winners["app.example.test"].key != "static:app" {
+		t.Fatalf("renderer %v %v plan %v", w, n, e.winners["app.example.test"].key)
+	}
+	e.crashWindow = false
+	e.now = t0.Add(2 * time.Hour)
+	acts := e.cycle([]model.Service{st, dock})
+	assertSums(t, forKey(acts, "docker:app"), "Conflict example.test app.example.test docker:app",
+		"RouteRemove example.test app.example.test docker:app")
 }

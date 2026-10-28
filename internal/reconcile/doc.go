@@ -20,16 +20,31 @@
 // config; a name with no DNS-valid characters; no zone and no default), a
 // hostname over 253 characters, an earlier duplicate of a key (the last
 // occurrence wins, like the approval gate), or a Published service with
-// neither a backend nor a last-known backend. Nothing else is emitted for it,
-// including any removal: it still counts as present, so it is never scheduled
-// for removal, its existing route is left as is, and (not being routable) it
-// never causes another service's route to be removed.
+// neither a backend nor a last-known backend. It is never planned (no DNS,
+// cert or RouteWrite) and, being present, never scheduled for removal. It is
+// not routable, so it never causes another service's route to be removed.
+// Its existing route is left as is UNLESS a Published, routable claimant that
+// outranks or out-tiers it takes over its hostname: an Invalid Published
+// service with a Known route claims its stored (Known) zone and hostname as a
+// non-serving holder (see Stored-hostname claim), so it then gets Conflict
+// and its stored row is removed like any loser. When nobody takes the name
+// over (e.g. its Known zone was removed from the config) only Invalid is
+// emitted and nothing is removed.
 //
 // Hostname conflicts are decided on the resulting hostname, case-insensitive,
-// among every desired service with a valid hostname plus the Known services
-// of unavailable sources ("phantoms", whose routes may still exist).
+// among every desired service with a valid hostname (or a stored-hostname
+// claim, below), the Known services of unavailable sources ("phantoms", whose
+// routes may still exist), and the Known services of available sources that
+// are absent from desired ("absent": removal scheduled or due, route not yet
+// removed). An absent claimant ranks below every present claimant: it keeps
+// its hostname only while no present service claims it, and when a present
+// Published, routable service of ANY source rank wins its hostname, its route
+// is removed at once (RouteRemove, no grace, no ScheduleRemoval, no
+// DNSDelete since the winner uses the name). Against a present but
+// non-routable winner it keeps its route until its grace period ends.
 //
-// Stored-hostname claim: a present service that is NOT Published and has a
+// Stored-hostname claim: a present service that is NOT Published, or is
+// Published but Invalid because its labels no longer resolve, and has a
 // Known entry claims Known's zone and hostname (what its persisted route
 // actually serves), not the ones derived from its current labels, because
 // the route executor never applies a non-Published RouteWrite. This claim is
@@ -41,8 +56,23 @@
 // route); a Published service always claims from its current labels. Its
 // tier is unchanged: it is not in the serving tier, so a Published service of
 // the same source rank still takes the name over (and its route is removed).
-// As a result persisted rows share a hostname only transiently (a crash or a
-// failed batch between the winner's RouteWrite and the loser's RouteRemove).
+// As a result every route row's key is a claimant of the row's hostname
+// (present non-Published and Invalid holders via the stored-hostname claim,
+// phantoms, absent services), so a row is removed whenever a Published,
+// routable claimant takes its name, and a Published RouteWrite only happens
+// for the hostname's winner. Two rows therefore share a hostname only in a
+// crash window: between the winner's RouteWrite and the loser's RouteRemove
+// of one Apply (a crash, or a failed RouteRemove batch). The next cycle
+// re-emits the loser's RouteRemove and converges to one row. One more,
+// deliberate exception: during a source outage a phantom's row is never
+// removed, so if a present Published service outranks it (higher source
+// rank, or same rank with a smaller key; both are in the serving tier) both
+// rows exist until the source is back and the phantom loses as a present
+// service. The renderer's rule (source rank, then key) then picks the same
+// winner as Plan. A higher-ranked non-routable holder keeps its row and the
+// newcomer gets only a Conflict, without a RouteWrite.
+// A no-op RouteWrite whose stored zone is no longer configured says so in
+// its Reason.
 //
 // Order is SOURCE-FIRST:
 //  1. key-prefix source rank: static > truenas > docker > other, taken from
@@ -146,8 +176,9 @@
 // 24h when unset) for the caller to persist; nothing is deleted. Once now is
 // strictly after RemovedAfter: RouteRemove, and in per-host zones that are
 // still configured DNSDelete for owned rows of that hostname whose owner key
-// is the service key, unless a current service now resolves to the same
-// hostname. Foreign records and the wildcard record are never deleted
+// is the service key, unless another service now claims the same hostname.
+// An absent service whose hostname is taken over by a present Published,
+// routable service is removed earlier (see Hostname conflicts). Foreign records and the wildcard record are never deleted
 // automatically (a later UI action may). A present service with a
 // RemovedAfter gets CancelRemoval in any state.
 //

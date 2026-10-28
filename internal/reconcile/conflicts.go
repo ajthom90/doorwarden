@@ -20,6 +20,11 @@ type claimant struct {
 	// phantom marks a known service of an unavailable source: it is not in
 	// desired, but its route may still exist, so it keeps its hostname.
 	phantom bool
+	// absent marks a known service of an available source that is no longer
+	// in desired (removal scheduled or due): its route still exists until
+	// RouteRemove, so it holds its hostname, but only while no present
+	// service claims it (it ranks below every present claimant).
+	absent bool
 }
 
 // loss describes why a claimant lost its hostname.
@@ -47,9 +52,13 @@ func sourceRank(key, source string) int {
 func (c claimant) rank() int { return sourceRank(c.key, c.source) }
 
 // outranks is source-first: a lower-trust source never takes a hostname from
-// a higher-trust one, whatever their states. Within one source rank, the
+// a higher-trust one, whatever their states. Exception: an absent claimant
+// (no longer in desired, route not yet removed) yields to every present one. Within one source rank, the
 // serving tier wins, then the smaller key.
 func outranks(a, b claimant) bool {
+	if a.absent != b.absent {
+		return b.absent // a service that is gone yields to any present claimant
+	}
 	if ra, rb := a.rank(), b.rank(); ra != rb {
 		return ra < rb
 	}
@@ -81,6 +90,8 @@ func resolveHostnames(cs []claimant) (winners map[string]claimant, losers map[st
 			switch {
 			case w.phantom:
 				why = "; its source is unavailable, so it keeps the name"
+			case w.absent:
+				why = "; it is no longer discovered and its route is removed after the grace period"
 			case !w.routable:
 				why = "; the winner is not published/routable, fix or approve it (or remove it)"
 			}

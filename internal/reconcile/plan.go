@@ -29,6 +29,9 @@ type entry struct {
 	svc        model.Service
 	zone, host string
 	err        error
+	// heldInvalid: a Published service whose labels are invalid (err set)
+	// that claims its Known zone/hostname as a non-serving holder.
+	heldInvalid bool
 }
 
 type planner struct {
@@ -46,8 +49,15 @@ type planner struct {
 // pure: no I/O, no clock, inputs are not modified, output order is
 // deterministic. See the package documentation for the rules.
 func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Time) []Action {
+	acts, _ := planWithWinners(desired, obs, cfg, now)
+	return acts
+}
+
+// planWithWinners is Plan that also returns the hostname winners (by
+// normalized hostname), for tests that check the renderer agrees with Plan.
+func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, now time.Time) ([]Action, map[string]claimant) {
 	if cfg == nil {
-		return nil // fail closed: no config, no changes
+		return nil, nil // fail closed: no config, no changes
 	}
 	p := newPlanner(obs, cfg, now)
 
@@ -59,7 +69,10 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 	var claims []claimant
 	for _, e := range entries {
 		present[e.svc.Key] = true
-		if e.err == nil {
+		if e.heldInvalid {
+			// not routable, so never serving and never able to evict anyone
+			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true})
+		} else if e.err == nil {
 			pubd := e.svc.State == model.StatePublished
 			_, routable := p.routeBackend(e.svc)
 			routable = routable && pubd
@@ -71,6 +84,10 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 		if !present[k.Key] && p.unavailable(k) && k.Hostname != "" {
 			// it is Known, i.e. it still has a route: serving tier
 			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true})
+		} else if !present[k.Key] && k.Hostname != "" {
+			// gone from an available source, route not yet removed: it holds
+			// its hostname as a non-serving claimant until removed
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, absent: true})
 		}
 	}
 	winners, losers := resolveHostnames(claims)
@@ -83,17 +100,13 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 		}
 		if e.err != nil {
 			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()})
-			continue
+			if l, lost := losers[e.svc.Key]; lost && e.heldInvalid {
+				p.planLoser(e, l)
+			}
+			continue // never planService: its zone may no longer be configured
 		}
 		if l, lost := losers[e.svc.Key]; lost {
-			p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
-			// A loser to a Published winner must not keep serving the name:
-			// remove its existing route (only if it has one, so this does not
-			// repeat once the caller forgets the Known entry). DNS is untouched.
-			if k, ok := obs.Known[e.svc.Key]; ok && p.mayRemoveLoserRoute(e.svc, l.winner) {
-				p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,
-					Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
-			}
+			p.planLoser(e, l)
 			continue
 		}
 		if p.planService(e) {
@@ -105,10 +118,10 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 			p.planZone(p.zones[zn], hosts)
 		}
 	}
-	p.planRemovals(present, winners)
+	p.planRemovals(present, winners, losers)
 
 	sortActions(p.out)
-	return p.out
+	return p.out, winners
 }
 
 func newPlanner(obs Observed, cfg *config.Config, now time.Time) *planner {
@@ -211,19 +224,40 @@ func (p *planner) resolve(s model.Service) entry {
 	return e
 }
 
+// planLoser emits Conflict for a hostname loser and, when the winner really
+// takes the name over, RouteRemove for its existing route (only if it has
+// one, so this does not repeat once the caller forgets the Known entry). DNS
+// is untouched.
+func (p *planner) planLoser(e entry, l loss) {
+	p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
+	if k, ok := p.obs.Known[e.svc.Key]; ok && p.mayRemoveLoserRoute(e.svc, l.winner) {
+		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,
+			Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
+	}
+}
+
 // claimKnown makes a present non-Published service that has a Known route
 // claim what it actually serves: the Known zone and hostname, not the ones
 // derived from its current labels (which the route executor never applies
 // while it is not Published). If its labels no longer resolve, the claim
-// still stands and a Skip reports the label problem. A non-Published service
-// without a Known route, and every Published service, are left as resolved.
+// still stands and a Skip reports the label problem. A Published service
+// whose labels do not resolve (e.err) and that has a Known route also claims
+// the Known zone/hostname, as a non-serving holder (heldInvalid): it stays
+// Invalid and is never planned, but as a hostname loser its route can be
+// removed. A service without a Known route, and a Published service whose
+// labels resolve, are left as resolved.
 func (p *planner) claimKnown(e *entry) {
-	if e.svc.State == model.StatePublished {
-		return
-	}
 	k, ok := p.obs.Known[e.svc.Key]
 	zn, host := normName(k.Zone), normName(k.Hostname)
 	if !ok || zn == "" || host == "" {
+		return
+	}
+	if e.svc.State == model.StatePublished {
+		if e.err != nil {
+			// Invalid labels: hold the stored hostname as a non-serving
+			// claimant; it stays Invalid and gets no planService.
+			e.zone, e.host, e.heldInvalid = zn, host, true
+		}
 		return
 	}
 	if e.err != nil {
@@ -273,8 +307,11 @@ func (p *planner) planService(e entry) bool {
 			return false
 		}
 		b := lk
-		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b,
-			Reason: "persisted route unchanged (service is " + s.State + ", not Published); last-known backend kept"})
+		reason := "persisted route unchanged (service is " + s.State + ", not Published); last-known backend kept"
+		if z == nil {
+			reason += "; zone " + e.zone + " is no longer configured"
+		}
+		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b, Reason: reason})
 		return true
 	}
 	return false // pending, discovered, ...: nothing is created and nothing removed
@@ -398,12 +435,21 @@ func certCovers(c store.Cert, name string) bool {
 }
 
 // planRemovals handles known services absent from desired.
-func (p *planner) planRemovals(present map[string]bool, winners map[string]claimant) {
+func (p *planner) planRemovals(present map[string]bool, winners map[string]claimant, losers map[string]loss) {
 	for _, k := range sortedKnown(p.obs.Known) {
 		if present[k.Key] || p.unavailable(k) {
 			continue // present, or unknown state: never schedule or remove
 		}
 		zn, host := normName(k.Zone), normName(k.Hostname)
+		if l, lost := losers[k.Key]; lost && l.winner.published && l.winner.routable && !l.winner.phantom {
+			// a present Published, routable service (of any source rank)
+			// takes over its hostname now: remove its route without waiting
+			// for the grace period (its owned DNS record stays: the winner
+			// uses that hostname).
+			p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key,
+				Reason: "service no longer discovered and hostname " + host + " now belongs to published " + l.winner.key})
+			continue
+		}
 		if k.RemovedAfter == nil {
 			ra := p.now.Add(p.grace)
 			p.emit(Action{Kind: ScheduleRemoval, Zone: zn, Host: host, Key: k.Key, RemovedAfter: &ra,
@@ -418,7 +464,7 @@ func (p *planner) planRemovals(present map[string]bool, winners map[string]claim
 		if z == nil || z.mode != "per-host" || host == "" {
 			continue // wildcard record is never deleted automatically
 		}
-		if _, taken := winners[host]; taken {
+		if w, taken := winners[host]; taken && w.key != k.Key {
 			continue // another service now uses this hostname; its record stays
 		}
 		for _, o := range p.obs.Owned {

@@ -267,6 +267,12 @@ type e2e struct {
 	cfg *config.Config
 	now time.Time
 	ex  *MultiExecutor
+	// winners is Plan's hostname winners of the last cycle.
+	winners map[string]claimant
+	// crashWindow disables the one-row-per-hostname check at the end of a
+	// cycle (for tests that deliberately leave a crash-window or source
+	// outage state); the renderer-agrees-with-Plan check still runs.
+	crashWindow bool
 }
 
 func newE2E(t *testing.T) *e2e {
@@ -288,10 +294,16 @@ func (e *e2e) cycle(desired []model.Service, unavailable ...string) []Action {
 	for _, u := range unavailable {
 		un[u] = true
 	}
-	acts := Plan(desired, Observed{Known: known, LastKnown: lk, Unavailable: un}, e.cfg, e.now)
+	obs := Observed{Known: known, LastKnown: lk, Unavailable: un}
+	acts, winners := planWithWinners(desired, obs, e.cfg, e.now)
+	if !reflect.DeepEqual(acts, Plan(desired, obs, e.cfg, e.now)) {
+		e.t.Fatal("planWithWinners differs from Plan")
+	}
+	e.winners = winners
 	if err := e.ex.Apply(context.Background(), acts, false); err != nil {
 		e.t.Fatalf("apply: %v (actions %v)", err, sums(acts))
 	}
+	assertRendererAgrees(e.t, e)
 	return acts
 }
 
