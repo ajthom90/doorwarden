@@ -27,8 +27,24 @@
 //
 // Hostname conflicts are decided on the resulting hostname, case-insensitive,
 // among every desired service with a valid hostname plus the Known services
-// of unavailable sources ("phantoms", whose routes may still exist). Order is
-// SOURCE-FIRST:
+// of unavailable sources ("phantoms", whose routes may still exist).
+//
+// Stored-hostname claim: a present service that is NOT Published and has a
+// Known entry claims Known's zone and hostname (what its persisted route
+// actually serves), not the ones derived from its current labels, because
+// the route executor never applies a non-Published RouteWrite. This claim is
+// used for conflict resolution, for its own actions (Zone/Host) and for the
+// routed-zone sets of wildcard DNS and wildcard/san certificates. If its
+// current labels no longer resolve to a hostname, the claim still stands and
+// a Skip reports the label problem instead of Invalid. A non-Published
+// service without a Known entry claims from its labels as before (it has no
+// route); a Published service always claims from its current labels. Its
+// tier is unchanged: it is not in the serving tier, so a Published service of
+// the same source rank still takes the name over (and its route is removed).
+// As a result persisted rows share a hostname only transiently (a crash or a
+// failed batch between the winner's RouteWrite and the loser's RouteRemove).
+//
+// Order is SOURCE-FIRST:
 //  1. key-prefix source rank: static > truenas > docker > other, taken from
 //     the stable key prefix ("static:", "truenas:", "docker:") because source
 //     names are configurable (Service.Source is only a fallback for unknown
@@ -64,7 +80,9 @@
 // authoritative (routable) when it passes model.ValidateBackend (scheme http
 // or https, valid host, port 1..65535), the same predicate the route store
 // enforces. A Published service whose backend is not authoritative uses its
-// last-known backend, else it is Invalid. Stopped and Error services carry no
+// last-known backend, and a Skip plus the RouteWrite's Reason ("current
+// backend invalid (<problem>); using last-known backend") make the
+// misconfiguration visible; without a last-known backend it is Invalid. Stopped and Error services carry no
 // authoritative backend: if previously published (in Known) and a last-known
 // backend exists, RouteWrite carries the LAST-KNOWN backend; without one a
 // Skip is emitted and nothing is removed. Pending, Discovered and the rest
@@ -72,7 +90,10 @@
 // (name, so Host; middlewares; websockets), which are not trustworthy while
 // it is stopped or errored, so the route executor (NewRouteExecutor) treats
 // a RouteWrite for a non-Published service as a no-op: the route is left as
-// last written, and only a Published service can change it. RouteRemove is
+// last written, and only a Published service can change it. Such a
+// RouteWrite carries the stored zone/hostname (see Stored-hostname claim) and
+// the Reason "persisted route unchanged (service is <state>, not
+// Published); last-known backend kept". RouteRemove is
 // the only signal that removes a route: route executors must not remove a
 // route merely because no RouteWrite for it appeared. Route identity is the
 // service key.

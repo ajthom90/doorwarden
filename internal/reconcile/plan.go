@@ -52,6 +52,9 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 	p := newPlanner(obs, cfg, now)
 
 	entries := p.dedupe(desired)
+	for i := range entries {
+		p.claimKnown(&entries[i])
+	}
 	present := map[string]bool{}
 	var claims []claimant
 	for _, e := range entries {
@@ -208,6 +211,29 @@ func (p *planner) resolve(s model.Service) entry {
 	return e
 }
 
+// claimKnown makes a present non-Published service that has a Known route
+// claim what it actually serves: the Known zone and hostname, not the ones
+// derived from its current labels (which the route executor never applies
+// while it is not Published). If its labels no longer resolve, the claim
+// still stands and a Skip reports the label problem. A non-Published service
+// without a Known route, and every Published service, are left as resolved.
+func (p *planner) claimKnown(e *entry) {
+	if e.svc.State == model.StatePublished {
+		return
+	}
+	k, ok := p.obs.Known[e.svc.Key]
+	zn, host := normName(k.Zone), normName(k.Hostname)
+	if !ok || zn == "" || host == "" {
+		return
+	}
+	if e.err != nil {
+		p.emit(Action{Kind: Skip, Zone: zn, Host: host, Key: e.svc.Key, Svc: copySvc(e.svc),
+			Reason: fmt.Sprintf("current labels invalid (%v); persisted route for %s still claims the hostname", e.err, host)})
+		e.err = nil
+	}
+	e.zone, e.host = zn, host
+}
+
 // planService emits the per-service actions for a hostname winner and
 // reports whether a RouteWrite was emitted.
 func (p *planner) planService(e entry) bool {
@@ -229,7 +255,13 @@ func (p *planner) planService(e entry) bool {
 			p.emit(Action{Kind: CertEnsure, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
 				Names: []string{e.host}, Issuer: z.issuer})
 		}
-		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b})
+		reason := ""
+		if !authoritative(s.Backend) {
+			// Keep serving, but make the misconfiguration visible.
+			reason = "current backend invalid (" + backendProblem(s.Backend) + "); using last-known backend"
+			p.emit(Action{Kind: Skip, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Reason: reason})
+		}
+		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b, Reason: reason})
 		return true
 	case model.StateStopped, model.StateError:
 		if !isKnown {
@@ -242,7 +274,7 @@ func (p *planner) planService(e entry) bool {
 		}
 		b := lk
 		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b,
-			Reason: "service is " + s.State + "; rendering last-known backend"})
+			Reason: "persisted route unchanged (service is " + s.State + ", not Published); last-known backend kept"})
 		return true
 	}
 	return false // pending, discovered, ...: nothing is created and nothing removed
