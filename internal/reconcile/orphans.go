@@ -209,7 +209,16 @@ func (p *planner) planOrphans(entries []entry, winners map[string]claimant) {
 			continue // never remove what this plan ensures
 		}
 		if present && ow.protected {
-			continue // (a) present but not cleanly Published: keeps its records
+			// (a) present but not cleanly Published: keeps its records. A
+			// removal scheduled while it was absent is cancelled now that it
+			// is back in any state, so a deadline frozen during that absence
+			// never deletes the record in a later publish cycle; once it is
+			// Published and no longer wants the row, a fresh grace starts.
+			if o.RemovedAfter != nil {
+				base.Kind, base.Svc, base.Reason = DNSCancelRemoval, copySvc(ow.svc), "service is present again"
+				p.emit(base)
+			}
+			continue
 		}
 		if !present && p.ownerSourceUnknown(owner, ev) {
 			continue // (b) a source outage means unknown, never gone

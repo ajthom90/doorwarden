@@ -109,8 +109,9 @@ func TestOrphanCancelWhenWantedAgainNeverDeleted(t *testing.T) {
 	assertOrphans(t, Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, phCfg(), t0))
 }
 
-// (a) a present owner that is not cleanly Published keeps every row, and a
-// scheduled removal stays frozen (neither cancelled nor executed).
+// (a) a present owner that is not cleanly Published keeps every row; a
+// removal scheduled while it was absent is cancelled (it is present again),
+// never executed.
 func TestOrphanPresentNonPublishedOwnerKeepsRows(t *testing.T) {
 	bad := pub("docker:app", "web", "example.test", 80)
 	bad.Options.Middlewares = []string{"undefined@file"}
@@ -132,7 +133,11 @@ func TestOrphanPresentNonPublishedOwnerKeepsRows(t *testing.T) {
 				if name == "held invalid with Known" || name == "stopped" {
 					obs.Known = knownMap(known("docker:app", "example.test", "app.example.test", nil))
 				}
-				assertOrphans(t, Plan([]model.Service{s}, obs, phCfg(), t0))
+				var want []string
+				if ra != nil {
+					want = append(want, "DNSCancelRemoval example.test app.example.test docker:app [app.example.test A 192.0.2.10]")
+				}
+				assertOrphans(t, Plan([]model.Service{s}, obs, phCfg(), t0), want...)
 			})
 		}
 	}
@@ -175,7 +180,7 @@ func TestOrphanSourceUnavailableOrUnknownNeverRemoves(t *testing.T) {
 		{"no prefix", nil, Observed{Owned: row("gone", past)}},
 		{"empty owner", nil, Observed{Owned: row("", past)}},
 		{"present service whose source is marked unavailable", []model.Service{pub("docker:gone", "web", "example.test", 80)},
-			Observed{Owned: row("docker:gone", past), Unavailable: map[string]bool{"docker": true}}},
+			Observed{Owned: row("docker:gone", nil), Unavailable: map[string]bool{"docker": true}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,6 +189,10 @@ func TestOrphanSourceUnavailableOrUnknownNeverRemoves(t *testing.T) {
 			assertOrphans(t, got)
 		})
 	}
+	// present (carried forward) with a schedule from its absence: cancelled
+	got := Plan([]model.Service{pub("docker:gone", "web", "example.test", 80)},
+		Observed{Foreign: listed("example.test"), Owned: row("docker:gone", past), Unavailable: map[string]bool{"docker": true}}, phCfg(), t0)
+	assertOrphans(t, got, "DNSCancelRemoval example.test gone.example.test docker:gone [gone.example.test A 192.0.2.10]")
 	// control: another source's outage does not block an owner once evidence
 	// (a desired or Known key) maps the unavailable name to another prefix.
 	// A source's name alone never maps it: a TrueNAS source may be named
@@ -353,6 +362,10 @@ func TestOrphanUnparsableTargetProtectsOwner(t *testing.T) {
 	cfg.Zones[0].TargetIP = "not-an-ip"
 	obs := Observed{Foreign: listed("example.test"),
 		Owned: []store.DNSRecord{ownedRA("example.test", "app.example.test", "A", target, "docker:app", tp(t0.Add(-time.Hour)))}}
+	// present again: the schedule is cancelled, nothing is removed
+	assertOrphans(t, Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, cfg, t0),
+		"DNSCancelRemoval example.test app.example.test docker:app [app.example.test A 192.0.2.10]")
+	obs.Owned[0].RemovedAfter = nil
 	assertOrphans(t, Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, cfg, t0))
 }
 

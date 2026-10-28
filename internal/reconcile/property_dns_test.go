@@ -137,6 +137,13 @@ func propWanted(c dnsPropCase, s model.Service, o store.DNSRecord) bool {
 	return c.modes[s.Zone] == "per-host" && o.Provider == "dnsp" && o.Zone == s.Zone && o.Name == s.Name+"."+s.Zone && o.Type == typ
 }
 
+// propProtected is the test's own statement of "present but not cleanly
+// Published": such an owner keeps its rows, and a schedule is cancelled.
+func propProtected(c dnsPropCase, s model.Service) bool {
+	return s.State != model.StatePublished || s.Backend.Port == 0 || len(s.Options.Middlewares) > 0 ||
+		s.Zone == "missing.test" || c.unavailable[s.Source]
+}
+
 func TestPropertyDNSOrphanInvariants(t *testing.T) {
 	var scheduled, deleted, cancelled, reassigned, completeChecked int
 	for seed := int64(0); seed < dnsPropSeeds; seed++ {
@@ -184,8 +191,8 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 			wanted := isPresent && propWanted(c, s, o)
 			if a.Kind == DNSCancelRemoval {
 				cancelled++
-				if !wanted || o.RemovedAfter == nil {
-					fail("cancel for an unwanted or unscheduled row")
+				if !(wanted || isPresent && propProtected(c, s)) || o.RemovedAfter == nil {
+					fail("cancel for an unwanted or unscheduled row of a non-protected owner")
 				}
 				continue
 			}
@@ -248,6 +255,10 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 			s, isPresent := present[o.OwnerKey]
 			if isPresent && propWanted(c, s, o) && o.RemovedAfter != nil && got[k] != DNSCancelRemoval {
 				fail("wanted scheduled row %s not cancelled", k)
+			}
+			if isPresent && propProtected(c, s) && o.RemovedAfter != nil && got[k] != DNSCancelRemoval &&
+				!strings.HasPrefix(o.Name, "*.") && c.modes[o.Zone] != "off" && c.modes[o.Zone] != "" && o.Provider == "dnsp" && o.Zone != "gone.test" {
+				fail("scheduled row %s of a present protected owner not cancelled", k)
 			}
 			pre := sourceOf(o.OwnerKey)
 			if isPresent || len(c.unavailable) > 0 || c.modes[o.Zone] != "per-host" || o.Provider != "dnsp" ||
