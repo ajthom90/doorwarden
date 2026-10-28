@@ -152,7 +152,13 @@ func (c *Client) wrap(err error) error {
 // returned even on error when a response was received.
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, hdr http.Header, body, out any) (int, error) {
 	u := *c.Base
-	u.Path = strings.TrimRight(u.Path, "/") + path
+	// path is already escaped by the caller (url.PathEscape on variable parts)
+	u.RawPath = strings.TrimRight(u.EscapedPath(), "/") + path
+	if up, err := url.PathUnescape(u.RawPath); err == nil {
+		u.Path = up
+	} else {
+		return 0, fmt.Errorf("invalid request path: %w", err)
+	}
 	if query != nil {
 		u.RawQuery = query.Encode()
 	}
@@ -228,7 +234,7 @@ func summarize(b []byte) string {
 				}
 			}
 		}
-		for _, k := range []string{"message", "error", "detail", "msg"} {
+		for _, k := range []string{"message", "errorMessage", "error", "detail", "msg"} {
 			if s, ok := m[k].(string); ok && s != "" {
 				return trunc(s)
 			}
