@@ -72,11 +72,29 @@ const (
 	// repairBreakerMinMissing: the breaker needs MORE than this many missing
 	// rows (and more than half of the wanted ones).
 	repairBreakerMinMissing = 3
+	// RepairMassOKTTL: a mass-repair acknowledgement older than this is
+	// ignored (and cleared by the DNS executor).
+	RepairMassOKTTL = 24 * time.Hour
+	// repairMassOKSkew: an acknowledgement dated further than this in the
+	// future (a clock stepped back) is ignored too.
+	repairMassOKSkew = 5 * time.Minute
 )
 
 // AlertDNSMassMissing marks the Skip planRepairs emits when most owned
 // records of a provider/zone are missing (Action.Alert).
 const AlertDNSMassMissing = "dns-mass-missing"
+
+// RepairBreakerKey is the Key of the breaker Skip of provider/zone (zone
+// normalized): stable, and never a service key.
+func RepairBreakerKey(provider, zone string) string {
+	return "repair-breaker:" + provider + "/" + normName(zone)
+}
+
+// massOKValid reports whether a mass-repair acknowledgement made at at still
+// counts at now.
+func massOKValid(at, now time.Time) bool {
+	return now.Sub(at) < RepairMassOKTTL && !at.After(now.Add(repairMassOKSkew))
+}
 
 // Plan computes the actions that bring the world in line with desired. It is
 // pure: no I/O, no clock, inputs are not modified, output order is
@@ -556,7 +574,9 @@ func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *
 // hosted zone, a misconfigured provider) than the records gone: ONE Skip
 // (Alert AlertDNSMassMissing) is emitted and no repair at all for that pair.
 // It holds every cycle while the condition does, and clears by itself once
-// it no longer holds. Otherwise at most RepairCapPerZone repairs are emitted,
+// it no longer holds. An operator acknowledgement of the pair
+// (Observed.RepairMassOK, valid for RepairMassOKTTL) lets the capped repairs
+// through instead. Otherwise at most RepairCapPerZone repairs are emitted,
 // the first by (name, type, owner key); the rest wait for later cycles.
 func (p *planner) planRepairs() {
 	keys := make([]string, 0, len(p.repairPairs))
@@ -566,13 +586,21 @@ func (p *planner) planRepairs() {
 	sort.Strings(keys)
 	for _, k := range keys {
 		rp := p.repairPairs[k]
-		if rp.missing > repairBreakerMinMissing && 2*rp.missing > rp.wanted {
-			p.emit(Action{Kind: Skip, Zone: rp.zone, Host: rp.zone, Provider: rp.provider, Alert: AlertDNSMassMissing,
-				Reason: fmt.Sprintf("most owned records missing at %s/%s (%d of %d); refusing mass repair: check the provider and zone configuration (repairs resume by themselves once most records are listed again)",
-					rp.provider, rp.zone, rp.missing, rp.wanted)})
+		ackAt, acked := p.obs.RepairMassOK[k]
+		acked = acked && massOKValid(ackAt, p.now)
+		tripped := rp.missing > repairBreakerMinMissing && 2*rp.missing > rp.wanted
+		if tripped && !acked {
+			p.emit(Action{Kind: Skip, Zone: rp.zone, Host: rp.zone, Key: RepairBreakerKey(rp.provider, rp.zone),
+				Provider: rp.provider, Alert: AlertDNSMassMissing, Reason: breakerReason(rp)})
 			continue
 		}
 		c := rp.cands
+		if tripped {
+			for i := range c {
+				c[i].Reason += fmt.Sprintf(" (mass repair of %s/%s acknowledged at %s: %d of %d missing)",
+					rp.provider, rp.zone, ackAt.UTC().Format(time.RFC3339), rp.missing, rp.wanted)
+			}
+		}
 		sort.SliceStable(c, func(i, j int) bool {
 			a, b := c[i], c[j]
 			if a.Record.Name != b.Record.Name {
@@ -587,6 +615,20 @@ func (p *planner) planRepairs() {
 			p.emit(c[i])
 		}
 	}
+}
+
+// breakerReason is the self-describing text of a breaker Skip: what is
+// refused, why, and the two ways out (fix the configuration, or acknowledge
+// that the records really are gone).
+func breakerReason(rp *repairPair) string {
+	key := store.RepairMassOKKey(rp.provider, rp.zone)
+	return fmt.Sprintf("most owned records missing at %[1]s/%[2]s (%[3]d of %[4]d); refusing mass repair: check the provider and zone configuration. "+
+		"Repairs resume by themselves once most records are listed again. "+
+		"If the records really are gone, acknowledge it once to re-create them (%[5]d per cycle): "+
+		`POST /api/v1/dns/repair/ack {"provider":%[1]q,"zone":%[2]q}, or without the API set the kv key %[6]s to the current UTC time in RFC3339 `+
+		`(sqlite3 <database> "INSERT OR REPLACE INTO kv(key,value) VALUES('%[6]s',strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now'))"); `+
+		"the acknowledgement lasts %[7]s and is cleared once the zone has recovered",
+		rp.provider, rp.zone, rp.missing, rp.wanted, RepairCapPerZone, key, "24h")
 }
 
 // driftSkip reports an owned record whose value was changed out of band.

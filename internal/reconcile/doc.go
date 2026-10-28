@@ -421,12 +421,39 @@
 // more likely wrong (a wiped Pi-hole, a Route 53 zone pinned to the wrong
 // hosted zone, a misconfigured provider) than the records gone: ONE Skip
 // "most owned records missing at <provider>/<zone> (N of M); refusing mass
-// repair: check the provider and zone configuration" with
-// Action.Alert = AlertDNSMassMissing (the caller notifies an operator) is
-// emitted, and NO repair for that pair. It holds every cycle while the
+// repair: check the provider and zone configuration. ..." with
+// Action.Alert = AlertDNSMassMissing (the caller notifies an operator) and
+// Key = RepairBreakerKey(provider, zone) ("repair-breaker:<provider>/<zone>",
+// never a service key) is emitted, and NO repair for that pair. The reason
+// also names the way out (below). It holds every cycle while the
 // condition holds and clears by itself: once most records are listed again
 // (restored by hand, or the configuration fixed) the remaining rows are
-// repaired as usual. Otherwise at most RepairCapPerZone (5) repairs are
+// repaired as usual.
+//
+// Operator override: when the records really are gone (a reinstalled
+// Pi-hole, records deleted by hand) there is no configuration to fix. The
+// operator acknowledges it once per provider/zone: kv key
+// dns/repair-mass-ok/<provider>/<zone> (store.RepairMassOKKey, zone
+// normalized) holding the acknowledgement time in RFC3339
+// (store.AcknowledgeMassRepair; the API action POST /api/v1/dns/repair/ack
+// {provider, zone} of T20 calls it; without the API the kv row can be
+// written with sqlite3, as the Skip says). GatherObserved reads every
+// acknowledgement into Observed.RepairMassOK (keyed provider+"/"+zone).
+// While the pair's acknowledgement is younger than RepairMassOKTTL (24h) and
+// not dated more than 5 minutes ahead, a tripped pair gets the CAPPED
+// repairs (same selection and cap as below; their Reason says "acknowledged
+// at <time>") instead of the Skip. The DNS executor deletes the key at the
+// end of a non-dry Apply that listed the pair successfully when at most 3 of
+// the pair's ownership rows (all of them, not only the eligible ones, so
+// it can only clear later than the plan would stop tripping) are missing
+// from that listing (kept current by the batch's own writes): the zone has
+// recovered, and a later mass loss trips the breaker again rather than ride
+// on an old acknowledgement. Its sweep (first non-dry Apply, then hourly)
+// deletes acknowledgements that are expired, dated ahead, unreadable, or
+// name a provider/zone it does not manage. A dry run never clears one. An
+// acknowledged pair whose remaining missing rows are all blocked by foreign
+// records, or not due, lists nothing and keeps its acknowledgement until it
+// expires (24h at most). Otherwise at most RepairCapPerZone (5) repairs are
 // emitted per pair, the first by (name, type, owner key); the rest follow in
 // later cycles. A wildcard zone has at most one eligible row, so its breaker
 // never trips. Not covered: a wanted row whose desired value also changed
@@ -505,8 +532,9 @@
 // its RouteRemove was applied (removal past grace, or a conflict loser);
 // pass Observed.Owned (with RemovedAfter) as EVERY ownership row in the
 // store, not only the configured provider/zone pairs, plus Foreign,
-// OwnedMissing and OwnedDrifted (GatherObserved does all of it:
-// DNSObservation.Fill); give the DNS executor a RepairStateStore (a
+// OwnedMissing, OwnedDrifted and RepairMassOK (GatherObserved does all of
+// it: DNSObservation.Fill); notify an operator for a Skip with
+// Action.Alert set; give the DNS executor a RepairStateStore (a
 // *store.Store as its Store is enough) or every repair is refused; register the DNS executor for every kind in DNSActionKinds
 // (RegisterDNSExecutor; it persists, reassigns and forgets ownership rows
 // itself) and the route executor for RouteWrite, RouteRemove,

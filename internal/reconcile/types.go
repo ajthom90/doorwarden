@@ -165,6 +165,11 @@ type Observed struct {
 	// what is listed there (normalized). Informational: Plan reports it and
 	// never overwrites it.
 	OwnedDrifted map[string][]dns.Record
+	// RepairMassOK maps provider+"/"+zone (normalized) to the time an
+	// operator acknowledged that the pair's owned records really are gone
+	// (store.AcknowledgeMassRepair). While it is younger than RepairMassOKTTL
+	// a tripped mass-repair breaker lets the capped repairs through.
+	RepairMassOK map[string]time.Time
 }
 
 // OwnedRowKey identifies an ownership row in Observed.OwnedMissing and
