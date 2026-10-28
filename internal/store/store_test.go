@@ -181,6 +181,29 @@ func TestSettingsMissingKey(t *testing.T) {
 	}
 }
 
+func TestDeleteSetting(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	if err := s.DeleteSetting(ctx, "absent"); err != nil {
+		t.Fatalf("deleting an absent key: %v", err)
+	}
+	if err := s.SetSetting(ctx, "a", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSetting(ctx, "b", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSetting(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetSetting(ctx, "a"); ok {
+		t.Fatal("a still set")
+	}
+	if v, ok, _ := s.GetSetting(ctx, "b"); !ok || v != "2" {
+		t.Fatalf("b %q %v", v, ok)
+	}
+}
+
 func TestStoreSurvivesReopen(t *testing.T) {
 	s, p := openTemp(t)
 	ctx := context.Background()
