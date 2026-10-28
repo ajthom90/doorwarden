@@ -13,8 +13,8 @@ func TestScrubRemovesSecretsKeepsChain(t *testing.T) {
 	if strings.Contains(err.Error(), "SECRET123") || !strings.Contains(err.Error(), "[redacted]") {
 		t.Fatalf("err = %v", err)
 	}
-	if !errors.Is(err, base) {
-		t.Fatal("chain lost")
+	if errors.Is(err, base) {
+		t.Fatal("raw cause must not be reachable")
 	}
 	if err := scrub(context.DeadlineExceeded, "x"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("deadline chain lost")

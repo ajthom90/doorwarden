@@ -9,6 +9,7 @@ package notify
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -81,11 +82,15 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	cut := n
+	const ell = "…"
+	cut := n - len(ell)
+	if cut < 0 {
+		cut = 0
+	}
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + "…"
+	return s[:cut] + ell
 }
 
 func stripNUL(s string) string {
@@ -102,9 +107,7 @@ func (e Event) normalized() Event {
 	out.Kind = truncate(strings.ToValidUTF8(stripNUL(e.Kind), "?"), maxKindBytes)
 	out.Subject = truncate(strings.ToValidUTF8(stripNUL(e.Subject), "?"), MaxSubjectBytes)
 	out.Message = truncate(strings.ToValidUTF8(stripNUL(e.Message), "?"), MaxMessageBytes)
-	if _, ok := ParseSeverity(string(e.Severity)); !ok || e.Severity == "" {
-		out.Severity = Info
-	}
+	out.Severity, _ = ParseSeverity(strings.TrimSpace(string(e.Severity))) // unknown => Info
 	out.Fields = nil
 	if len(e.Fields) > 0 {
 		keys := make([]string, 0, len(e.Fields))
@@ -118,6 +121,13 @@ func (e Event) normalized() Event {
 		out.Fields = make(map[string]string, len(keys))
 		for _, k := range keys {
 			nk := truncate(strings.ToValidUTF8(stripNUL(k), "?"), MaxFieldKeyBytes)
+			for i := 2; ; i++ { // keep colliding keys apart
+				if _, dup := out.Fields[nk]; !dup {
+					break
+				}
+				suffix := "_" + strconv.Itoa(i)
+				nk = truncate(strings.ToValidUTF8(stripNUL(k), "?"), MaxFieldKeyBytes-len(suffix)) + suffix
+			}
 			out.Fields[nk] = truncate(strings.ToValidUTF8(stripNUL(e.Fields[k]), "?"), MaxFieldValueBytes)
 		}
 	}

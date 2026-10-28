@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -136,37 +139,118 @@ func TestWebhookConnectionErrorRedactsURL(t *testing.T) {
 	}
 }
 
-func TestWebhookRefusesCrossHostRedirect(t *testing.T) {
+func TestWebhookDoesNotFollowRedirects(t *testing.T) {
 	var hits atomic.Int32
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
 	defer other.Close()
+	for _, loc := range []string{other.URL + "/steal?token=LOCTOKEN-SENTINEL", "/b?token=LOCTOKEN-SENTINEL"} {
+		for _, code := range []int{301, 302, 307, 308} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/b" {
+					hits.Add(1)
+				}
+				w.Header().Set("Location", loc)
+				w.WriteHeader(code)
+			}))
+			cfg := webhookCfg(srv.URL)
+			cfg.Secret = "k"
+			w, _ := NewWebhook(cfg, time.Second)
+			err := w.Send(context.Background(), testEvent)
+			srv.Close()
+			want := fmt.Sprintf("unexpected redirect (status %d); redirects are not followed", code)
+			if err == nil || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "LOCTOKEN-SENTINEL") {
+				t.Fatalf("%d: err = %v", code, err)
+			}
+			if !IsPermanent(err) {
+				t.Fatalf("%d: redirect should be permanent", code)
+			}
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("a redirect target was contacted %d times", hits.Load())
+	}
+}
+
+// A malformed Location must not reach the error text (net/http's own client
+// would echo it while parsing).
+func TestWebhookMalformedLocationDoesNotLeak(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, other.URL+"/steal", http.StatusTemporaryRedirect)
+		w.Header().Set("Location", "http://[::1TOKEN-SENTINEL")
+		w.WriteHeader(307)
 	}))
 	defer srv.Close()
-	cfg := webhookCfg(srv.URL)
-	cfg.Secret = "k"
-	cfg.Headers = map[string]secrets.Secret{"X-Token": "T"}
-	w, _ := NewWebhook(cfg, time.Second)
+	w, _ := NewWebhook(webhookCfg(srv.URL), time.Second)
 	err := w.Send(context.Background(), testEvent)
-	if err == nil || hits.Load() != 0 {
-		t.Fatalf("err=%v hits=%d", err, hits.Load())
-	}
-	if !strings.Contains(err.Error(), "redirect") {
+	if err == nil || strings.Contains(err.Error(), "TOKEN-SENTINEL") {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestWebhookSameHostRedirectOK(t *testing.T) {
-	var final atomic.Int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/a", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/b", http.StatusTemporaryRedirect) })
-	mux.HandleFunc("/b", func(w http.ResponseWriter, r *http.Request) { final.Add(1) })
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-	w, _ := NewWebhook(webhookCfg(srv.URL+"/a"), time.Second)
-	if err := w.Send(context.Background(), testEvent); err != nil || final.Load() != 1 {
-		t.Fatalf("err=%v final=%d", err, final.Load())
+func TestWebhookQueryTokenAndPathScrubbed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte(r.URL.String()))
+	}))
+	url := srv.URL + "/services/PATHSECRET-SENTINEL?token=QUERYSECRET-SENTINEL&a=1"
+	w, _ := NewWebhook(webhookCfg(url), time.Second)
+	err := w.Send(context.Background(), testEvent)
+	srv.Close()
+	if err == nil {
+		t.Fatal("want error")
+	}
+	// connection refused now: the dial error mentions only host:port.
+	err2 := w.Send(context.Background(), testEvent)
+	for _, e := range []error{err, err2} {
+		for _, bad := range []string{"PATHSECRET-SENTINEL", "QUERYSECRET-SENTINEL"} {
+			if e != nil && strings.Contains(e.Error(), bad) {
+				t.Fatalf("leak of %s: %v", bad, e)
+			}
+		}
+	}
+}
+
+func TestErrorChainExposesNoRawText(t *testing.T) {
+	// A transport error carrying a secret in its text must be reduced to a
+	// sanitized message and a kind sentinel.
+	raw := &net.OpError{Op: "dial", Err: errors.New("boom RAWSECRET-SENTINEL")}
+	err := scrub(raw, "RAWSECRET-SENTINEL")
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		t.Fatal("errors.As reached the raw cause")
+	}
+	for e := error(err); e != nil; e = errors.Unwrap(e) {
+		if strings.Contains(e.Error(), "RAWSECRET-SENTINEL") {
+			t.Fatalf("chain element leaks: %v", e)
+		}
+	}
+	if !errors.Is(err, ErrTemporary) || errors.Is(err, ErrPermanent) {
+		t.Fatalf("kind: %v", err)
+	}
+	if !errors.Is(scrub(context.DeadlineExceeded), context.DeadlineExceeded) {
+		t.Fatal("deadline kind lost")
+	}
+	if !errors.Is(permanent(errors.New("x")), ErrPermanent) {
+		t.Fatal("permanent kind lost")
+	}
+}
+
+func TestScrubQueryPairsAndShortValues(t *testing.T) {
+	err := scrub(errors.New(`Post "https://h.example.test/p?token=ab&k=LONGVALUE12": x`), "LONGVALUE12")
+	if strings.Contains(err.Error(), "token=ab") || strings.Contains(err.Error(), "LONGVALUE12") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSecretStringsFromURL(t *testing.T) {
+	got := urlSecrets("https://user:pw1234@h.example.test/path/TOKEN9?a=VALUE1&b=2#FRAG123")
+	have := map[string]bool{}
+	for _, g := range got {
+		have[g] = true
+	}
+	for _, w := range []string{"/path/TOKEN9", "VALUE1", "a=VALUE1", "pw1234", "FRAG123"} {
+		if !have[w] {
+			t.Errorf("missing element %q in %v", w, got)
+		}
 	}
 }
 
@@ -261,5 +345,22 @@ func TestWebhookIgnoresAmbientProxy(t *testing.T) {
 	case <-hit:
 		t.Fatal("request went through ambient proxy")
 	default:
+	}
+}
+
+func TestWebhookSeverityNormalizedInJSON(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { body, _ = io.ReadAll(r.Body) }))
+	defer srv.Close()
+	w, _ := NewWebhook(webhookCfg(srv.URL), time.Second)
+	e := testEvent
+	e.Severity = "  CRITICAL "
+	if err := w.Send(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	_ = json.Unmarshal(body, &m)
+	if m["severity"] != "critical" {
+		t.Fatalf("severity %v", m["severity"])
 	}
 }

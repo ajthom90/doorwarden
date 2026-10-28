@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -92,20 +93,52 @@ func TestNtfyAuth(t *testing.T) {
 	}
 }
 
-func TestNtfyRefusesCrossHostRedirectWithoutLeakingToken(t *testing.T) {
+func TestNtfyDoesNotFollowRedirectsOrLeakToken(t *testing.T) {
 	var leaked atomic.Int32
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked.Add(1) }))
 	defer other.Close()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, other.URL, http.StatusTemporaryRedirect)
+		http.Redirect(w, r, other.URL+"?k=LOC-SENTINEL", http.StatusTemporaryRedirect)
 	}))
 	defer srv.Close()
 	c := ntfyCfg(srv.URL)
 	c.Token = "tk_SENTINEL"
 	n, _ := NewNtfy(c, time.Second)
 	err := n.Send(context.Background(), testEvent)
-	if err == nil || leaked.Load() != 0 || strings.Contains(err.Error(), "tk_SENTINEL") {
+	if err == nil || leaked.Load() != 0 || strings.Contains(err.Error(), "tk_SENTINEL") || strings.Contains(err.Error(), "LOC-SENTINEL") ||
+		!strings.Contains(err.Error(), "unexpected redirect (status 307); redirects are not followed") {
 		t.Fatalf("err=%v leaked=%d", err, leaked.Load())
+	}
+}
+
+func TestNtfyTopicIsSecret(t *testing.T) {
+	c := ntfyCfg("https://ntfy.example.test")
+	c.Topic = "SECRETTOPIC-sentinel"
+	if s := fmt.Sprintf("%+v %v %#v", c, c, c); strings.Contains(s, "SECRETTOPIC") {
+		t.Fatalf("topic printed: %s", s)
+	}
+	n, err := NewNtfy(c, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// unroutable-by-refusal: closed port
+	err = n.Send(context.Background(), testEvent)
+	if err == nil || strings.Contains(err.Error(), "SECRETTOPIC") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestNtfySeverityCaseInsensitive(t *testing.T) {
+	var prio string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { prio = r.Header.Get("Priority") }))
+	defer srv.Close()
+	n, _ := NewNtfy(ntfyCfg(srv.URL), time.Second)
+	for sev, want := range map[Severity]string{"CRITICAL": "5", " Warning ": "4", "INFO": "3"} {
+		e := testEvent
+		e.Severity = sev
+		if err := n.Send(context.Background(), e); err != nil || prio != want {
+			t.Errorf("%q: err=%v prio=%q want %q", sev, err, prio, want)
+		}
 	}
 }
 

@@ -59,7 +59,7 @@ type WebhookCfg struct {
 type NtfyCfg struct {
 	NotifyCommon      `yaml:",inline"`
 	Server            string         `yaml:"server"`
-	Topic             string         `yaml:"topic"`
+	Topic             secrets.Secret `yaml:"topic"` // on public servers the topic is the password
 	Token             secrets.Secret `yaml:"token"`
 	Username          string         `yaml:"username"`
 	Password          secrets.Secret `yaml:"password"`
@@ -164,7 +164,7 @@ func (n *Notifications) validate() []error {
 		if err := ValidateNotifyURL(t.Server, t.AllowInsecureHTTP); err != nil {
 			add("%s.server: %v", p, err)
 		}
-		if !topicRe.MatchString(t.Topic) {
+		if !topicRe.MatchString(t.Topic.Reveal()) {
 			add("%s.topic must match [A-Za-z0-9_-]{1,64}", p)
 		}
 		if t.Token != "" && (t.Username != "" || t.Password != "") {

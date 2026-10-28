@@ -21,7 +21,7 @@ type Ntfy struct {
 	name    string
 	cfg     config.NtfyCfg
 	target  string
-	client  *http.Client
+	client  *httpDoer
 	secrets []string
 }
 
@@ -30,7 +30,7 @@ func NewNtfy(cfg config.NtfyCfg, timeout time.Duration) (*Ntfy, error) {
 	if err := config.ValidateNotifyURL(cfg.Server, cfg.AllowInsecureHTTP); err != nil {
 		return nil, fmt.Errorf("ntfy %q: server: %w", cfg.Name, err)
 	}
-	if !topicRe.MatchString(cfg.Topic) {
+	if !topicRe.MatchString(cfg.Topic.Reveal()) {
 		return nil, fmt.Errorf("ntfy %q: invalid topic", cfg.Name)
 	}
 	if cfg.Token != "" && (cfg.Username != "" || cfg.Password != "") {
@@ -39,12 +39,14 @@ func NewNtfy(cfg config.NtfyCfg, timeout time.Duration) (*Ntfy, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return &Ntfy{
+	n := &Ntfy{
 		name: cfg.Name, cfg: cfg,
-		target:  strings.TrimRight(cfg.Server, "/") + "/" + cfg.Topic,
-		client:  newHTTPClient(timeout),
-		secrets: []string{cfg.Token.Reveal(), cfg.Password.Reveal(), cfg.Server},
-	}, nil
+		target: strings.TrimRight(cfg.Server, "/") + "/" + cfg.Topic.Reveal(),
+		client: newHTTPClient(timeout),
+	}
+	n.secrets = append(urlSecrets(n.target), cfg.Token.Reveal(), cfg.Password.Reveal(), cfg.Topic.Reveal())
+	n.secrets = append(n.secrets, urlSecrets(cfg.Server)...)
+	return n, nil
 }
 
 // Name returns the configured sender name.

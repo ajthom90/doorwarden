@@ -117,9 +117,10 @@ func (s *SMTP) Send(ctx context.Context, e Event) error {
 }
 
 func (s *SMTP) wrapErr(err error) error {
-	err = scrub(err, s.cfg.Password.Reveal(), s.cfg.Username)
 	var te *textproto.Error
-	if errors.As(err, &te) && te.Code >= 500 {
+	perm := errors.As(err, &te) && te.Code >= 500
+	err = scrub(err, s.cfg.Password.Reveal()) // password only: usernames are short and not secret
+	if perm {
 		return permanent(err)
 	}
 	return err

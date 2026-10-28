@@ -3,6 +3,9 @@ package notify
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +90,9 @@ func newTestDispatcher(t *testing.T, o Options) (*Dispatcher, *fakeClock, *sleep
 	t.Helper()
 	clk, sl := newClock(), &sleepRec{}
 	o.Now, o.Sleep = clk.Now, sl.Sleep
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	d := NewDispatcher(o)
 	t.Cleanup(func() {
 		ctx, c := context.WithTimeout(context.Background(), 2*time.Second)
@@ -221,7 +227,7 @@ func TestRateLimitTokenBucket(t *testing.T) {
 func TestRateLimitReportsDropped(t *testing.T) {
 	var dropped atomic.Int32
 	d, _, _ := newTestDispatcher(t, Options{Observe: func(_, res string) {
-		if res == "dropped" {
+		if res == "rate_limited" {
 			dropped.Add(1)
 		}
 	}})
@@ -269,20 +275,102 @@ func TestDedupeDisabledByNegativeWindow(t *testing.T) {
 	}
 }
 
-func TestDedupePrunesExpiredKeys(t *testing.T) {
-	d, clk, _ := newTestDispatcher(t, Options{DedupeWindow: time.Minute})
-	d.Add(&fakeSender{name: "s"}, SenderOptions{RatePerMinute: 100000})
-	for i := 0; i < 3000; i++ {
-		_ = d.Notify(context.Background(), ev(Info, "k"+string(rune('a'+i%26))+strings.Repeat("x", i%50)+time.Duration(i).String()))
-		if i%100 == 0 {
-			clk.Advance(time.Minute + time.Second)
+// dedupeKeys returns how many deliveries carried each DedupeKey.
+func deliveredByKey(s *fakeSender) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int{}
+	for _, e := range s.got {
+		out[e.DedupeKey]++
+	}
+	return out
+}
+
+func notifyKeys(t *testing.T, d *Dispatcher, prefix string, from, to int) {
+	t.Helper()
+	for i := from; i < to; i++ {
+		if err := d.Notify(context.Background(), ev(Info, fmt.Sprintf("%s-%d", prefix, i))); err != nil {
+			t.Fatalf("notify %s-%d: %v", prefix, i, err)
 		}
 	}
+}
+
+// The suppression map stays bounded, live keys survive a prune, and expired
+// keys no longer suppress.
+func TestDedupePruneBoundsMapKeepsLiveKeys(t *testing.T) {
+	d, clk, _ := newTestDispatcher(t, Options{DedupeWindow: time.Hour, QueueSize: 6000})
+	s := &fakeSender{name: "s"}
+	d.Add(s, SenderOptions{RatePerMinute: 1000000})
+	notifyKeys(t, d, "old", 0, 1000) // expires at t0+1h
+	clk.Advance(59 * time.Minute)
+	notifyKeys(t, d, "live", 0, 1000) // expires at t0+1h59m
+	clk.Advance(2 * time.Minute)      // old expired, live not
+	notifyKeys(t, d, "new", 0, 200)   // pushes past maxDedupeKeys: prune runs
 	d.mu.Lock()
 	n := len(d.seen)
 	d.mu.Unlock()
 	if n > maxDedupeKeys {
-		t.Fatalf("dedupe map grew to %d", n)
+		t.Fatalf("map grew to %d (> %d)", n, maxDedupeKeys)
+	}
+	if n < 1000 {
+		t.Fatalf("live keys were wiped: %d entries", n)
+	}
+	notifyKeys(t, d, "live", 0, 1000) // must all be suppressed still
+	notifyKeys(t, d, "old", 0, 10)    // expired: accepted again
+	closeAll(t, d)
+	got := deliveredByKey(s)
+	for i := 0; i < 1000; i++ {
+		if c := got[fmt.Sprintf("live-%d", i)]; c != 1 {
+			t.Fatalf("live-%d delivered %d times, want 1 (suppression lost after prune)", i, c)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		if c := got[fmt.Sprintf("old-%d", i)]; c != 2 {
+			t.Fatalf("old-%d delivered %d times, want 2 (expired key still suppressed)", i, c)
+		}
+	}
+}
+
+func TestDropsAreObserved(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+	obs := func(typ, res string) { mu.Lock(); seen[typ+"/"+res]++; mu.Unlock() }
+	d, _, _ := newTestDispatcher(t, Options{Observe: obs, QueueSize: 1, Timeout: time.Minute})
+	s := &fakeSender{name: "s", block: make(chan struct{})}
+	d.Add(s, SenderOptions{MinSeverity: Warning})
+	_ = d.Notify(context.Background(), ev(Critical, "k"))
+	_ = d.Notify(context.Background(), ev(Critical, "k")) // suppressed
+	for s.callCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	_ = d.Notify(context.Background(), ev(Critical, "")) // fills the queue
+	if err := d.Notify(context.Background(), ev(Critical, "")); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("err = %v", err)
+	}
+	_ = d.Deliver(context.Background(), ev(Info, "")) // filtered
+	mu.Lock()
+	defer mu.Unlock()
+	for _, k := range []string{"dispatcher/suppressed_dedupe", "dispatcher/dropped_queue_full", "webhook/filtered_severity"} {
+		if seen[k] != 1 {
+			t.Errorf("%s = %d, want 1 (all: %v)", k, seen[k], seen)
+		}
+	}
+}
+
+func TestSeverityMixedCaseThroughFilter(t *testing.T) {
+	d, _, _ := newTestDispatcher(t, Options{})
+	s := &fakeSender{name: "s"}
+	d.Add(s, SenderOptions{MinSeverity: Warning})
+	for _, sev := range []Severity{"CRITICAL", " Warning", "INFO", "weird"} {
+		_ = d.Deliver(context.Background(), ev(sev, ""))
+	}
+	if s.count() != 2 {
+		t.Fatalf("delivered %d, want 2", s.count())
+	}
+	for _, e := range s.got {
+		if e.Severity != Critical && e.Severity != Warning {
+			t.Fatalf("not normalized: %q", e.Severity)
+		}
 	}
 }
 

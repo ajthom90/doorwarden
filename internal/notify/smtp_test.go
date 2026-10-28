@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -17,6 +18,7 @@ import (
 	"mime/quotedprintable"
 	"net"
 	"net/mail"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"sync"
@@ -370,5 +372,45 @@ func TestSMTPAuthFailureDoesNotLeakPassword(t *testing.T) {
 	// The hostile server echoes the decoded credentials in its 535 reply.
 	if strings.Contains(err.Error(), "PASSWORD-SENTINEL") {
 		t.Fatalf("leak: %v", err)
+	}
+	var te *textproto.Error
+	if errors.As(err, &te) {
+		t.Fatalf("raw *textproto.Error reachable: %q", te.Msg)
+	}
+	for e := error(err); e != nil; e = errors.Unwrap(e) {
+		if strings.Contains(e.Error(), "PASSWORD-SENTINEL") {
+			t.Fatalf("chain element leaks: %v", e)
+		}
+	}
+}
+
+func TestSMTPScrubsPasswordOnlyNotUsername(t *testing.T) {
+	f := startFakeSMTP(t, false)
+	f.authFail = true
+	cfg := smtpCfg(f)
+	cfg.Username = "u"
+	s := newTestSMTP(t, cfg, f)
+	err := s.Send(context.Background(), testEvent)
+	if err == nil || !strings.Contains(err.Error(), "authentication") && !strings.Contains(err.Error(), "auth") {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(err.Error(), "[redacted]") && strings.Count(err.Error(), "[redacted]") > 2 {
+		t.Fatalf("username scrubbed everywhere: %v", err)
+	}
+	if !strings.Contains(err.Error(), "smtp") || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("message garbled: %v", err)
+	}
+}
+
+func TestSMTPWrapErrKeepsUsernameText(t *testing.T) {
+	cfg := config.SMTPCfg{NotifyCommon: config.NotifyCommon{Name: "m"}, Host: "mail.example.test", Port: 465, TLS: "tls",
+		Username: "mail", Password: "PASSWORD-SENTINEL", From: "a@example.test", To: []string{"b@example.test"}}
+	s, err := NewSMTP(cfg, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s.wrapErr(errors.New("535 mail account PASSWORD-SENTINEL rejected")).Error()
+	if !strings.Contains(got, "mail account") || strings.Contains(got, "PASSWORD-SENTINEL") {
+		t.Fatalf("got %q", got)
 	}
 }

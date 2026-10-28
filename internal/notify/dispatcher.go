@@ -44,8 +44,10 @@ type Options struct {
 
 	Now   func() time.Time                                 // injectable clock
 	Sleep func(ctx context.Context, d time.Duration) error // injectable sleeper
-	// Observe is called once per sender per event with result ok|error|dropped
-	// (dropped = rate limited). Typically wired to Metrics.Notification.
+	// Observe counts outcomes as (senderType, result). Per sender: ok, error,
+	// rate_limited, filtered_severity. Dispatcher-level (senderType
+	// "dispatcher"): dropped_queue_full, suppressed_dedupe. The set is closed.
+	// Typically wired to Metrics.Notification.
 	Observe func(senderType, result string)
 	Logger  *slog.Logger
 }
@@ -61,6 +63,12 @@ const (
 // onto a bounded queue (ErrQueueFull when full) drained by one worker
 // goroutine; each event is sent to all senders concurrently, each attempt
 // bounded by Timeout, with one retry after RetryBackoff for transient errors.
+// Dedupe is global (one window per DedupeKey across all senders) and is
+// recorded when the event is enqueued, so an event that is then rate limited
+// or fails everywhere still suppresses repeats for the window. A black-holed
+// sender can delay delivery to the others by up to ~2*Timeout+RetryBackoff
+// per event (~22s with defaults), and a burst beyond QueueSize is dropped
+// (ErrQueueFull); per-sender queues would remove both limits.
 // Delivery uses the dispatcher's own context, never the caller's, so a
 // cancelled reconcile does not lose an alert. Close stops intake, drains the
 // queue until its context expires, then aborts in-flight sends.
@@ -215,22 +223,31 @@ func (d *Dispatcher) Notify(_ context.Context, e Event) (err error) {
 		}
 	}()
 	e = e.normalized()
+	result, err := d.enqueue(e)
+	if result != "" {
+		d.observe("dispatcher", result)
+	}
+	return err
+}
+
+// enqueue applies dedupe and queues e. result is a drop reason to observe.
+func (d *Dispatcher) enqueue(e Event) (result string, err error) {
 	now := d.o.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		return ErrClosed
+		return "", ErrClosed
 	}
 	key := truncate(e.DedupeKey, maxDedupeKey)
 	if key != "" && d.o.DedupeWindow > 0 {
 		if exp, ok := d.seen[key]; ok && now.Before(exp) {
-			return nil
+			return "suppressed_dedupe", nil
 		}
 	}
 	select {
 	case d.queue <- e:
 	default:
-		return ErrQueueFull
+		return "dropped_queue_full", ErrQueueFull
 	}
 	if key != "" && d.o.DedupeWindow > 0 {
 		if len(d.seen) >= maxDedupeKeys {
@@ -238,7 +255,7 @@ func (d *Dispatcher) Notify(_ context.Context, e Event) (err error) {
 		}
 		d.seen[key] = now.Add(d.o.DedupeWindow)
 	}
-	return nil
+	return "", nil
 }
 
 // pruneLocked drops expired keys; if that frees nothing the map is reset
@@ -302,6 +319,7 @@ func (d *Dispatcher) Deliver(ctx context.Context, e Event) error {
 	var wg sync.WaitGroup
 	for i, s := range senders {
 		if e.Severity.Rank() < s.min.Rank() {
+			d.observe(s.s.Type(), "filtered_severity")
 			continue
 		}
 		wg.Add(1)
@@ -323,7 +341,7 @@ func (d *Dispatcher) observe(typ, res string) {
 func (d *Dispatcher) deliverOne(ctx context.Context, s *entry, e Event) error {
 	name, typ := s.s.Name(), s.s.Type()
 	if !s.allow(d.o.Now()) {
-		d.observe(typ, "dropped")
+		d.observe(typ, "rate_limited")
 		return fmt.Errorf("sender %q: %w", name, ErrRateLimited)
 	}
 	err := d.attempt(ctx, s.s, e)

@@ -21,7 +21,7 @@ const SignatureHeader = "X-Doorwarden-Signature"
 type Webhook struct {
 	name    string
 	cfg     config.WebhookCfg
-	client  *http.Client
+	client  *httpDoer
 	secrets []string
 }
 
@@ -39,7 +39,7 @@ func NewWebhook(cfg config.WebhookCfg, timeout time.Duration) (*Webhook, error) 
 		timeout = 10 * time.Second
 	}
 	w := &Webhook{name: cfg.Name, cfg: cfg, client: newHTTPClient(timeout)}
-	w.secrets = append(w.secrets, cfg.URL.Reveal(), cfg.Secret.Reveal())
+	w.secrets = append(urlSecrets(cfg.URL.Reveal()), cfg.Secret.Reveal())
 	for _, v := range cfg.Headers {
 		w.secrets = append(w.secrets, v.Reveal())
 	}
