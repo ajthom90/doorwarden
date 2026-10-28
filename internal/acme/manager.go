@@ -1054,6 +1054,14 @@ func (m *Manager) cleanupCertDirs(ctx context.Context) {
 		return
 	}
 	known := map[string]bool{}
+	removeAbove := func(id string, cur int) {
+		err := removeVersionsAboveLogged(m.certsDir, id, cur, func(name string) {
+			m.log.Info("acme: removed unrecorded certificate version directory", "cert", id, "dir", name)
+		})
+		if err != nil {
+			m.log.Warn("acme: certificate directory cleanup", "cert", id, "err", err)
+		}
+	}
 	for _, r := range rows {
 		known[r.ID] = true
 		cur := 0
@@ -1064,9 +1072,7 @@ func (m *Manager) cleanupCertDirs(ctx context.Context) {
 			}
 			cur = n
 		}
-		if err := removeVersionsAbove(m.certsDir, r.ID, cur); err != nil {
-			m.log.Warn("acme: certificate directory cleanup", "cert", r.ID, "err", err)
-		}
+		removeAbove(r.ID, cur)
 	}
 	ents, err := os.ReadDir(m.certsDir)
 	if err != nil {
@@ -1076,9 +1082,7 @@ func (m *Manager) cleanupCertDirs(ctx context.Context) {
 		if !e.IsDir() || known[e.Name()] || !validID(e.Name()) {
 			continue
 		}
-		if err := removeVersionsAbove(m.certsDir, e.Name(), 0); err != nil {
-			m.log.Warn("acme: certificate directory cleanup", "cert", e.Name(), "err", err)
-		}
+		removeAbove(e.Name(), 0)
 		_ = os.Remove(filepath.Join(m.certsDir, e.Name())) // only if now empty
 	}
 }

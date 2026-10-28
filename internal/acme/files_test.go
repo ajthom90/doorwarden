@@ -23,7 +23,7 @@ func (h *harness) reopen(t *testing.T) *Manager {
 	m, err := NewManager(ManagerConfig{Config: h.m.cfg, Store: h.st, Box: h.box, CertsDir: h.dir, Now: h.clock.Now,
 		Jitter:         func() float64 { return 0 },
 		ProviderByName: func(name string) (challenge.Provider, error) { return fakeDNSProvider{name}, nil },
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil))})
+		Logger:         slog.New(slog.NewTextHandler(io.MultiWriter(h.logs), nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +73,11 @@ func TestCrashBetweenFilesAndRowIsCleanedUp(t *testing.T) {
 	h.reopen(t)
 	if got := dirNames(t, filepath.Join(h.dir, b.ID)); got != "v1,v2" {
 		t.Fatalf("after restart: %s", got)
+	}
+	for _, want := range []string{"cert=" + b.ID + " dir=v3", "cert=example_test-000000000000 dir=v1"} {
+		if !strings.Contains(h.logs.String(), `removed unrecorded certificate version directory" `+want) {
+			t.Errorf("startup cleanup not logged (%s): %s", want, h.logs.String())
+		}
 	}
 	if _, err := os.Stat(filepath.Join(h.dir, "example_test-000000000000")); !os.IsNotExist(err) {
 		t.Fatalf("row-less id dir kept: %v", err)
@@ -164,5 +169,68 @@ func TestRowWriteFailureRemovesNewVersion(t *testing.T) {
 	}
 	if got := dirNames(t, filepath.Join(h.dir, b.ID)); got != "v1" {
 		t.Fatalf("version dirs after failed row write: %s", got)
+	}
+}
+
+// A symlink planted at certs/<id> is never followed: no chmod, write or
+// delete reaches its target, and the order or cleanup fails clearly.
+func TestCertDirSymlinkRefused(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	b, err := h.m.Issue(ctx, wildcardReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	for _, d := range []string{"v1", "v9", ".tmp-v-1"} {
+		if err := os.MkdirAll(filepath.Join(outside, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, d, "keep"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	idPath := filepath.Join(h.dir, b.ID)
+	if err := os.RemoveAll(idPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, idPath); err != nil {
+		t.Fatal(err)
+	}
+	check := func(stage string) {
+		t.Helper()
+		if got := dirNames(t, outside); got != ".tmp-v-1,v1,v9" {
+			t.Fatalf("%s: outside directory changed: %s", stage, got)
+		}
+		if fi, _ := os.Stat(outside); fi.Mode().Perm() != 0o755 {
+			t.Fatalf("%s: outside directory mode changed to %v", stage, fi.Mode().Perm())
+		}
+	}
+	h.reopen(t) // startup cleanup
+	check("cleanup")
+	if !strings.Contains(h.logs.String(), "is a symlink") {
+		t.Errorf("cleanup refusal not logged: %s", h.logs.String())
+	}
+	h.clock.Add(70 * 24 * time.Hour)
+	r := h.m.RenewNow(ctx, b.ID)
+	if r.Err == nil || !strings.Contains(r.Err.Error(), "symlink") {
+		t.Fatalf("want symlink refusal, got %v", r.Err)
+	}
+	check("renewal")
+	if err := pruneCertVersions(h.dir, b.ID, 20); err == nil {
+		t.Fatal("prune followed the symlink")
+	}
+	check("prune")
+	// A regular file there is refused too.
+	if err := os.Remove(idPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(idPath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeCertVersion(h.dir, b.ID, []byte("c"), []byte("k")); err == nil || !strings.Contains(err.Error(), "is not a directory; refusing") {
+		t.Fatalf("want not-a-directory refusal, got %v", err)
 	}
 }

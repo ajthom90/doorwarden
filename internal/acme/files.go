@@ -30,6 +30,31 @@ func ensureDir(dir string) error {
 	return os.Chmod(dir, dirMode)
 }
 
+// idDir returns root/<id> after checking, without following symlinks, that
+// it is a real directory: a symlink planted there must never redirect a
+// chmod, a write or a delete outside the certificate tree. With create it is
+// made (0700) when missing. The certs root itself may be a symlink.
+func idDir(root, id string, create bool) (string, error) {
+	dir := filepath.Join(root, id)
+	fi, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) && create {
+		if err := os.Mkdir(dir, dirMode); err != nil && !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+		fi, err = os.Lstat(dir)
+	}
+	if err != nil {
+		return "", err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("acme: %s is a symlink; refusing to use it (remove it)", dir)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("acme: %s is not a directory; refusing to use it (remove it)", dir)
+	}
+	return dir, nil
+}
+
 // writeTemp writes data to a new 0600 temp file next to path and fsyncs it.
 func writeTemp(path string, data []byte) (tmp string, err error) {
 	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-"+filepath.Base(path)+"-*")
@@ -79,7 +104,11 @@ const versionPrefix = "v"
 
 // certVersions lists the v<N> versions present under root/<id>, ascending.
 func certVersions(root, id string) []int {
-	ents, err := os.ReadDir(filepath.Join(root, id))
+	dir, err := idDir(root, id, false)
+	if err != nil {
+		return nil
+	}
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -136,8 +165,11 @@ func writeCertVersion(root, id string, chainPEM, keyPEM []byte) (string, error) 
 	if err := ensureDir(root); err != nil {
 		return "", fmt.Errorf("acme: certs dir: %w", err)
 	}
-	dir := filepath.Join(root, id)
-	if err := ensureDir(dir); err != nil {
+	dir, err := idDir(root, id, true)
+	if err != nil {
+		return "", fmt.Errorf("acme: cert dir: %w", err)
+	}
+	if err := os.Chmod(dir, dirMode); err != nil {
 		return "", fmt.Errorf("acme: cert dir: %w", err)
 	}
 	n := 1
@@ -184,7 +216,10 @@ func writeCertVersion(root, id string, chainPEM, keyPEM []byte) (string, error) 
 // (the current version and the one before it stay) and every leftover
 // staging directory.
 func pruneCertVersions(root, id string, keep int) error {
-	dir := filepath.Join(root, id)
+	dir, err := idDir(root, id, false)
+	if err != nil {
+		return err
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -206,12 +241,21 @@ func pruneCertVersions(root, id string, keep int) error {
 // leftover staging directories): files written by an attempt whose store
 // row was never updated. current 0 removes every version.
 func removeVersionsAbove(root, id string, current int) error {
-	dir := filepath.Join(root, id)
-	ents, err := os.ReadDir(dir)
+	return removeVersionsAboveLogged(root, id, current, nil)
+}
+
+// removeVersionsAboveLogged is removeVersionsAbove calling removed (if not
+// nil) with each version or staging directory it deleted.
+func removeVersionsAboveLogged(root, id string, current int, removed func(name string)) error {
+	dir, err := idDir(root, id, false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
+		return err
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
 		return err
 	}
 	var errs []error
@@ -220,6 +264,8 @@ func removeVersionsAbove(root, id string, current int) error {
 		if (isV && n > current) || strings.HasPrefix(e.Name(), ".tmp-") {
 			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
 				errs = append(errs, err)
+			} else if removed != nil {
+				removed(e.Name())
 			}
 		}
 	}
