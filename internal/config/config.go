@@ -73,11 +73,21 @@ type DockerSource struct {
 	Approval string `yaml:"approval"` // auto|approve|off
 }
 
+// StaticService is a statically configured service. Without ID the service
+// key derives from the name, so renaming such a service changes its key.
 type StaticService struct {
-	Name     string `yaml:"name"`
-	Host     string `yaml:"host"`
-	Upstream string `yaml:"upstream"`
-	Port     int    `yaml:"port"`
+	ID          string   `yaml:"id"`
+	Name        string   `yaml:"name"`
+	Host        string   `yaml:"host"`
+	Upstream    string   `yaml:"upstream"`
+	Port        int      `yaml:"port"`
+	Scheme      string   `yaml:"scheme"`
+	Zone        string   `yaml:"zone"`
+	SkipVerify  bool     `yaml:"skip_verify"`
+	Websockets  bool     `yaml:"websockets"`
+	Middlewares []string `yaml:"middlewares"`
+	Rename      string   `yaml:"rename"`
+	Skip        bool     `yaml:"skip"`
 }
 
 type Settings struct {

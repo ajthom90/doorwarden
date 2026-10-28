@@ -2,7 +2,6 @@ package approval
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -13,32 +12,46 @@ import (
 )
 
 type fake struct {
-	mu sync.Mutex
-	m  map[string]store.Service
+	mu       sync.Mutex
+	m        map[string]string
+	writes   int
+	failList bool
 }
 
-func newFake() *fake { return &fake{m: map[string]store.Service{}} }
-func (f *fake) ListServices(context.Context) ([]store.Service, error) {
+func newFake() *fake { return &fake{m: map[string]string{}} }
+func (f *fake) SetApproval(_ context.Context, k, fp string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var o []store.Service
-	for _, v := range f.m {
-		o = append(o, v)
+	f.m[k] = fp
+	f.writes++
+	return nil
+}
+func (f *fake) ClearApproval(_ context.Context, k string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.m, k)
+	f.writes++
+	return nil
+}
+func (f *fake) ListApprovals(context.Context) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return nil, errors.New("boom")
+	}
+	o := map[string]string{}
+	for k, v := range f.m {
+		o[k] = v
 	}
 	return o, nil
-}
-func (f *fake) UpsertService(_ context.Context, v store.Service) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.m[v.Key] = v
-	return nil
 }
 
 var ctx = context.Background()
 
 func svc(key, state string) model.Service {
-	return model.Service{Key: key, Source: "docker", Name: key, State: state,
-		Backend: model.Backend{Scheme: "http", Host: "192.0.2.1", Port: 80}}
+	return model.Service{Key: key, Source: "docker", Name: key, Zone: "example.test", State: state,
+		Backend: model.Backend{Scheme: "http", Host: "192.0.2.1", Port: 80},
+		Options: model.Options{Middlewares: []string{"auth", "rl"}}}
 }
 
 func states(out []model.Service) map[string]string {
@@ -47,6 +60,18 @@ func states(out []model.Service) map[string]string {
 		m[s.Key] = s.State
 	}
 	return m
+}
+
+func resolveState(t *testing.T, g *Gate, m Mode, s model.Service) string {
+	t.Helper()
+	out, err := g.Resolve(ctx, m, []model.Service{s})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("out=%+v", out)
+	}
+	return out[0].State
 }
 
 func TestAutoPublishesAndSkipWins(t *testing.T) {
@@ -64,42 +89,50 @@ func TestAutoPublishesAndSkipWins(t *testing.T) {
 
 func TestOffOmits(t *testing.T) {
 	g := NewGate(newFake())
-	out, _ := g.Resolve(ctx, ModeOff, []model.Service{svc("a", model.StateDiscovered), svc("b", model.StateStopped)})
-	if len(out) != 0 {
-		t.Fatalf("%+v", out)
+	out, err := g.Resolve(ctx, ModeOff, []model.Service{svc("a", model.StateDiscovered), svc("b", model.StateStopped)})
+	if err != nil || len(out) != 0 {
+		t.Fatalf("%v %+v", err, out)
+	}
+	if err := g.Approve(ctx, "a"); !errors.Is(err, ErrUnknownService) {
+		t.Fatalf("off mode must not allow approval: %v", err)
 	}
 }
 
-func TestApproveFlow(t *testing.T) {
-	g := NewGate(newFake())
-	in := []model.Service{svc("a", model.StateDiscovered)}
-	out, _ := g.Resolve(ctx, ModeApprove, in)
-	if states(out)["a"] != model.StatePending {
-		t.Fatalf("%+v", out)
+func TestApproveFlowAndRevoke(t *testing.T) {
+	f := newFake()
+	g := NewGate(f)
+	s := svc("a", model.StateDiscovered)
+	if resolveState(t, g, ModeApprove, s) != model.StatePending {
+		t.Fatal("want pending")
 	}
 	if err := g.Approve(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	out, _ = g.Resolve(ctx, ModeApprove, in)
-	if states(out)["a"] != model.StatePublished {
-		t.Fatalf("%+v", out)
+	if resolveState(t, g, ModeApprove, s) != model.StatePublished {
+		t.Fatal("want published")
 	}
 	if err := g.Revoke(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	out, _ = g.Resolve(ctx, ModeApprove, in)
-	if states(out)["a"] != model.StatePending {
-		t.Fatalf("%+v", out)
+	if resolveState(t, g, ModeApprove, s) != model.StatePending {
+		t.Fatal("want pending after revoke")
+	}
+	w := f.writes
+	if err := g.Revoke(ctx, "a"); err != nil || f.writes != w {
+		t.Fatalf("revoke of absent must be a no-op: err=%v writes %d->%d", err, w, f.writes)
 	}
 }
 
-func TestApproveSkipStillOmitted(t *testing.T) {
+func TestSkipWinsInApprove(t *testing.T) {
 	g := NewGate(newFake())
 	s := svc("a", model.StateDiscovered)
 	s.Options.Skip = true
-	out, _ := g.Resolve(ctx, ModeApprove, []model.Service{s})
-	if len(out) != 0 {
-		t.Fatalf("%+v", out)
+	out, err := g.Resolve(ctx, ModeApprove, []model.Service{s})
+	if err != nil || len(out) != 0 {
+		t.Fatalf("%v %+v", err, out)
+	}
+	if err := g.Approve(ctx, "a"); !errors.Is(err, ErrUnknownService) {
+		t.Fatalf("%v", err)
 	}
 }
 
@@ -108,7 +141,7 @@ func TestUnknownKey(t *testing.T) {
 	if err := g.Approve(ctx, "nope"); !errors.Is(err, ErrUnknownService) {
 		t.Fatalf("%v", err)
 	}
-	if err := g.Revoke(ctx, "nope"); !errors.Is(err, ErrUnknownService) {
+	if err := g.Revoke(ctx, "nope"); err != nil {
 		t.Fatalf("%v", err)
 	}
 }
@@ -116,38 +149,80 @@ func TestUnknownKey(t *testing.T) {
 func TestStoppedErrorKeepStateEveryMode(t *testing.T) {
 	f := newFake()
 	g := NewGate(f)
-	in := []model.Service{svc("s", model.StateStopped), svc("e", model.StateError)}
-	// pre-approve both
-	f.UpsertService(ctx, store.Service{Key: "s", State: model.StatePublished, OverridesJSON: `{"approved":true}`})
-	f.UpsertService(ctx, store.Service{Key: "e", State: model.StatePublished, OverridesJSON: `{"approved":true}`})
+	s, e := svc("s", model.StateStopped), svc("e", model.StateError)
+	f.m["s"], f.m["e"] = Fingerprint(s), Fingerprint(e) // even if "approved"
 	for _, m := range []Mode{ModeAuto, ModeApprove} {
-		out, _ := g.Resolve(ctx, m, in)
+		out, err := g.Resolve(ctx, m, []model.Service{s, e})
 		st := states(out)
-		if len(out) != 2 || st["s"] != model.StateStopped || st["e"] != model.StateError {
-			t.Fatalf("%s: %+v", m, out)
+		if err != nil || len(out) != 2 || st["s"] != model.StateStopped || st["e"] != model.StateError {
+			t.Fatalf("%s: %v %+v", m, err, out)
 		}
 	}
 }
 
-func TestApprovePreservesOverrides(t *testing.T) {
-	f := newFake()
-	g := NewGate(f)
-	f.UpsertService(ctx, store.Service{Key: "a", Source: "docker", State: model.StatePending, OverridesJSON: `{"rename":"x","n":1}`})
+func TestFingerprintChangesFlipToPending(t *testing.T) {
+	mut := map[string]func(*model.Service){
+		"drop middleware": func(s *model.Service) { s.Options.Middlewares = []string{"rl"} },
+		"zone":            func(s *model.Service) { s.Zone = "other.test" },
+		"rename":          func(s *model.Service) { s.Options.Rename = "evil" },
+		"name":            func(s *model.Service) { s.Name = "other" },
+		"scheme":          func(s *model.Service) { s.Backend.Scheme = "https" },
+		"skip-verify":     func(s *model.Service) { s.Backend.SkipVerify = true },
+		"websockets":      func(s *model.Service) { s.Options.Websockets = true },
+	}
+	for name, f := range mut {
+		g := NewGate(newFake())
+		s := svc("a", model.StateDiscovered)
+		resolveState(t, g, ModeApprove, s)
+		if err := g.Approve(ctx, "a"); err != nil {
+			t.Fatal(err)
+		}
+		if resolveState(t, g, ModeApprove, s) != model.StatePublished {
+			t.Fatalf("%s: not published before change", name)
+		}
+		c := s
+		c.Options.Middlewares = append([]string(nil), s.Options.Middlewares...)
+		f(&c)
+		if resolveState(t, g, ModeApprove, c) != model.StatePending {
+			t.Errorf("%s: change did not revoke approval", name)
+		}
+		// re-approve the changed content publishes again
+		if err := g.Approve(ctx, "a"); err != nil {
+			t.Fatal(err)
+		}
+		if resolveState(t, g, ModeApprove, c) != model.StatePublished {
+			t.Errorf("%s: re-approve did not publish", name)
+		}
+	}
+}
+
+func TestFingerprintIgnoresPortHostAndMiddlewareOrder(t *testing.T) {
+	g := NewGate(newFake())
+	s := svc("a", model.StateDiscovered)
+	resolveState(t, g, ModeApprove, s)
 	if err := g.Approve(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	var m map[string]any
-	if err := json.Unmarshal([]byte(f.m["a"].OverridesJSON), &m); err != nil {
+	c := s
+	c.Backend.Port, c.Backend.Host = 32768, "198.51.100.9"
+	c.Options.Middlewares = []string{"rl", "auth"}
+	if resolveState(t, g, ModeApprove, c) != model.StatePublished {
+		t.Fatal("port/host/order change must keep approval")
+	}
+}
+
+func TestReturningServiceStaysApproved(t *testing.T) {
+	g := NewGate(newFake())
+	s := svc("a", model.StateDiscovered)
+	resolveState(t, g, ModeApprove, s)
+	if err := g.Approve(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if m["rename"] != "x" || m["n"] != float64(1) || m["approved"] != true {
-		t.Fatalf("%v", m)
+	if out, err := g.Resolve(ctx, ModeApprove, nil); err != nil || len(out) != 0 {
+		t.Fatal(err)
 	}
-	g.Revoke(ctx, "a")
-	m = nil
-	json.Unmarshal([]byte(f.m["a"].OverridesJSON), &m)
-	if m["rename"] != "x" || m["approved"] == true {
-		t.Fatalf("%v", m)
+	if resolveState(t, g, ModeApprove, s) != model.StatePublished {
+		t.Fatal("should stay approved")
 	}
 }
 
@@ -157,30 +232,99 @@ func TestApprovalSurvivesRestartRealStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	in := []model.Service{svc("a", model.StateDiscovered)}
+	s := svc("a", model.StateDiscovered)
 	g1 := NewGate(st)
-	out, err := g1.Resolve(ctx, ModeApprove, in)
-	if err != nil || states(out)["a"] != model.StatePending {
-		t.Fatalf("%v %+v", err, out)
+	if resolveState(t, g1, ModeApprove, s) != model.StatePending {
+		t.Fatal("want pending")
 	}
 	if err := g1.Approve(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
-	out, err = NewGate(st).Resolve(ctx, ModeApprove, in)
-	if err != nil || states(out)["a"] != model.StatePublished {
-		t.Fatalf("%v %+v", err, out)
+	g2 := NewGate(st)
+	if err := g2.Approve(ctx, "a"); !errors.Is(err, ErrUnknownService) {
+		t.Fatalf("fresh gate has no snapshot: %v", err)
+	}
+	if resolveState(t, g2, ModeApprove, s) != model.StatePublished {
+		t.Fatal("approval lost across gates")
+	}
+	// a services-table rewrite does not touch approvals
+	if err := st.UpsertService(ctx, store.Service{Key: "a", Source: "docker", State: model.StatePublished, OverridesJSON: `{"x":1}`}); err != nil {
+		t.Fatal(err)
+	}
+	if resolveState(t, NewGate(st), ModeApprove, s) != model.StatePublished {
+		t.Fatal("approval clobbered by services write")
+	}
+	if err := g2.Revoke(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if resolveState(t, NewGate(st), ModeApprove, s) != model.StatePending {
+		t.Fatal("revoke not persisted")
 	}
 }
 
-func TestConcurrent(t *testing.T) {
+func TestUnknownModeErrors(t *testing.T) {
 	g := NewGate(newFake())
+	if _, err := g.Resolve(ctx, Mode("bogus"), []model.Service{svc("a", model.StateDiscovered)}); err == nil {
+		t.Fatal("want error")
+	}
+}
+
+func TestResolveStoreErrorLeavesNoState(t *testing.T) {
+	f := newFake()
+	g := NewGate(f)
+	s := svc("a", model.StateDiscovered)
+	resolveState(t, g, ModeApprove, s) // snapshot has "a"
+	f.failList = true
+	if _, err := g.Resolve(ctx, ModeApprove, []model.Service{svc("b", model.StateDiscovered)}); err == nil {
+		t.Fatal("want error")
+	}
+	if f.writes != 0 || len(f.m) != 0 {
+		t.Fatalf("unexpected writes: %d %v", f.writes, f.m)
+	}
+	f.failList = false
+	if err := g.Approve(ctx, "a"); err != nil { // snapshot unchanged by failed Resolve
+		t.Fatal(err)
+	}
+	if err := g.Approve(ctx, "b"); !errors.Is(err, ErrUnknownService) {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestConcurrentConsistency(t *testing.T) {
+	f := newFake()
+	g := NewGate(f)
 	in := []model.Service{svc("a", model.StateDiscovered)}
-	g.Resolve(ctx, ModeApprove, in)
+	if _, err := g.Resolve(ctx, ModeApprove, in); err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		wg.Add(2)
-		go func() { defer wg.Done(); _ = g.Approve(ctx, "a") }()
-		go func() { defer wg.Done(); _, _ = g.Resolve(ctx, ModeApprove, in) }()
+		go func() {
+			defer wg.Done()
+			if err := g.Approve(ctx, "a"); err != nil {
+				t.Error(err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := g.Resolve(ctx, ModeApprove, in); err != nil {
+				t.Error(err)
+			}
+		}()
 	}
 	wg.Wait()
+	if resolveState(t, g, ModeApprove, in[0]) != model.StatePublished || f.m["a"] != Fingerprint(in[0]) {
+		t.Fatalf("inconsistent: %v", f.m)
+	}
+	var wg2 sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg2.Add(2)
+		go func() { defer wg2.Done(); _ = g.Revoke(ctx, "a") }()
+		go func() { defer wg2.Done(); _, _ = g.Resolve(ctx, ModeApprove, in) }()
+	}
+	wg2.Wait()
+	if resolveState(t, g, ModeApprove, in[0]) != model.StatePending {
+		t.Fatal("revoke should leave pending")
+	}
 }

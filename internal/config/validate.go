@@ -102,6 +102,19 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 			add("%s %q must be auto, approve or off", a.name, a.v)
 		}
 	}
+	seen := map[string]int{}
+	for i, st := range c.Static {
+		for _, p := range st.Problems() {
+			add("static[%d] %s: %s", i, st.Name, p)
+		}
+		if k := st.Key(); k != "" {
+			if j, dup := seen[k]; dup {
+				add("static[%d] %s: duplicate key %s (also static[%d])", i, st.Name, k, j)
+			} else {
+				seen[k] = i
+			}
+		}
+	}
 	return errs
 }
 

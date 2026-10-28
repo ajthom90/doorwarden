@@ -2,45 +2,31 @@
 // without labels) into model.Services. Hosts may be hostnames or IPs and are
 // never resolved here.
 //
-// config.StaticService only carries name/host/upstream/port, so the richer
-// per-service options live on Entry; FromConfig lifts a config entry into one.
+// Key is "static:<id>" when the entry has an id, else "static:<slug of name>";
+// renaming an entry that has no id therefore changes its key. Entries with
+// neither (an invalid definition) share the key "static:unnamed".
 //
-// An invalid definition yields a Service with State error and an empty
-// backend (Host "", Port 0; see source.Source for the consumer contract); the
-// reasons are available from Warnings (reset on every List call). Duplicate
-// ids/names are all returned; the reconciler resolves the conflict.
+// Validation uses config.StaticService.Problems. An invalid definition yields a
+// Service with State error and an empty backend (Host "", Port 0; see
+// source.Source for the consumer contract); the reasons are available from
+// Warnings . Duplicate keys are all returned; the
+// reconciler resolves the conflict.
 package static
 
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"sort"
-	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/model"
 )
 
-// Entry is one static service definition.
-type Entry struct {
-	ID, Name, Zone string
-	Scheme, Host   string // Scheme defaults to http
-	Port           int
-	SkipVerify     bool // implies https unless Scheme says otherwise
-	Websockets     bool
-	Middlewares    []string
-	Rename         string
-	Skip           bool
-
-	// invalid is set by FromConfig when the upstream URL cannot be parsed.
-	invalid string
-}
-
 // Config configures the static source.
 type Config struct {
-	Services []Entry
+	Services []config.StaticService
 	Name     string // source name, default "static"
 }
 
@@ -71,76 +57,27 @@ func (s *Source) Warnings() []string {
 	return append([]string(nil), s.warnings...)
 }
 
-// FromConfig converts a config entry. A non-empty Upstream (scheme://host[:port])
-// overrides Host/Port; otherwise Host and Port are used.
-func FromConfig(c config.StaticService) Entry {
-	e := Entry{Name: c.Name, Host: c.Host, Port: c.Port}
-	if c.Upstream == "" {
-		return e
-	}
-	u, err := url.Parse(c.Upstream)
-	if err != nil || u.Hostname() == "" {
-		e.invalid = fmt.Sprintf("invalid upstream %q", c.Upstream)
-		return e
-	}
-	e.Scheme, e.Host = u.Scheme, u.Hostname()
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			e.invalid = fmt.Sprintf("invalid upstream port %q", p)
-			return e
-		}
-		e.Port = n
-	} else {
-		e.Port = c.Port
-	}
-	return e
-}
-
 // List converts the entries; it never fails.
 func (s *Source) List(_ context.Context) ([]model.Service, error) {
 	var out []model.Service
 	var warns []string
-	for i, e := range s.cfg.Services {
-		id := e.ID
-		if id == "" {
-			id = e.Name
-		}
-		if id == "" {
-			id = fmt.Sprintf("unnamed-%d", i)
+	for _, e := range s.cfg.Services {
+		key := e.Key()
+		if key == "" {
+			key = "static:unnamed"
 		}
 		svc := model.Service{
-			Key: "static:" + id, Source: "static", Name: e.Name, Zone: e.Zone,
+			Key: key, Source: "static", Name: e.Name, Zone: e.Zone,
 			Options: model.Options{Skip: e.Skip, Websockets: e.Websockets,
 				Middlewares: append([]string(nil), e.Middlewares...), Rename: e.Rename},
 			State: model.StateDiscovered,
 		}
-		scheme := e.Scheme
-		if scheme == "" {
-			scheme = "http"
-			if e.SkipVerify {
-				scheme = "https"
-			}
-		}
-		var reason string
-		switch {
-		case e.invalid != "":
-			reason = e.invalid
-		case e.Name == "":
-			reason = "empty name"
-		case e.Host == "":
-			reason = "empty host"
-		case e.Port < 1 || e.Port > 65535:
-			reason = fmt.Sprintf("port %d out of range 1..65535", e.Port)
-		case scheme != "http" && scheme != "https":
-			reason = fmt.Sprintf("unsupported scheme %q", scheme)
-		}
-		if reason != "" {
+		if probs := e.Problems(); len(probs) > 0 {
 			svc.State = model.StateError
-			svc.Backend = model.Backend{Scheme: scheme, SkipVerify: e.SkipVerify}
-			warns = append(warns, fmt.Sprintf("static %s: %s", svc.Key, reason))
+			warns = append(warns, fmt.Sprintf("static %s: %s", key, strings.Join(probs, "; ")))
 		} else {
-			svc.Backend = model.Backend{Scheme: scheme, Host: e.Host, Port: e.Port, SkipVerify: e.SkipVerify}
+			scheme, host, port := e.Target()
+			svc.Backend = model.Backend{Scheme: scheme, Host: host, Port: port, SkipVerify: e.SkipVerify}
 		}
 		out = append(out, svc)
 	}

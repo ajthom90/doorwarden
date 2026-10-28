@@ -5,23 +5,36 @@
 // wins. Services already Stopped or Error keep that state in every mode: they
 // carry no authoritative backend and must not trigger changes.
 //
-// Persistence: the decision is stored in the services table, in
-// overrides_json under the reserved key "approved" (other keys are preserved).
-// In approve mode Resolve inserts a Pending row for services the store has not
-// seen, so that Approve has a row to mark. Callers that rewrite
-// overrides_json for these rows must preserve the "approved" key.
+// Persistence: approvals live in their own store table (approvals), never in
+// the services table, so reconciler writes cannot clobber them. The Gate does
+// not write services at all; the reconciler owns that table and records state
+// from Resolve's output.
+//
+// An approval is bound to a fingerprint of the approved content (key, name,
+// rename, zone, backend scheme, skip-verify, websockets, sorted middlewares).
+// Backend host and port are deliberately excluded because Docker host ports
+// change on every restart. If the content changes (e.g. an auth middleware is
+// dropped) the stored approval no longer applies and the service is Pending
+// again until re-approved. A service that disappears and returns unchanged
+// stays approved.
+//
+// Approve can only approve services seen by the most recent Resolve call (the
+// Gate keeps an in-memory key->fingerprint snapshot); other keys return
+// ErrUnknownService. The UI must therefore only offer approval for services
+// it has seen via Resolve.
 package approval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
-	"time"
 
 	"github.com/ajthom90/doorwarden/internal/model"
-	"github.com/ajthom90/doorwarden/internal/store"
 )
 
 // Mode is the approval mode (matches config approval values).
@@ -33,130 +46,100 @@ const (
 	ModeOff     Mode = "off"
 )
 
-// approvedKey is the reserved overrides_json key holding the decision.
-const approvedKey = "approved"
-
-// ErrUnknownService means no service with that key is known to the store.
+// ErrUnknownService means the key was not in the most recent Resolve call.
 var ErrUnknownService = errors.New("unknown service")
 
 // Store is the persistence the gate needs; *store.Store satisfies it.
 type Store interface {
-	ListServices(ctx context.Context) ([]store.Service, error)
-	UpsertService(ctx context.Context, v store.Service) error
+	SetApproval(ctx context.Context, key, fingerprint string) error
+	ClearApproval(ctx context.Context, key string) error
+	ListApprovals(ctx context.Context) (map[string]string, error)
 }
 
 // Gate applies approval decisions. It is safe for concurrent use.
 type Gate struct {
-	mu  sync.Mutex
-	st  Store
-	now func() time.Time
+	mu   sync.Mutex
+	st   Store
+	snap map[string]string // key -> fingerprint from the last Resolve
 }
 
 // NewGate returns a Gate backed by st.
-func NewGate(st Store) *Gate { return &Gate{st: st, now: time.Now} }
+func NewGate(st Store) *Gate { return &Gate{st: st, snap: map[string]string{}} }
 
-func isApproved(overridesJSON string) bool {
-	var m map[string]json.RawMessage
-	if json.Unmarshal([]byte(overridesJSON), &m) != nil {
-		return false
-	}
-	return string(m[approvedKey]) == "true"
-}
-
-func setApproved(overridesJSON string, v bool) (string, error) {
-	m := map[string]json.RawMessage{}
-	if overridesJSON != "" {
-		if err := json.Unmarshal([]byte(overridesJSON), &m); err != nil {
-			return "", fmt.Errorf("approval: corrupt overrides_json: %w", err)
-		}
-		if m == nil {
-			m = map[string]json.RawMessage{}
-		}
-	}
-	if v {
-		m[approvedKey] = json.RawMessage("true")
-	} else {
-		delete(m, approvedKey)
-	}
-	b, err := json.Marshal(m)
-	return string(b), err
+// Fingerprint returns the content fingerprint an approval is bound to.
+func Fingerprint(s model.Service) string {
+	mw := append([]string{}, s.Options.Middlewares...)
+	sort.Strings(mw)
+	b, _ := json.Marshal([]any{s.Key, s.Name, s.Options.Rename, s.Zone,
+		s.Backend.Scheme, s.Backend.SkipVerify, s.Options.Websockets, mw})
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // Resolve returns svcs with their State decided; see the package comment.
+// Services dropped by Skip or ModeOff are not part of the snapshot, so they
+// cannot be approved.
 func (g *Gate) Resolve(ctx context.Context, mode Mode, svcs []model.Service) ([]model.Service, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if mode == ModeOff {
-		return nil, nil
-	}
-	if mode != ModeAuto && mode != ModeApprove {
+	if mode != ModeAuto && mode != ModeApprove && mode != ModeOff {
 		return nil, fmt.Errorf("approval: unknown mode %q", mode)
 	}
-	known := map[string]store.Service{}
+	var approved map[string]string
 	if mode == ModeApprove {
-		rows, err := g.st.ListServices(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rows {
-			known[r.Key] = r
+		var err error
+		if approved, err = g.st.ListApprovals(ctx); err != nil {
+			return nil, err // snapshot untouched
 		}
 	}
+	snap := map[string]string{}
 	var out []model.Service
-	for _, s := range svcs {
-		if s.Options.Skip {
-			continue
-		}
-		if s.State == model.StateStopped || s.State == model.StateError {
-			out = append(out, s)
-			continue
-		}
-		if mode == ModeAuto {
-			s.State = model.StatePublished
-			out = append(out, s)
-			continue
-		}
-		row, ok := known[s.Key]
-		if !ok {
-			now := g.now()
-			if err := g.st.UpsertService(ctx, store.Service{Key: s.Key, Source: s.Source,
-				State: model.StatePending, OverridesJSON: "{}", FirstSeen: now, LastSeen: now}); err != nil {
-				return nil, err
+	if mode != ModeOff {
+		for _, s := range svcs {
+			if s.Options.Skip {
+				continue
 			}
+			fp := Fingerprint(s)
+			if s.State == model.StateStopped || s.State == model.StateError {
+				out = append(out, s)
+				continue
+			}
+			snap[s.Key] = fp
+			if mode == ModeAuto {
+				s.State = model.StatePublished
+			} else if stored, ok := approved[s.Key]; ok && stored == fp {
+				s.State = model.StatePublished
+			} else {
+				s.State = model.StatePending
+			}
+			out = append(out, s)
 		}
-		if ok && isApproved(row.OverridesJSON) {
-			s.State = model.StatePublished
-		} else {
-			s.State = model.StatePending
-		}
-		out = append(out, s)
 	}
+	g.snap = snap
 	return out, nil
 }
 
-// Approve persists approval for key. The key must already be known to the store.
-func (g *Gate) Approve(ctx context.Context, key string) error { return g.set(ctx, key, true) }
-
-// Revoke removes the approval for key, returning it to Pending.
-func (g *Gate) Revoke(ctx context.Context, key string) error { return g.set(ctx, key, false) }
-
-func (g *Gate) set(ctx context.Context, key string, v bool) error {
+// Approve persists approval of the content last seen for key.
+func (g *Gate) Approve(ctx context.Context, key string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	rows, err := g.st.ListServices(ctx)
+	fp, ok := g.snap[key]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownService, key)
+	}
+	return g.st.SetApproval(ctx, key, fp)
+}
+
+// Revoke removes any approval for key; it is a no-op if there is none.
+func (g *Gate) Revoke(ctx context.Context, key string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cur, err := g.st.ListApprovals(ctx)
 	if err != nil {
 		return err
 	}
-	for _, r := range rows {
-		if r.Key != key {
-			continue
-		}
-		js, err := setApproved(r.OverridesJSON, v)
-		if err != nil {
-			return err
-		}
-		r.OverridesJSON = js
-		return g.st.UpsertService(ctx, r)
+	if _, ok := cur[key]; !ok {
+		return nil
 	}
-	return fmt.Errorf("%w: %q", ErrUnknownService, key)
+	return g.st.ClearApproval(ctx, key)
 }
