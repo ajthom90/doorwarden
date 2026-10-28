@@ -528,6 +528,10 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 		res.Err = ErrWildcardNeedsDNS01
 		return res
 	}
+	if !validID(id) {
+		res.Err = fmt.Errorf("acme: certificate id %q cannot be stored (at most 200 of a-z, 0-9, '-', '_'); use a shorter zone name", id)
+		return res
+	}
 	dir, isCfg, err := m.effectiveDirectory(ctx, issuer)
 	if err != nil {
 		res.Err = err
@@ -556,7 +560,9 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 		prov, err = m.http01()
 	}
 	if err != nil {
-		return m.recordFailure(context.WithoutCancel(ctx), z, issuer, dir, id, names, err)
+		r, ev := m.recordFailure(context.WithoutCancel(ctx), z, issuer, dir, id, names, err, false)
+		m.notify(context.WithoutCancel(ctx), ev)
+		return r
 	}
 
 	select {
@@ -569,24 +575,41 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 	done := make(chan Result, 1)
 	handedOff = true
 	go func() {
-		defer func() { <-issueSem }()
-		defer m.clearInFlight(id)
 		bg := context.WithoutCancel(ctx)
+		released := false
+		release := func() {
+			if !released {
+				released = true
+				<-issueSem
+			}
+		}
+		defer release()
+		defer m.clearInFlight(id)
 		var r Result
+		var ev *Event
 		func() {
+			started := false
 			defer func() {
 				if p := recover(); p != nil {
-					r = m.recordFailure(bg, z, issuer, dir, id, names, fmt.Errorf("acme: order panicked: %v", p))
+					if started {
+						m.endAttempt(bg, issuer, id, false)
+					}
+					r, ev = m.recordFailure(bg, z, issuer, dir, id, names, fmt.Errorf("acme: order panicked: %v", p), started)
 				}
 			}()
+			m.beginAttempt(bg, issuer, id)
+			started = true
 			ob, err := m.obtain(ctx, o)
-			m.recordOrder(bg, issuer, id, err == nil)
+			m.endAttempt(bg, issuer, id, err == nil)
 			if err != nil {
-				r = m.recordFailure(bg, z, issuer, dir, id, names, err)
+				r, ev = m.recordFailure(bg, z, issuer, dir, id, names, err, true)
 				return
 			}
-			r = m.recordSuccess(bg, z, issuer, dir, id, names, ob)
+			r, ev = m.recordSuccess(bg, z, issuer, dir, id, names, ob)
 		}()
+		// Notifications go out only after the process-wide slot is free.
+		release()
+		m.notify(bg, ev)
 		done <- r
 	}()
 	select {
@@ -596,6 +619,68 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 		res.Err = fmt.Errorf("acme: order still running in the background; its result will be stored: %w", ctx.Err())
 		return res
 	}
+}
+
+func (m *Manager) notify(ctx context.Context, ev *Event) {
+	if ev != nil && m.notifier != nil {
+		m.notifier.Notify(ctx, *ev)
+	}
+}
+
+// beginAttempt persists, before an order is placed, that it is being
+// attempted: the set's failure count and backoff advance as if it failed,
+// and a pending order event is appended. A crash mid-order thus leaves a
+// deferred set and an order that counts toward the guards; endAttempt and
+// recordSuccess resolve both when the order returns.
+func (m *Manager) beginAttempt(ctx context.Context, issuer, id string) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	now := m.now()
+	var a attemptState
+	_, _ = m.kv.getJSON(ctx, attemptKey(id), &a)
+	a.Failures++
+	a.NextAttempt = now.Add(backoffDelay(a.Failures, m.jitter()))
+	if a.ParkedUntil.After(a.NextAttempt) {
+		a.NextAttempt = a.ParkedUntil
+	}
+	if err := m.kv.putJSON(ctx, attemptKey(id), a); err != nil {
+		m.log.Warn("acme: persist attempt start", "cert", id, "err", err)
+	}
+	evs := m.loadOrders(ctx, issuer, now)
+	evs = append(evs, orderEvent{T: now.Unix(), Set: id, Pending: true})
+	if err := m.kv.putJSON(ctx, ordersKey(issuer), evs); err != nil {
+		m.log.Warn("acme: record order", "issuer", issuer, "err", err)
+	}
+}
+
+// endAttempt resolves id's pending order event.
+func (m *Manager) endAttempt(ctx context.Context, issuer, id string, ok bool) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	evs := m.loadOrders(ctx, issuer, m.now())
+	for i := len(evs) - 1; i >= 0; i-- {
+		if evs[i].Set == id && evs[i].Pending {
+			evs[i].Pending, evs[i].OK = false, ok
+			break
+		}
+	}
+	if err := m.kv.putJSON(ctx, ordersKey(issuer), evs); err != nil {
+		m.log.Warn("acme: record order", "issuer", issuer, "err", err)
+	}
+}
+
+// loadOrders returns the issuer's order events of the last 7 days.
+// Callers hold stateMu.
+func (m *Manager) loadOrders(ctx context.Context, issuer string, now time.Time) []orderEvent {
+	var evs []orderEvent
+	_, _ = m.kv.getJSON(ctx, ordersKey(issuer), &evs)
+	keep := evs[:0]
+	for _, e := range evs {
+		if now.Sub(time.Unix(e.T, 0)) < 7*24*time.Hour {
+			keep = append(keep, e)
+		}
+	}
+	return keep
 }
 
 // guard returns a DeferredError when no attempt may be made now.
@@ -609,6 +694,11 @@ func (m *Manager) guard(ctx context.Context, issuer, id string, names []string, 
 	}
 	if a.ParkedUntil.After(now) {
 		return &DeferredError{Until: a.ParkedUntil, Reason: "rate limited by the CA", LastError: a.LastError}
+	}
+	var acct time.Time
+	_, _ = m.kv.getJSON(ctx, accountParkKey(issuer), &acct)
+	if acct.After(now) {
+		return &DeferredError{Until: acct, Reason: fmt.Sprintf("issuer %s account rate limited by the CA", issuer)}
 	}
 	if !force && a.NextAttempt.After(now) {
 		return &DeferredError{Until: a.NextAttempt, Reason: fmt.Sprintf("backing off after %d failure(s)", a.Failures), LastError: a.LastError}
@@ -626,7 +716,7 @@ func (m *Manager) guard(ctx context.Context, issuer, id string, names []string, 
 	var dup, recent []int64
 	for _, e := range evs {
 		t := time.Unix(e.T, 0)
-		if e.Set == id && e.OK && now.Sub(t) < 7*24*time.Hour {
+		if e.Set == id && (e.OK || e.Pending) && now.Sub(t) < 7*24*time.Hour {
 			dup = append(dup, e.T)
 		}
 		if now.Sub(t) < 3*time.Hour {
@@ -653,24 +743,6 @@ func within(ts []int64, now time.Time, d time.Duration) []int64 {
 	}
 	slices.Sort(out)
 	return out
-}
-
-func (m *Manager) recordOrder(ctx context.Context, issuer, id string, ok bool) {
-	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
-	now := m.now()
-	var evs []orderEvent
-	_, _ = m.kv.getJSON(ctx, ordersKey(issuer), &evs)
-	keep := evs[:0]
-	for _, e := range evs {
-		if now.Sub(time.Unix(e.T, 0)) < 7*24*time.Hour {
-			keep = append(keep, e)
-		}
-	}
-	keep = append(keep, orderEvent{T: now.Unix(), Set: id, OK: ok})
-	if err := m.kv.putJSON(ctx, ordersKey(issuer), keep); err != nil {
-		m.log.Warn("acme: record order", "issuer", issuer, "err", err)
-	}
 }
 
 // OrdersLastWeek returns how many orders the issuer's account placed in the
@@ -769,23 +841,35 @@ func validationFailure(err error) bool {
 	return found
 }
 
-// recordFailure persists a failed attempt: backoff (and rate-limit park),
-// failed validations, and the row's last_result/last_error. The previous
-// certificate's files, expiry and path are left untouched.
-func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer string, dir directory, id string, names []string, cause error) Result {
+// recordFailure persists a failed attempt: backoff (and rate-limit park,
+// also for the issuer account), failed validations, and the row's
+// last_result/last_error. The previous certificate's files, expiry and path
+// are left untouched. started means beginAttempt already counted this
+// attempt (it is not counted again). The failure event is returned, not
+// sent: callers send it once the issue slot is released.
+func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer string, dir directory, id string, names []string, cause error, started bool) (Result, *Event) {
 	now := m.now()
 	msg := m.red.errText(cause)
 	park := rateLimitPark(cause, now)
 	m.stateMu.Lock()
 	var a attemptState
 	_, _ = m.kv.getJSON(ctx, attemptKey(id), &a)
-	a.Failures++
+	if !started || a.Failures == 0 {
+		a.Failures++
+		a.NextAttempt = now.Add(backoffDelay(a.Failures, m.jitter()))
+	}
 	a.LastError = msg
-	a.NextAttempt = now.Add(backoffDelay(a.Failures, m.jitter()))
 	if park > 0 {
 		a.ParkedUntil = now.Add(park)
 		if a.ParkedUntil.After(a.NextAttempt) {
 			a.NextAttempt = a.ParkedUntil
+		}
+		var acct time.Time
+		_, _ = m.kv.getJSON(ctx, accountParkKey(issuer), &acct)
+		if a.ParkedUntil.After(acct) {
+			if err := m.kv.putJSON(ctx, accountParkKey(issuer), a.ParkedUntil); err != nil {
+				m.log.Warn("acme: persist account park", "issuer", issuer, "err", err)
+			}
 		}
 	}
 	if err := m.kv.putJSON(ctx, attemptKey(id), a); err != nil {
@@ -820,16 +904,14 @@ func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer strin
 	}
 	m.log.Warn("acme: certificate order failed", "cert", id, "zone", row.Zone, "names", strings.Join(names, ","),
 		"failures", a.Failures, "next_attempt", a.NextAttempt, "err", msg)
-	if m.notifier != nil {
-		m.notifier.Notify(ctx, Event{Kind: EventFailure, CertID: id, Zone: row.Zone, Names: append([]string(nil), names...),
-			NotAfter: row.NotAfter, Message: msg, NextAttempt: a.NextAttempt})
-	}
+	ev := &Event{Kind: EventFailure, CertID: id, Zone: row.Zone, Names: append([]string(nil), names...),
+		NotAfter: row.NotAfter, Message: msg, NextAttempt: a.NextAttempt}
 	return Result{CertID: id, Zone: row.Zone, Names: append([]string(nil), names...),
 		Err:         &redactedError{msg: truncate(m.red.redact(fmt.Sprintf("acme: order for %s failed: %s", strings.Join(names, ","), msg))), cause: cause},
-		NextAttempt: a.NextAttempt}
+		NextAttempt: a.NextAttempt}, ev
 }
 
-func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer string, dir directory, id string, names []string, ob obtained) Result {
+func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer string, dir directory, id string, names []string, ob obtained) (Result, *Event) {
 	leaf, err := leafCert(ob.ChainPEM)
 	if err == nil {
 		err = coversAll(leaf, names)
@@ -842,7 +924,7 @@ func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer strin
 		row, err = m.storeVersion(ctx, row, ob.ChainPEM, ob.KeyPEM)
 	}
 	if err != nil {
-		return m.recordFailure(ctx, z, issuer, dir, id, names, err)
+		return m.recordFailure(ctx, z, issuer, dir, id, names, err, true)
 	}
 	m.stateMu.Lock()
 	if err := m.kv.putJSON(ctx, attemptKey(id), attemptState{}); err != nil {
@@ -855,7 +937,7 @@ func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer strin
 	return Result{CertID: id, Zone: row.Zone, Names: append([]string(nil), names...), Bundle: &Bundle{
 		ID: id, Zone: row.Zone, Names: append([]string(nil), names...), Issuer: issuer, Staging: dir.Staging, Managed: true,
 		NotAfter: leaf.NotAfter, Dir: row.Path, ChainPEM: append([]byte(nil), ob.ChainPEM...), Key: secrets.Secret(ob.KeyPEM),
-	}}
+	}}, nil
 }
 
 // storeVersion writes chain and key as a new version of row.ID, points
@@ -1279,7 +1361,11 @@ func (m *Manager) forgetRegistration(ctx context.Context, o order) {
 
 // legoObtain places one order with lego. It is called with issueSem held.
 func (m *Manager) legoObtain(ctx context.Context, o order) (obtained, error) {
-	key, err := m.accountKey(ctx, o.Issuer)
+	// Store bookkeeping (account key, registration) must complete even when
+	// the caller's context ends mid-order: a half-written account would
+	// orphan the CA account.
+	bk := context.WithoutCancel(ctx)
+	key, err := m.accountKey(bk, o.Issuer)
 	if err != nil {
 		return obtained{}, err
 	}
@@ -1293,13 +1379,13 @@ func (m *Manager) legoObtain(ctx context.Context, o order) (obtained, error) {
 	}
 	// A stored registration must be on the user before NewClient: lego
 	// takes the account URL (JWS kid) from it only at construction.
-	u.reg = m.storedRegistration(ctx, o)
+	u.reg = m.storedRegistration(bk, o)
 	client, err := lego.NewClient(lc)
 	if err != nil {
 		return obtained{}, fmt.Errorf("acme: directory %s: %w", o.Dir.URL, err)
 	}
 	if u.reg == nil {
-		if u.reg, err = m.register(ctx, client, o); err != nil {
+		if u.reg, err = m.register(bk, client, o); err != nil {
 			return obtained{}, err
 		}
 	}
@@ -1323,7 +1409,7 @@ func (m *Manager) legoObtain(ctx context.Context, o order) (obtained, error) {
 	if err != nil {
 		var pd *acme.ProblemDetails
 		if errors.As(err, &pd) && pd.Type == "urn:ietf:params:acme:error:accountDoesNotExist" {
-			m.forgetRegistration(context.WithoutCancel(ctx), o)
+			m.forgetRegistration(bk, o)
 		}
 		return obtained{}, err
 	}

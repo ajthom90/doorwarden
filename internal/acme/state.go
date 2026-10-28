@@ -16,7 +16,8 @@ import (
 //
 //	acme/attempt/<cert id>              attemptState (backoff, rate-limit park)
 //	acme/fv/<issuer>/<name>             failed validations (unix times, last hour)
-//	acme/orders/<issuer>                orders placed (last 7 days)
+//	acme/orders/<issuer>                orders placed (last 7 days; pending until resolved)
+//	acme/park/<issuer>                  issuer account parked (rate limited) until
 //	acme/account/<issuer>/key           base64 of the box-sealed account key PEM
 //	acme/account/<issuer>/reg/<dirhash> registration resource (JSON, not secret)
 //	acme/issuer/<issuer>/directory      explicit staging->production override
@@ -31,10 +32,15 @@ type attemptState struct {
 	LastError   string    `json:"last_error"`
 }
 
+// orderEvent is one order placed with an issuer's account. It is written
+// with Pending set before the order starts and resolved (OK or failed)
+// when it ends; an event still pending after a crash may have produced a
+// certificate, so it counts toward every order guard.
 type orderEvent struct {
-	T   int64  `json:"t"`
-	Set string `json:"set"`
-	OK  bool   `json:"ok"`
+	T       int64  `json:"t"`
+	Set     string `json:"set"`
+	OK      bool   `json:"ok"`
+	Pending bool   `json:"pending,omitempty"`
 }
 
 type kvStore struct{ st *store.Store }
@@ -58,11 +64,12 @@ func (k kvStore) putJSON(ctx context.Context, key string, v any) error {
 	return k.st.SetSetting(ctx, key, string(b))
 }
 
-func attemptKey(id string) string        { return "acme/attempt/" + id }
-func fvKey(issuer, name string) string   { return "acme/fv/" + issuer + "/" + name }
-func ordersKey(issuer string) string     { return "acme/orders/" + issuer }
-func accountKeyKey(issuer string) string { return "acme/account/" + issuer + "/key" }
-func overrideKey(issuer string) string   { return "acme/issuer/" + issuer + "/directory" }
+func attemptKey(id string) string         { return "acme/attempt/" + id }
+func fvKey(issuer, name string) string    { return "acme/fv/" + issuer + "/" + name }
+func ordersKey(issuer string) string      { return "acme/orders/" + issuer }
+func accountParkKey(issuer string) string { return "acme/park/" + issuer }
+func accountKeyKey(issuer string) string  { return "acme/account/" + issuer + "/key" }
+func overrideKey(issuer string) string    { return "acme/issuer/" + issuer + "/directory" }
 func regKey(issuer, dirURL string) string {
 	h := sha256.Sum256([]byte(dirURL))
 	return "acme/account/" + issuer + "/reg/" + hex.EncodeToString(h[:8])
