@@ -429,7 +429,7 @@ func (b *dnsBatch) create(ctx context.Context, t dnsTarget, base *store.DNSRecor
 		row.CreatedAt, row.RemovedAfter = base.CreatedAt, base.RemovedAfter
 	}
 	if err := b.e.persist(ctx, row); err != nil {
-		return b.rollback(ctx, t, created, err)
+		return b.rollback(ctx, t, created, base, err)
 	}
 	b.e.activity(ctx, "info", fmt.Sprintf("created %s %s at %s/%s (owner %s, provider id %q)", t, t.value, t.provider, t.zone, t.owner, got.ID))
 	return nil
@@ -437,7 +437,7 @@ func (b *dnsBatch) create(ctx context.Context, t dnsTarget, base *store.DNSRecor
 
 // rollback deletes a record just created whose ownership could not be
 // recorded, so nothing is left that nobody would ever clean up.
-func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record, perr error) error {
+func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record, base *store.DNSRecord, perr error) error {
 	e := b.e
 	bctx := context.WithoutCancel(ctx)
 	e.log.ErrorContext(ctx, "DNS RECORD CREATED BUT OWNERSHIP NOT RECORDED; rolling back",
@@ -447,6 +447,9 @@ func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record
 	// rollback: the listing proved the name was free before the create.
 	if rows, err := e.st.ListOwnedRecords(bctx, t.provider, t.zone); err == nil {
 		for _, r := range rows {
+			if base != nil && r.OwnerKey == base.OwnerKey && r.ProviderRecordID == base.ProviderRecordID && r.ProviderRecordID != created.ID {
+				continue // our own stale row (re-create after ErrNotFound): it points at the gone record
+			}
 			if (created.ID != "" && r.ProviderRecordID == created.ID) || (normName(r.Name) == t.name && normType(r.Type) == t.typ) {
 				msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership (%v); left in place because an ownership row of %s now references it",
 					t, t.value, t.provider, t.zone, created.ID, perr, r.OwnerKey)

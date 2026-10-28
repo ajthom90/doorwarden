@@ -773,11 +773,15 @@ func TestGatherObserved(t *testing.T) {
 		Value: ip1, ProviderRecordID: mine.ID, OwnerKey: "docker:app", CreatedAt: t0}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.AddOwnedRecord(ctx, store.DNSRecord{Provider: "p2", Zone: "other.test", Name: "x.other.test", Type: "A",
+		Value: ip1, ProviderRecordID: "p2-1", OwnerKey: "docker:x", CreatedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
 	f2.FailNext("ListRecords", errors.New("unreachable"))
 	provs := map[string]dns.Provider{dzp: f1, "p2": f2}
 	zones := []ZoneRef{{dzp, "Example.Test."}, {dzp, dz}, {"p2", "other.test"}, {"p3", "third.test"}}
 	owned, foreign, errs := GatherObserved(ctx, provs, st, zones, 0)
-	if len(owned) != 1 || owned[0].OwnerKey != "docker:app" {
+	if len(owned) != 2 || owned[0].OwnerKey != "docker:app" || owned[1].OwnerKey != "docker:x" { // rows survive a failed listing
 		t.Fatalf("owned %+v", owned)
 	}
 	got, ok := foreign[dzp+"/"+dz]
@@ -798,8 +802,8 @@ func TestGatherObserved(t *testing.T) {
 	}
 
 	// an empty successful listing is present and empty
-	_, foreign, errs = GatherObserved(ctx, map[string]dns.Provider{"p2": f2}, st, []ZoneRef{{"p2", "other.test"}}, 0)
-	if v, ok := foreign["p2/other.test"]; !ok || len(v) != 0 || len(errs) != 0 {
+	_, foreign, errs = GatherObserved(ctx, map[string]dns.Provider{"p2": f2}, st, []ZoneRef{{"p2", "empty.test"}}, 0)
+	if v, ok := foreign["p2/empty.test"]; !ok || len(v) != 0 || len(errs) != 0 {
 		t.Fatalf("foreign %+v errs %v", foreign, errs)
 	}
 }
@@ -810,5 +814,28 @@ func TestDNSZoneRefs(t *testing.T) {
 	got := DNSZoneRefs(cfg)
 	if len(got) != 2 || got[0] != (ZoneRef{dzp, "a.test"}) || got[1] != (ZoneRef{dzp, "b.test"}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+// Re-create after UpdateRecord ErrNotFound, then the ownership write fails:
+// our own stale row (old ID) must not stop the rollback of the new record.
+func TestDNSExecRecoveryRollbackIgnoresOwnStaleRow(t *testing.T) {
+	fs := &failingOwnStore{}
+	r := perHostRig(t, func(c *DNSExecutorConfig) { fs.OwnershipStore = c.Store; c.Store = fs })
+	r.addRow(t, "app.example.test", "A", ip1, "gone-id", "docker:app")
+	fs.addFails = 2
+	err := r.apply(t, false, ensure("app.example.test", ip2, "docker:app"))
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("err %v", err)
+	}
+	cs := r.fk.Calls()
+	if got := strings.Join(ops(r.fk, 0), ","); got != "UpdateRecord,ListRecords,CreateRecord,DeleteRecord" || cs[3].Record.ID != "fake-1" {
+		t.Fatalf("calls %+v", cs)
+	}
+	if recs := r.zoneRecords(t); len(recs) != 0 {
+		t.Fatalf("zone %+v", recs)
+	}
+	if rows := r.rows(t); len(rows) != 1 || rows[0].ProviderRecordID != "gone-id" || rows[0].Value != ip1 {
+		t.Fatalf("rows %+v", rows)
 	}
 }
