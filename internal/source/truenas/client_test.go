@@ -360,3 +360,72 @@ func TestClientKeepalivePings(t *testing.T) {
 		t.Fatal("no keepalive ping received")
 	}
 }
+
+// waitConnClosed polls until the callback's close of the net.Conn is visible.
+func waitConnClosed(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) != nil {
+			return
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	t.Error("ctx callback never closed the connection")
+}
+
+// Regression: ctx ends between the auth read and stop(); this used to leave
+// c.conn nil after a "successful" connect and panic on the next dereference.
+func TestClientCancelDuringAuthDoesNotPanic(t *testing.T) {
+	f := newFake(t, `[]`)
+	for i := 0; i < 50; i++ {
+		c := NewClient(f.url(), secrets.Secret(testKey), false)
+		ctx, cancel := context.WithCancel(context.Background())
+		first := true
+		c.testHookAfterRead = func(conn *websocket.Conn) {
+			if first {
+				first = false
+				cancel()
+				waitConnClosed(t, conn)
+			}
+		}
+		_, err := c.Call(ctx, "core.ping")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("iter %d: err = %v", i, err)
+		}
+		c.mu.Lock()
+		nilConn := c.conn == nil
+		c.mu.Unlock()
+		if !nilConn {
+			t.Fatalf("iter %d: conn must be dropped", i)
+		}
+		c.testHookAfterRead = nil
+		got, err := c.Call(context.Background(), "core.ping")
+		if err != nil || string(got) != `"pong"` {
+			t.Fatalf("iter %d: follow-up %s %v", i, got, err)
+		}
+		_ = c.Close()
+		cancel()
+	}
+}
+
+// Cancelling a finished call's ctx later must not touch the live connection.
+func TestClientStaleCallbackDoesNotCloseConn(t *testing.T) {
+	f := newFake(t, `[]`)
+	c := NewClient(f.url(), secrets.Secret(testKey), false)
+	defer c.Close()
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := c.Call(ctx, "core.ping"); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		cancel() // old ctx cancelled after its call finished
+		time.Sleep(time.Millisecond)
+		if _, err := c.Call(context.Background(), "core.ping"); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+	}
+	if n := f.connCount(); n != 1 {
+		t.Fatalf("server saw %d connections, want exactly 1 (spurious reconnect)", n)
+	}
+}

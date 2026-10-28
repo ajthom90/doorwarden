@@ -45,6 +45,10 @@ type Client struct {
 
 	pingEvery time.Duration // zero means 20s; for tests
 
+	// testHookAfterRead, if non-nil, runs in roundTrip after a response was
+	// read and before the ctx callback is stopped. Tests only.
+	testHookAfterRead func(conn *websocket.Conn)
+
 	mu     sync.Mutex
 	conn   *websocket.Conn
 	done   chan struct{} // closed to stop the keepalive goroutine of conn
@@ -167,6 +171,9 @@ func (c *Client) callLocked(ctx context.Context, method string, params []any) (j
 		if err := c.connectLocked(ctx); err != nil {
 			return nil, err
 		}
+		if c.conn == nil {
+			return nil, errors.New("connection lost after connect")
+		}
 	}
 	return c.roundTrip(ctx, method, params)
 }
@@ -193,6 +200,9 @@ func (c *Client) connectLocked(ctx context.Context) error {
 		_ = c.dropLocked()
 		return err
 	}
+	if c.conn == nil {
+		return errors.New("connection lost during authentication")
+	}
 	var ok bool
 	if json.Unmarshal(res, &ok) != nil || !ok {
 		_ = c.dropLocked()
@@ -208,8 +218,11 @@ type rpcResponse struct {
 }
 
 // roundTrip sends one request on c.conn and reads until the matching id.
-func (c *Client) roundTrip(ctx context.Context, method string, params []any) (json.RawMessage, error) {
+func (c *Client) roundTrip(ctx context.Context, method string, params []any) (res json.RawMessage, err error) {
 	conn := c.conn
+	if conn == nil {
+		return nil, errors.New("not connected")
+	}
 	c.nextID++
 	id := c.nextID
 	idRaw, _ := json.Marshal(id)
@@ -222,9 +235,19 @@ func (c *Client) roundTrip(ctx context.Context, method string, params []any) (js
 	_ = conn.SetWriteDeadline(dl)
 	stop := context.AfterFunc(ctx, func() { _ = conn.UnderlyingConn().Close() })
 	defer func() {
+		if c.testHookAfterRead != nil {
+			c.testHookAfterRead(conn)
+		}
 		if !stop() {
-			// The callback ran (or is running): the connection is dead.
+			// The callback ran (or is running): the connection is dead and
+			// the call was cancelled, so never report success.
 			_ = c.dropLocked()
+			res = nil
+			if cerr := ctx.Err(); cerr != nil {
+				err = ctxErr(cerr, method)
+			} else {
+				err = errors.New("connection closed")
+			}
 		}
 	}()
 
