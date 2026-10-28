@@ -1,0 +1,110 @@
+package config
+
+import (
+	"fmt"
+	"net/netip"
+	"sort"
+)
+
+// Capabilities describes what a DNS provider type can do. A later task adapts
+// dns.Capabilities to this.
+type Capabilities struct{ WildcardA bool }
+
+// Validate returns every problem found, not just the first.
+func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) []error {
+	var errs []error
+	add := func(f string, a ...any) { errs = append(errs, fmt.Errorf(f, a...)) }
+
+	names := make([]string, 0, len(c.Providers))
+	for n := range c.Providers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if c.Providers[n].Type == "" {
+			add("provider %q: type is required", n)
+		}
+	}
+
+	oneOf := func(v string, opts ...string) bool {
+		for _, o := range opts {
+			if v == o {
+				return true
+			}
+		}
+		return false
+	}
+
+	for i, z := range c.Zones {
+		id := fmt.Sprintf("zone[%d] %q", i, z.Name)
+		if z.Name == "" {
+			add("zone[%d]: name is required", i)
+		}
+		if z.TargetIP == "" {
+			add("%s: target_ip is required", id)
+		} else if _, err := netip.ParseAddr(z.TargetIP); err != nil {
+			add("%s: target_ip %q is not a valid IP", id, z.TargetIP)
+		}
+
+		if z.Records.Mode != "" && !oneOf(z.Records.Mode, "wildcard", "per-host", "off") {
+			add("%s: records.mode %q must be wildcard, per-host or off", id, z.Records.Mode)
+		}
+		if z.Records.Mode != "off" && z.Records.Provider != "" {
+			p, ok := c.Providers[z.Records.Provider]
+			if !ok {
+				add("%s: records.provider %q is not defined", id, z.Records.Provider)
+			} else if z.Records.Mode == "wildcard" {
+				if cp, known := caps(p.Type); !known {
+					add("%s: records.provider %q has unknown type %q", id, z.Records.Provider, p.Type)
+				} else if !cp.WildcardA {
+					add("%s: records.mode wildcard requires a provider with wildcard A record support; %q (type %s) lacks it", id, z.Records.Provider, p.Type)
+				}
+			}
+		} else if z.Records.Mode != "off" && z.Records.Mode != "" {
+			add("%s: records.provider is required when records.mode is %q", id, z.Records.Mode)
+		}
+
+		cert := z.Certificate
+		if cert.Strategy != "" && !oneOf(cert.Strategy, "wildcard", "per-host", "san") {
+			add("%s: certificate.strategy %q must be wildcard, per-host or san", id, cert.Strategy)
+		}
+		if cert.Challenge != "" && !oneOf(cert.Challenge, "dns-01", "http-01") {
+			add("%s: certificate.challenge %q must be dns-01 or http-01", id, cert.Challenge)
+		}
+		if cert.Strategy == "wildcard" && cert.Challenge != "dns-01" {
+			add("%s: certificate.strategy wildcard requires challenge dns-01", id)
+		}
+		if cert.Issuer != "" {
+			if _, ok := c.Issuers[cert.Issuer]; !ok {
+				add("%s: certificate.issuer %q is not defined", id, cert.Issuer)
+			}
+		}
+		if cert.DNSProvider != "" {
+			p, ok := c.Providers[cert.DNSProvider]
+			if !ok {
+				add("%s: certificate.dns_provider %q is not defined", id, cert.DNSProvider)
+			} else if p.Type == "unifi" {
+				add("%s: certificate.dns_provider %q is of type unifi, which cannot solve ACME challenges", id, cert.DNSProvider)
+			}
+		}
+	}
+
+	for _, a := range []struct {
+		name, v string
+	}{
+		{"sources.truenas.approval", approval(c.Sources.TrueNAS != nil, func() string { return c.Sources.TrueNAS.Approval })},
+		{"sources.docker.approval", approval(c.Sources.Docker != nil, func() string { return c.Sources.Docker.Approval })},
+	} {
+		if a.v != "" && !oneOf(a.v, "auto", "approve", "off") {
+			add("%s %q must be auto, approve or off", a.name, a.v)
+		}
+	}
+	return errs
+}
+
+func approval(present bool, f func() string) string {
+	if !present {
+		return ""
+	}
+	return f()
+}

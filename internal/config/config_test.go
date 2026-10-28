@@ -1,0 +1,146 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func envMap(m map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+}
+
+func loadStr(t *testing.T, yml string, env map[string]string) (*Config, error) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(p, envMap(env))
+}
+
+const base = `
+zones:
+  - name: example.test
+    target_ip: 192.0.2.10
+    records: {provider: cf, mode: per-host}
+    certificate: {issuer: le, strategy: per-host, challenge: dns-01, dns_provider: cf}
+providers:
+  cf: {type: cloudflare, api_token: tok}
+  uni: {type: unifi, url: "https://192.0.2.1"}
+issuers:
+  le: {email: admin@example.test}
+`
+
+func mustLoad(t *testing.T, yml string) *Config {
+	t.Helper()
+	c, err := loadStr(t, yml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func caps(wild bool) func(string) (Capabilities, bool) {
+	return func(typ string) (Capabilities, bool) {
+		switch typ {
+		case "cloudflare":
+			return Capabilities{WildcardA: wild}, true
+		case "unifi":
+			return Capabilities{}, true
+		}
+		return Capabilities{}, false
+	}
+}
+
+func hasErr(errs []error, sub string) bool {
+	for _, e := range errs {
+		if strings.Contains(e.Error(), sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEnvSubstitution(t *testing.T) {
+	yml := strings.Replace(base, "api_token: tok", "api_token: ${A}, region: ${B:-x}", 1)
+	c, err := loadStr(t, yml, map[string]string{"A": "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := c.Providers["cf"]
+	if p.Extra["api_token"] != "secret" || p.Extra["region"] != "x" {
+		t.Fatalf("got %#v", p.Extra)
+	}
+}
+
+func TestUnsetVarFails(t *testing.T) {
+	yml := strings.Replace(base, "api_token: tok", "api_token: ${UNSET_VAR}", 1)
+	_, err := loadStr(t, yml, nil)
+	if err == nil || !strings.Contains(err.Error(), "UNSET_VAR") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUnknownKeyFails(t *testing.T) {
+	if _, err := loadStr(t, base+"bogus: 1\n", nil); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestWildcardRequiresDNS01(t *testing.T) {
+	yml := strings.Replace(base, "strategy: per-host, challenge: dns-01", "strategy: wildcard, challenge: http-01", 1)
+	errs := mustLoad(t, yml).Validate(caps(true))
+	if !hasErr(errs, "dns-01") {
+		t.Fatalf("errs = %v", errs)
+	}
+}
+
+func TestUnifiNotChallengeProvider(t *testing.T) {
+	yml := strings.Replace(base, "dns_provider: cf", "dns_provider: uni", 1)
+	errs := mustLoad(t, yml).Validate(caps(true))
+	if !hasErr(errs, "unifi") {
+		t.Fatalf("errs = %v", errs)
+	}
+}
+
+func TestWildcardModeNeedsCapability(t *testing.T) {
+	yml := strings.Replace(base, "mode: per-host", "mode: wildcard", 1)
+	c := mustLoad(t, yml)
+	if errs := c.Validate(caps(false)); !hasErr(errs, "wildcard") {
+		t.Fatalf("errs = %v", errs)
+	}
+	if errs := c.Validate(caps(true)); len(errs) != 0 {
+		t.Fatalf("errs = %v", errs)
+	}
+}
+
+func TestDefaultsStagingIssuer(t *testing.T) {
+	c := mustLoad(t, base)
+	if d := c.Issuers["le"].Directory; d != "staging" {
+		t.Fatalf("directory = %q", d)
+	}
+	if c.Settings.GracePeriod.String() != "24h0m0s" || c.Settings.PollInterval.String() != "30s" || c.Settings.RenewBefore.String() != "720h0m0s" {
+		t.Fatalf("settings = %+v", c.Settings)
+	}
+	if errs := c.Validate(caps(true)); len(errs) != 0 {
+		t.Fatalf("errs = %v", errs)
+	}
+}
+
+func TestUnknownProviderRef(t *testing.T) {
+	yml := strings.Replace(base, "records: {provider: cf", "records: {provider: nope", 1)
+	yml = strings.Replace(yml, "issuer: le", "issuer: missing", 1)
+	errs := mustLoad(t, yml).Validate(caps(true))
+	if !hasErr(errs, "nope") || !hasErr(errs, "missing") {
+		t.Fatalf("errs = %v", errs)
+	}
+}
+
+func TestZoneRequiredFields(t *testing.T) {
+	yml := strings.Replace(base, "target_ip: 192.0.2.10", "target_ip: notip", 1)
+	if errs := mustLoad(t, yml).Validate(caps(true)); !hasErr(errs, "target_ip") {
+		t.Fatalf("errs = %v", errs)
+	}
+}
