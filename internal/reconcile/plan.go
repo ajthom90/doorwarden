@@ -231,10 +231,38 @@ func (p *planner) resolve(s model.Service) entry {
 // is untouched.
 func (p *planner) planLoser(e entry, l loss) {
 	p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
-	if k, ok := p.obs.Known[e.svc.Key]; ok && p.mayRemoveLoserRoute(e.svc, l.winner) {
-		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,
-			Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
+	k, ok := p.obs.Known[e.svc.Key]
+	if !ok {
+		return
 	}
+	old := normName(k.Hostname)
+	switch {
+	case p.mayRemoveLoserRoute(e.svc, l.winner):
+		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key,
+			Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
+	case p.renamedAway(e, old):
+		// It no longer declares its old hostname and nothing else claims
+		// that name on its behalf: keeping the row would leave an orphan
+		// that a newcomer at the old name shares with it. It is served
+		// under neither name until it wins its new one.
+		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key,
+			Svc: copySvc(e.svc), Reason: "service now declares " + e.host + " (held by " + l.winner.key +
+				"); its old route for " + old + " is removed"})
+	}
+}
+
+// renamedAway reports whether a hostname loser is a Published service whose
+// current labels name a different hostname than its persisted route (old),
+// from an available source. Held-Invalid and non-Published services claim
+// their stored hostname, so they never qualify.
+func (p *planner) renamedAway(e entry, old string) bool {
+	if e.heldInvalid || e.svc.State != model.StatePublished {
+		return false
+	}
+	if e.svc.Source == "" || p.obs.Unavailable[e.svc.Source] {
+		return false
+	}
+	return old != "" && old != e.host
 }
 
 // claimKnown makes a present non-Published service that has a Known route

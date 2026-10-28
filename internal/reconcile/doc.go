@@ -71,21 +71,38 @@
 // route); a Published service always claims from its current labels. Its
 // tier is unchanged: it is not in the serving tier, so a Published service of
 // the same source rank still takes the name over (and its route is removed).
-// As a result every route row's key is a claimant of the row's hostname
+//
+// Renamed Published loser: when a Published service's current labels name
+// a different hostname than its persisted row and it LOSES that hostname,
+// its old row is removed in the same plan (RouteRemove, whoever the winner
+// is, unless its source is Unavailable): otherwise nothing would claim the
+// old name and a newcomer there would share it with the stale row. The
+// renamed service is served under neither name until it wins its new one.
+//
+// Invariant (checked by TestPropertyRouteInvariants): after a plan is fully
+// applied, every route row's key is a claimant of the row's hostname
 // (present non-Published and Invalid holders via the stored-hostname claim,
-// phantoms, absent services), so a row is removed whenever a Published,
-// routable claimant takes its name, and a Published RouteWrite only happens
-// for the hostname's winner. Two rows therefore share a hostname only in a
-// crash window: between the winner's RouteWrite and the loser's RouteRemove
-// of one Apply (a crash, or a failed RouteRemove batch). The next cycle
-// re-emits the loser's RouteRemove and converges to one row. One more,
-// deliberate exception: during a source outage a phantom's row is never
-// removed, so if a present Published service outranks it (higher source
-// rank, or same rank with a smaller key; both are in the serving tier) both
-// rows exist until the source is back and the phantom loses as a present
-// service. The renderer's rule (source rank, then key) then picks the same
-// winner as Plan. A higher-ranked non-routable holder keeps its row and the
-// newcomer gets only a Conflict, without a RouteWrite.
+// phantoms, absent services in grace; past-grace and renamed-away rows are
+// removed in the same plan), a row is removed whenever a Published, routable
+// claimant of the same or a higher source rank takes its name, and a
+// Published RouteWrite only happens for the hostname's winner. Rows that did
+// not share a hostname before a cycle can come to share one only in:
+//   - a crash window: between the winner's RouteWrite and the loser's
+//     RouteRemove of one Apply (a crash, or a failed RouteRemove batch); the
+//     next cycle re-emits the RouteRemove and converges to one row;
+//   - a source outage: a phantom's row is never removed, so if a present
+//     Published service outranks it (higher source rank, or same rank with a
+//     smaller key; both are in the serving tier) both rows exist until the
+//     source is back and the phantom loses as a present service.
+//
+// In both the renderer's rule (source rank, then key) picks Plan's winner.
+// Rows that already share a hostname for any other reason (left by an
+// outage whose claimants then changed state, or written outside Plan)
+// converge only when a claimant takes the name over or an absent row's grace
+// period ends, not necessarily in the next cycle; until then a same-rank
+// absent row with a smaller key can be what the renderer serves while Plan's
+// winner is a non-routable holder. A higher-ranked non-routable holder keeps
+// its row and the newcomer gets only a Conflict, without a RouteWrite.
 // A no-op RouteWrite whose stored zone is no longer configured says so in
 // its Reason.
 //
