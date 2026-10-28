@@ -194,7 +194,8 @@
 // (routes and certs proceed). An owned row for the same (provider, zone, name,
 // type) with an equal value means nothing to do (unless the listing shows it
 // missing or changed: see Drift repair); with another value, DNSEnsure
-// carries the row's provider record ID (update). Otherwise a listed record
+// carries the row's provider record ID (update; capped like a repair when
+// the listing shows it missing: see Drift repair). Otherwise a listed record
 // with the same name and the same type, or a CNAME, that is not owned yields
 // Conflict ("foreign record exists") and no DNSEnsure, even if its value is
 // already right: the user must adopt it. A DNS conflict does not block the
@@ -456,8 +457,21 @@
 // expires (24h at most). Otherwise at most RepairCapPerZone (5) repairs are
 // emitted per pair, the first by (name, type, owner key); the rest follow in
 // later cycles. A wildcard zone has at most one eligible row, so its breaker
-// never trips. Not covered: a wanted row whose desired value also changed
-// takes the update path (no Repair flag), which is not counted or capped.
+// never trips.
+//
+// Repair-class updates (ownedUpdate): a wanted owned row (same owner) whose
+// desired value changed (a target_ip change) is updated, DNSEnsure with the
+// row's provider ID and no Repair flag. When the listing shows it PRESENT,
+// or the pair was not listed, that is an in-place change of a record we own
+// and the update is emitted uncapped (a legitimate migration touches every
+// record of the zone); the row counts as wanted, not missing. When a
+// successful listing shows it MISSING, the update would re-create the record
+// (UpdateRecord answers not-found, then the guarded create), so it is
+// repair-class: it counts as wanted and missing for the breaker, shares the
+// per-pair cap and selection with the same-value repairs, is held (no
+// update at all) while the breaker trips unless acknowledged, is a Conflict
+// when a foreign record holds the name, and is never planned while the
+// owner's source is unavailable. A drifted row is the drift Skip, as above.
 //
 // The executor (DNSEnsure with Repair) does not stop at an up-to-date row:
 //  1. stale-plan check: the stored row must still exist with the action's

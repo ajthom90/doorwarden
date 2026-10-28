@@ -58,7 +58,8 @@ type planner struct {
 // repairPair counts, for one provider/zone, the wanted owned rows eligible
 // for repair (wanted) and those of them a listing showed missing (missing,
 // including rows a foreign record blocks), with the repairs that could be
-// emitted (cands, unblocked missing rows).
+// emitted (cands, unblocked missing rows: DNSEnsure{Repair} for a row with
+// the desired value, the update for a row whose desired value changed).
 type repairPair struct {
 	provider, zone  string
 	wanted, missing int
@@ -450,7 +451,8 @@ func (p *planner) planZone(z *zoneInfo, hosts []string) {
 // the desired value, or Conflict if a foreign record holds the name. key is
 // the service key ("" for the wildcard record). An owned record with the
 // desired value that a listing showed missing is repaired (see
-// ownedPresence).
+// ownedPresence). An owned record with another value is updated (see
+// ownedUpdate).
 func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) {
 	owner := key
 	if owner == "" {
@@ -477,16 +479,8 @@ func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) 
 					name, z.recType, o.OwnerKey, o.OwnerKey)})
 			return
 		}
-		if d, ok := p.obs.OwnedDrifted[OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)]; ok && !anySameValue(d, z.value) {
-			// Changed out of band to neither the stored nor the desired
-			// value: someone else's edit is never overwritten. (Listed with
-			// the desired value is our own unconfirmed update: the update is
-			// repeated, idempotently.)
-			p.emit(p.driftSkip(z, o, key, s, d))
-			return
-		}
 		want.ID = o.ProviderRecordID
-		p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+		p.ownedUpdate(z, o, key, s, Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 			Record: &want, Owner: owner, Reason: "owned record has a different value"})
 		return
 	}
@@ -519,6 +513,72 @@ func (p *planner) foreignBlocker(z *zoneInfo, name string) *dns.Record {
 	return nil
 }
 
+// ownedUpdate plans upd, the update of the wanted owned row o (same owner)
+// to the zone's desired value, against the provider listing:
+//   - changed out of band to neither the stored nor the desired value: a
+//     drift Skip, never overwritten (listed with the desired value is our
+//     own unconfirmed update: the update is repeated, idempotently);
+//   - present (or the pair not listed): the update is emitted, uncapped: an
+//     in-place change of a record we own and the provider lists (a target_ip
+//     migration touches every record of the zone);
+//   - missing at a successful listing: the update would re-create the record
+//     (UpdateRecord answers not-found, then the guarded create), so it is
+//     REPAIR-CLASS: it counts toward the pair's breaker like a missing
+//     same-value row and is a candidate of planRepairs (breaker, cap, due
+//     rows only), or a Conflict when a foreign record holds the name; never
+//     planned while the owner's source is unavailable.
+//
+// An eligible row (see ownedPresence) counts as wanted in every case.
+func (p *planner) ownedUpdate(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service, upd Action) {
+	rk := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+	if p.presenceChecked[rk] {
+		return // once per row
+	}
+	p.presenceChecked[rk] = true
+	pair := p.eligiblePair(z, s)
+	if pair != nil {
+		pair.wanted++
+	}
+	if d, ok := p.obs.OwnedDrifted[rk]; ok && !anySameValue(d, z.value) {
+		p.emit(p.driftSkip(z, o, key, s, d))
+		return
+	}
+	if !p.obs.OwnedMissing[rk] {
+		p.emit(upd)
+		return
+	}
+	if pair == nil {
+		return // the owner's state is unknown this cycle: never re-create blind
+	}
+	pair.missing++
+	name := normName(o.Name)
+	if fr := p.foreignBlocker(z, name); fr != nil {
+		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Record: fr, Owner: o.OwnerKey,
+			Reason: fmt.Sprintf("owned record %s %s is missing and a foreign record exists: %s %s %s; not re-creating it (adopt or remove it)",
+				name, z.recType, fr.Name, fr.Type, fr.Value)})
+		return
+	}
+	upd.Reason = "owned record has a different value and is missing at the provider; re-creating it with the new value"
+	pair.cands = append(pair.cands, upd)
+}
+
+// eligiblePair returns the breaker counters of z's provider/zone when a row
+// of owner service s (nil for the wildcard row) is eligible for repair: the
+// pair was listed and the owner's source is available. nil otherwise.
+func (p *planner) eligiblePair(z *zoneInfo, s *model.Service) *repairPair {
+	pk := z.provider + "/" + z.name
+	if _, listed := p.foreign[pk]; !listed || (s != nil && (s.Source == "" || p.obs.Unavailable[s.Source])) {
+		return nil
+	}
+	pair := p.repairPairs[pk]
+	if pair == nil {
+		pair = &repairPair{provider: z.provider, zone: z.name}
+		p.repairPairs[pk] = pair
+	}
+	return pair
+}
+
 // ownedPresence checks a wanted owned row o (owner o.OwnerKey, value equal to
 // the zone's desired value) against the provider listing: changed out of
 // band is reported with a Skip and never overwritten; missing is a repair
@@ -532,25 +592,17 @@ func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *
 		return // once per row (a winner's row is not re-checked for its owner as a loser)
 	}
 	p.presenceChecked[rk] = true
-	pk := z.provider + "/" + z.name
-	_, listed := p.foreign[pk]
 	// eligible: the owner's state is known and the pair was listed; only
 	// such rows count for the breaker
-	eligible := listed && (s == nil || (s.Source != "" && !p.obs.Unavailable[s.Source]))
-	var pair *repairPair
-	if eligible {
-		pair = p.repairPairs[pk]
-		if pair == nil {
-			pair = &repairPair{provider: z.provider, zone: z.name}
-			p.repairPairs[pk] = pair
-		}
+	pair := p.eligiblePair(z, s)
+	if pair != nil {
 		pair.wanted++
 	}
 	if d, ok := p.obs.OwnedDrifted[rk]; ok {
 		p.emit(p.driftSkip(z, o, key, s, d))
 		return
 	}
-	if !eligible || !p.obs.OwnedMissing[rk] {
+	if pair == nil || !p.obs.OwnedMissing[rk] {
 		return // present, or unknown this cycle: never repair blind
 	}
 	pair.missing++
@@ -567,7 +619,8 @@ func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *
 		Repair: true, Reason: "owned record is missing at the provider; re-creating it"})
 }
 
-// planRepairs emits the repair candidates ownedPresence collected, per
+// planRepairs emits the repair candidates ownedPresence and ownedUpdate
+// collected, per
 // provider/zone. Breaker: when more than repairBreakerMinMissing wanted rows
 // are missing AND they are more than half of the pair's wanted rows, the
 // listing is more likely wrong (a wiped server, a zone pinned to the wrong

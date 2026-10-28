@@ -369,8 +369,9 @@ func TestPropertyDNSRepairInvariants(t *testing.T) {
 		ensuredSlot := map[string]int{}
 		perPair, tripped := map[string]int{}, map[string]bool{}
 		for _, a := range ofKind(acts, DNSEnsure) {
-			ensuredSlot[OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)]++
-			if a.Repair {
+			k := OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)
+			ensuredSlot[k]++
+			if a.Repair || c.obs.OwnedMissing[k] { // a repair, or a repair-class update
 				perPair[a.Provider+"/"+a.Zone]++
 			}
 		}
@@ -455,21 +456,35 @@ func TestPropertyDNSRepairInvariants(t *testing.T) {
 	}
 }
 
-// TestPropertyDNSRepairBreaker checks the mass-repair breaker and the
-// per-zone cap against the test's own statement of them, on one per-host zone
-// with many owners: some absent (orphans), some stopped (protected), some from
-// an unavailable source, rows randomly missing, drifted or blocked by a
-// foreign CNAME.
+// TestPropertyDNSRepairBreaker checks the mass-repair breaker, the
+// acknowledgement and the per-zone cap against the test's own statement of
+// them, on one per-host zone with many owners: some absent (orphans), some
+// stopped (protected), some from an unavailable source, rows randomly
+// missing, drifted or blocked by a foreign CNAME. With target_ip moved, rows
+// randomly keep the old value (an update; re-creating when missing:
+// repair-class) or already have the new one (a same-value repair).
+// Invariant: at most RepairCapPerZone ensures touch missing rows per pair and
+// cycle; present rows' updates are never held.
 func TestPropertyDNSRepairBreaker(t *testing.T) {
-	var trips, capped, under int
+	var trips, acked, capped, under, classSent, presentUpd int
 	for seed := int64(0); seed < 2000; seed++ {
 		r := rand.New(rand.NewSource(seed))
 		obs := Observed{Foreign: listed("example.test"), OwnedMissing: map[string]bool{}, OwnedDrifted: map[string][]dns.Record{}}
 		if r.Intn(3) == 0 {
 			obs.Unavailable = map[string]bool{"truenas": true}
 		}
+		cfg, val := phCfg(), target
+		moved := r.Intn(2) == 0
+		if moved {
+			cfg.Zones[0].TargetIP, val = newTarget, newTarget
+		}
+		ack := r.Intn(4) == 0
+		if ack {
+			obs.RepairMassOK = map[string]time.Time{"dnsp/example.test": t0.Add(-time.Duration(r.Intn(20)) * time.Hour)}
+		}
 		var desired []model.Service
 		var eligibleMissing []string // names of unblocked eligible missing rows
+		var presentChanged []string  // names of eligible present rows needing an update
 		wanted, miss := 0, 0
 		total, pMiss := 1+r.Intn(40), r.Float64()
 		for i := 0; i < total; i++ {
@@ -485,9 +500,12 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 				desired = append(desired, pub(key, name, "example.test", 80))
 			}
 			o := owned("example.test", name+".example.test", "A", target, key)
+			if moved && r.Intn(2) == 0 {
+				o.Value = newTarget
+			}
 			obs.Owned = append(obs.Owned, o)
 			k := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
-			isMissing, blocked := r.Float64() < pMiss, false
+			isMissing, blocked, drifted := r.Float64() < pMiss, false, false
 			if isMissing {
 				obs.OwnedMissing[k] = true
 				if r.Intn(8) == 0 {
@@ -496,6 +514,7 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 						dns.Record{ID: "f" + name, Name: o.Name, Type: "CNAME", Value: "x.test"})
 				}
 			} else if r.Intn(8) == 0 { // drifted: wanted, not missing
+				drifted = true
 				obs.OwnedDrifted[k] = []dns.Record{{ID: "x", Name: o.Name, Type: "A", Value: ipFX}}
 			}
 			if role >= 2 && !obs.Unavailable[prefix] {
@@ -505,33 +524,60 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 					if !blocked {
 						eligibleMissing = append(eligibleMissing, o.Name)
 					}
+				} else if !drifted && o.Value != val {
+					presentChanged = append(presentChanged, o.Name)
 				}
 			}
 		}
 		r.Shuffle(len(desired), func(i, j int) { desired[i], desired[j] = desired[j], desired[i] })
 		r.Shuffle(len(obs.Owned), func(i, j int) { obs.Owned[i], obs.Owned[j] = obs.Owned[j], obs.Owned[i] })
-		acts := Plan(desired, obs, phCfg(), t0)
-		var got []string
-		for _, a := range acts {
-			if a.Repair {
+		acts := Plan(desired, obs, cfg, t0)
+		var got, gotPresent []string
+		for _, a := range ofKind(acts, DNSEnsure) {
+			k := OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)
+			switch {
+			case obs.OwnedMissing[k]:
 				got = append(got, a.Record.Name)
+				if !a.Repair {
+					classSent++
+				}
+			case a.Repair:
+				t.Fatalf("seed %d: repair of a present row %s", seed, sum(a))
+			case a.Record.ID != "":
+				gotPresent = append(gotPresent, a.Record.Name)
 			}
 		}
+		sort.Strings(got)
 		sk := breakerSkips(acts)
 		fail := func(f string, a ...any) {
 			t.Helper()
-			t.Fatalf("seed %d (wanted %d, missing %d): %s\nacts %v", seed, wanted, miss, fmt.Sprintf(f, a...), sums(acts))
+			t.Fatalf("seed %d (wanted %d, missing %d, moved %v, ack %v): %s\nacts %v", seed, wanted, miss, moved, ack, fmt.Sprintf(f, a...), sums(acts))
 		}
-		if miss > 3 && 2*miss > wanted {
+		if len(got) > RepairCapPerZone {
+			fail("%d ensures of missing rows", len(got))
+		}
+		// present rows needing an update are always updated (uncapped)
+		sort.Strings(gotPresent)
+		sort.Strings(presentChanged)
+		presentUpd += len(presentChanged)
+		for _, n := range presentChanged {
+			if j := sort.SearchStrings(gotPresent, n); j == len(gotPresent) || gotPresent[j] != n {
+				fail("present row %s not updated", n)
+			}
+		}
+		if miss > 3 && 2*miss > wanted && !ack {
 			trips++
 			want := fmt.Sprintf("(%d of %d)", miss, wanted)
-			if len(got) != 0 || len(sk) != 1 || !strings.Contains(sk[0].Reason, want) {
+			if len(got) != 0 || len(sk) != 1 || !strings.Contains(sk[0].Reason, want) || sk[0].Key != "repair-breaker:dnsp/example.test" {
 				fail("breaker: repairs %v skips %v", got, sums(sk))
 			}
 			continue
 		}
 		if len(sk) != 0 {
 			fail("breaker tripped wrongly")
+		}
+		if miss > 3 && 2*miss > wanted {
+			acked++
 		}
 		sort.Strings(eligibleMissing)
 		if len(eligibleMissing) > RepairCapPerZone {
@@ -544,8 +590,9 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 			fail("repairs %v, want %v", got, eligibleMissing)
 		}
 	}
-	t.Logf("tripped %d, capped %d, under the cap %d", trips, capped, under)
-	if trips == 0 || capped == 0 || under == 0 {
+	t.Logf("tripped %d, acknowledged %d, capped %d, under the cap %d, repair-class sent %d, present updates %d",
+		trips, acked, capped, under, classSent, presentUpd)
+	if trips == 0 || acked == 0 || capped == 0 || under == 0 || classSent == 0 || presentUpd == 0 {
 		t.Error("a branch never ran")
 	}
 }
