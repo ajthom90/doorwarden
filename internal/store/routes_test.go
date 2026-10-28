@@ -293,3 +293,38 @@ func TestUpsertRouteUnchangedIsNoop(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteRouteIfDue(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	if err := s.UpsertRoute(ctx, sampleRoute("docker:app", "app.example.test", 80)); err != nil {
+		t.Fatal(err)
+	}
+	del := func(now time.Time) bool {
+		t.Helper()
+		ok, err := s.DeleteRouteIfDue(ctx, "docker:app", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if del(t0.Add(1000 * time.Hour)) {
+		t.Fatal("unscheduled route deleted")
+	}
+	at := t0.Add(24 * time.Hour)
+	if err := s.SetRouteRemoval(ctx, "docker:app", &at); err != nil {
+		t.Fatal(err)
+	}
+	if del(at) || del(t0) {
+		t.Fatal("deleted at or before the deadline")
+	}
+	if !del(at.Add(time.Second)) {
+		t.Fatal("due route not deleted")
+	}
+	if _, ok, _ := s.GetRoute(ctx, "docker:app"); ok {
+		t.Fatal("route still there")
+	}
+	if del(at.Add(time.Hour)) {
+		t.Fatal("deleted twice")
+	}
+}

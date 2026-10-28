@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -80,12 +81,94 @@ func (s *Store) ListOwnedRecords(ctx context.Context, provider, zone string) ([]
 	return out, rows.Err()
 }
 
-// DeleteOwnedRecord forgets ownership of a record (no error if absent).
-// Matching is exact on (provider, zone, normalized name, normalized type). The
-// caller must only delete records it has verified it owns.
+// ListAllOwnedRecords returns every ownership row, of every provider and
+// zone (also those no longer configured), sorted by provider, zone, name and
+// type.
+func (s *Store) ListAllOwnedRecords(ctx context.Context) ([]DNSRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT provider, zone, name, type, value, provider_record_id, owner_key, created_at, removed_after
+		FROM dns_records ORDER BY provider, zone, name, type`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DNSRecord
+	for rows.Next() {
+		var r DNSRecord
+		var ca int64
+		var ra sql.NullInt64
+		if err := rows.Scan(&r.Provider, &r.Zone, &r.Name, &r.Type, &r.Value, &r.ProviderRecordID, &r.OwnerKey, &ca, &ra); err != nil {
+			return nil, err
+		}
+		r.CreatedAt, r.RemovedAfter = fromUnix(ca), scanNullTime(ra)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteOwnedRecord forgets ownership of a record (no error if absent),
+// whoever owns it. Matching is exact on (provider, zone, normalized name,
+// normalized type). It is for UI/admin paths only (an explicit user
+// decision); the reconciler uses the conditional DeleteOwnedRecordIfDue and
+// DeleteOwnedRecordOwned.
 func (s *Store) DeleteOwnedRecord(ctx context.Context, provider, zone, name, typ string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ?`, provider, zone, normName(name), normType(typ))
 	return err
+}
+
+// DeleteOwnedRecordIfDue deletes the row for (provider, zone, normalized
+// name, normalized type) only if it is owned by owner AND its removed_after
+// is set and strictly before notAfter (compared in whole seconds, the stored
+// precision). deleted reports whether a row was deleted; a row that is
+// absent, owned by another key, not scheduled or not yet due is left alone.
+func (s *Store) DeleteOwnedRecordIfDue(ctx context.Context, provider, zone, name, typ, owner string, notAfter time.Time) (deleted bool, err error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ?
+		AND owner_key = ? AND removed_after IS NOT NULL AND removed_after < ?`,
+		provider, zone, normName(name), normType(typ), owner, toUnix(notAfter))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// DeleteOwnedRecordOwned deletes the row for (provider, zone, normalized
+// name, normalized type) only if it is owned by owner; deleted reports
+// whether a row was deleted.
+func (s *Store) DeleteOwnedRecordOwned(ctx context.Context, provider, zone, name, typ, owner string) (deleted bool, err error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ? AND owner_key = ?`,
+		provider, zone, normName(name), normType(typ), owner)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// ReassignOwnedRecord transfers the row for (provider, zone, normalized name,
+// normalized type) from oldOwner to newOwner and clears its removed_after, in
+// one UPDATE guarded by owner_key = oldOwner. Value, provider record ID and
+// created_at are kept. No such row (absent, or owned by another key) writes
+// nothing and returns ErrOwnedRecordNotFound. newOwner must be non-empty,
+// without surrounding whitespace, and not a "zone:" key (the wildcard
+// record's owner never changes).
+func (s *Store) ReassignOwnedRecord(ctx context.Context, provider, zone, name, typ, oldOwner, newOwner string) error {
+	if newOwner == "" || strings.TrimSpace(newOwner) != newOwner || strings.HasPrefix(strings.ToLower(newOwner), "zone:") {
+		return fmt.Errorf("store: invalid new owner key %q", newOwner)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE dns_records SET owner_key = ?, removed_after = NULL
+		WHERE provider = ? AND zone = ? AND name = ? AND type = ? AND owner_key = ?`,
+		newOwner, provider, zone, normName(name), normType(typ), oldOwner)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrOwnedRecordNotFound
+	}
+	return nil
 }
 
 // SetOwnedRemoval sets (at non-nil) or clears (at nil) removed_after of the

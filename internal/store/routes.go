@@ -128,6 +128,20 @@ func (s *Store) DeleteRoute(ctx context.Context, key string) error {
 	return err
 }
 
+// DeleteRouteIfDue deletes key's route only if its removed_after is set and
+// strictly before notAfter (whole seconds, the stored precision). deleted
+// reports whether a route was deleted; an unscheduled or not yet due route
+// (e.g. its removal was cancelled after a plan was computed) is kept.
+func (s *Store) DeleteRouteIfDue(ctx context.Context, key string, notAfter time.Time) (deleted bool, err error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM routes WHERE key = ? AND removed_after IS NOT NULL AND removed_after < ?`,
+		key, toUnix(notAfter))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // SetRouteRemoval sets (at non-nil) or clears (at nil) the scheduled removal
 // of key's route. It returns ErrRouteNotFound, writing nothing, when there is
 // no route for key.

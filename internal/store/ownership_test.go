@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -170,5 +171,127 @@ func TestSetOwnedRemovalOwnerGuarded(t *testing.T) {
 	// other provider/zone never matched
 	if err := s.SetOwnedRemoval(ctx, "cf2", "example.test", "app.example.test", "A", "docker:app", &at); !errors.Is(err, ErrOwnedRecordNotFound) {
 		t.Fatalf("other provider: err = %v", err)
+	}
+}
+
+func TestDeleteOwnedRecordIfDue(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	r := rec("cf", "example.test", "app.example.test", "A", "192.0.2.1", "docker:app")
+	if err := s.AddOwnedRecord(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	count := func() int {
+		got, _ := s.ListOwnedRecords(ctx, "cf", "example.test")
+		return len(got)
+	}
+	del := func(owner string, now time.Time) bool {
+		t.Helper()
+		ok, err := s.DeleteOwnedRecordIfDue(ctx, "cf", "example.test", "APP.example.test.", "a", owner, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	// not scheduled: never deleted
+	if del("docker:app", t0.Add(1000*time.Hour)) || count() != 1 {
+		t.Fatal("unscheduled row deleted")
+	}
+	at := t0.Add(24 * time.Hour)
+	if err := s.SetOwnedRemoval(ctx, "cf", "example.test", "app.example.test", "A", "docker:app", &at); err != nil {
+		t.Fatal(err)
+	}
+	// at the deadline (not after) and before: kept
+	if del("docker:app", at) || del("docker:app", t0) || count() != 1 {
+		t.Fatal("deleted before the deadline")
+	}
+	// another owner: kept
+	if del("docker:other", at.Add(time.Hour)) || count() != 1 {
+		t.Fatal("other owner deleted")
+	}
+	// due and owned: deleted, once
+	if !del("docker:app", at.Add(time.Second)) || count() != 0 {
+		t.Fatal("due row not deleted")
+	}
+	if del("docker:app", at.Add(time.Hour)) {
+		t.Fatal("deleted twice")
+	}
+}
+
+func TestDeleteOwnedRecordOwned(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	if err := s.AddOwnedRecord(ctx, rec("cf", "example.test", "app.example.test", "A", "192.0.2.1", "docker:app")); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.DeleteOwnedRecordOwned(ctx, "cf", "example.test", "app.example.test", "A", "docker:other"); ok || err != nil {
+		t.Fatalf("other owner: %v %v", ok, err)
+	}
+	if ok, err := s.DeleteOwnedRecordOwned(ctx, "cf", "example.test", "App.Example.Test.", "a", "docker:app"); !ok || err != nil {
+		t.Fatalf("owner: %v %v", ok, err)
+	}
+	if got, _ := s.ListOwnedRecords(ctx, "cf", "example.test"); len(got) != 0 {
+		t.Fatalf("rows %+v", got)
+	}
+}
+
+func TestReassignOwnedRecordOwnerGuarded(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	r := rec("cf", "example.test", "app.example.test", "A", "192.0.2.1", "docker:old")
+	r.ProviderRecordID = "r1"
+	at := t0.Add(time.Hour)
+	r.RemovedAfter = &at
+	if err := s.AddOwnedRecord(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	// wrong old owner: nothing changes
+	if err := s.ReassignOwnedRecord(ctx, "cf", "example.test", "app.example.test", "A", "docker:x", "static:new"); !errors.Is(err, ErrOwnedRecordNotFound) {
+		t.Fatalf("wrong owner: %v", err)
+	}
+	if err := s.ReassignOwnedRecord(ctx, "cf", "example.test", "web.example.test", "A", "docker:old", "static:new"); !errors.Is(err, ErrOwnedRecordNotFound) {
+		t.Fatalf("missing row: %v", err)
+	}
+	for _, bad := range []string{"", " ", "zone:example.test", "ZONE:x"} {
+		if err := s.ReassignOwnedRecord(ctx, "cf", "example.test", "app.example.test", "A", "docker:old", bad); err == nil {
+			t.Fatalf("new owner %q accepted", bad)
+		}
+	}
+	got, _ := s.ListOwnedRecords(ctx, "cf", "example.test")
+	if got[0].OwnerKey != "docker:old" || got[0].RemovedAfter == nil {
+		t.Fatalf("changed: %+v", got)
+	}
+	if err := s.ReassignOwnedRecord(ctx, "cf", "example.test", "APP.example.test.", "a", "docker:old", "static:new"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.ListOwnedRecords(ctx, "cf", "example.test")
+	if len(got) != 1 || got[0].OwnerKey != "static:new" || got[0].RemovedAfter != nil || got[0].Value != "192.0.2.1" ||
+		got[0].ProviderRecordID != "r1" || !got[0].CreatedAt.Equal(r.CreatedAt.UTC().Truncate(time.Second)) {
+		t.Fatalf("after reassign: %+v", got)
+	}
+}
+
+func TestListAllOwnedRecords(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	for _, r := range []DNSRecord{
+		rec("cf", "b.test", "x.b.test", "A", "192.0.2.1", "docker:x"),
+		rec("old", "a.test", "y.a.test", "AAAA", "2001:db8::1", "docker:y"),
+		rec("cf", "a.test", "z.a.test", "A", "192.0.2.2", "docker:z"),
+	} {
+		if err := s.AddOwnedRecord(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListAllOwnedRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, r := range got {
+		keys = append(keys, r.Provider+"/"+r.Zone+"/"+r.Name)
+	}
+	if want := []string{"cf/a.test/z.a.test", "cf/b.test/x.b.test", "old/a.test/y.a.test"}; !reflect.DeepEqual(keys, want) {
+		t.Fatalf("got %v want %v", keys, want)
 	}
 }
