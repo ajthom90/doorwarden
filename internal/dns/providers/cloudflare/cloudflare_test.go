@@ -27,15 +27,17 @@ type rec struct {
 }
 
 type backend struct {
-	raw     string // when set, replaces the dns_records list response body (HTTP 200)
-	noInfo  bool   // omit result_info from list responses
-	perPage int    // page size (default 3)
-	mu      sync.Mutex
-	n       int
-	recs    []rec
-	zones   map[string]string
-	status  int // when non-zero, every request fails with it
-	slow    time.Duration
+	zeroPages bool   // report total_pages: 0
+	delFail   bool   // DELETE answers success:false
+	raw       string // when set, replaces the dns_records list response body (HTTP 200)
+	noInfo    bool   // omit result_info from list responses
+	perPage   int    // page size (default 3)
+	mu        sync.Mutex
+	n         int
+	recs      []rec
+	zones     map[string]string
+	status    int // when non-zero, every request fails with it
+	slow      time.Duration
 }
 
 func newBackend() *backend {
@@ -134,6 +136,9 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			resp := map[string]any{"success": true, "result": res}
 			if !b.noInfo {
+				if b.zeroPages {
+					total = 0
+				}
 				resp["result_info"] = map[string]int{"page": page, "total_pages": total}
 			}
 			reply(200, resp)
@@ -172,6 +177,10 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.recs[i].Content, b.recs[i].TTL = in.Content, in.TTL
 		reply(200, map[string]any{"success": true, "result": toJSON(b.recs[i])})
 	case "DELETE":
+		if b.delFail {
+			reply(200, map[string]any{"success": false, "errors": []map[string]any{{"message": "cannot delete"}}})
+			return
+		}
 		b.recs = append(b.recs[:i], b.recs[i+1:]...)
 		reply(200, map[string]any{"success": true, "result": map[string]string{"id": parts[2]}})
 	}
@@ -343,5 +352,52 @@ func TestListingHardening(t *testing.T) {
 	p := newProvider(t, b, fakeToken)
 	if recs, err := p.ListRecords(ctx, "example.test"); err != nil || len(recs) != 1 {
 		t.Fatalf("recs=%v err=%v", recs, err)
+	}
+}
+
+func TestCNAMEBlocksARecord(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.recs = append(b.recs, rec{ID: "c1", Name: "c.example.test", Type: "CNAME", Content: "t.example.test", TTL: 1, zone: "example.test"},
+		rec{ID: "a1", Name: "a.example.test", Type: "A", Content: "192.0.2.1", TTL: 1, zone: "example.test"})
+	p := newProvider(t, b, fakeToken)
+	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.2"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "CNAME") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "CNAME", Value: "x.example.test"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(b.recs) != 2 {
+		t.Fatal("conflicting record was created")
+	}
+}
+
+func TestZeroTotalPagesWithFullPageIsError(t *testing.T) {
+	b := newBackend()
+	b.zeroPages, b.perPage = true, 100
+	for i := 0; i < 100; i++ {
+		b.recs = append(b.recs, rec{ID: fmt.Sprint("r", i), Name: fmt.Sprintf("h%d.example.test", i), Type: "A", Content: "192.0.2.1", zone: "example.test"})
+	}
+	if _, err := newProvider(t, b, fakeToken).ListRecords(context.Background(), "example.test"); err == nil {
+		t.Fatal("total_pages 0 with a full page accepted")
+	}
+}
+
+func TestDeleteByIDVerifiesNameAndCheckSuccess(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.recs = append(b.recs, rec{ID: "a1", Name: "a.example.test", Type: "A", Content: "192.0.2.1", TTL: 1, zone: "example.test"})
+	p := newProvider(t, b, fakeToken)
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: "a1", Name: "other.example.test", Type: "A"}); err == nil || len(b.recs) != 1 {
+		t.Fatalf("id with the wrong name deleted: err=%v recs=%d", err, len(b.recs))
+	}
+	b.delFail = true
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: "a1"}); err == nil || !strings.Contains(err.Error(), "cannot delete") {
+		t.Fatalf("success:false on DELETE accepted: %v", err)
+	}
+	b.delFail = false
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: "a1", Name: "a.example.test", Type: "A"}); err != nil || len(b.recs) != 0 {
+		t.Fatalf("err=%v recs=%d", err, len(b.recs))
 	}
 }

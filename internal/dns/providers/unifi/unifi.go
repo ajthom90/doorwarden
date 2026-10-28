@@ -44,30 +44,19 @@ const apiRoot = "/proxy/network/integration/v1"
 func init() {
 	dns.Register(Type, func(cfg map[string]any, sr dns.SecretResolver) (dns.Provider, error) {
 		str := func(k string) string { v, _ := cfg[k].(string); return v }
-		flag := func(k string) (bool, error) {
-			v, ok := cfg[k]
-			if !ok || v == nil {
-				return false, nil
-			}
-			b, ok := v.(bool)
-			if !ok {
-				return false, fmt.Errorf("unifi: config field %q must be a bool", k)
-			}
-			return b, nil
-		}
 		key, err := dns.ResolveField(cfg, sr, "api_key")
 		if err != nil {
 			return nil, fmt.Errorf("unifi: %w", err)
 		}
 		c := Config{URL: str("url"), APIKey: key, SiteID: str("site_id")}
-		if c.InsecureSkipVerify, err = flag("insecure_skip_verify"); err != nil {
-			return nil, err
+		if c.InsecureSkipVerify, err = httpx.BoolOption(cfg, "insecure_skip_verify"); err != nil {
+			return nil, fmt.Errorf("unifi: %w", err)
 		}
-		if c.Wildcard, err = flag("wildcard"); err != nil {
-			return nil, err
+		if c.Wildcard, err = httpx.BoolOption(cfg, "wildcard"); err != nil {
+			return nil, fmt.Errorf("unifi: %w", err)
 		}
-		if c.AllowInsecureHTTP, err = flag("allow_insecure_http"); err != nil {
-			return nil, err
+		if c.AllowInsecureHTTP, err = httpx.BoolOption(cfg, "allow_insecure_http"); err != nil {
+			return nil, fmt.Errorf("unifi: %w", err)
 		}
 		return New(c)
 	}, dns.ConfigSchema{Fields: []dns.Field{
@@ -90,10 +79,17 @@ type Config struct {
 	AllowInsecureHTTP  bool
 }
 
+// creds keeps the API key off the Provider struct itself, so a dereferenced
+// copy of the provider cannot print it.
+type creds struct {
+	dns.Redacted
+	key secrets.Secret
+}
+
 // Provider implements dns.Provider.
 type Provider struct {
 	c        *httpx.Client
-	key      secrets.Secret
+	cr       *creds
 	wildcard bool
 
 	mu     sync.Mutex
@@ -113,10 +109,10 @@ func New(cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("unifi: %w", err)
 	}
 	c.Secrets = []secrets.Secret{cfg.APIKey}
-	return &Provider{c: c, key: cfg.APIKey, wildcard: cfg.Wildcard, siteID: cfg.SiteID}, nil
+	return &Provider{c: c, cr: &creds{key: cfg.APIKey}, wildcard: cfg.Wildcard, siteID: cfg.SiteID}, nil
 }
 
-func (p *Provider) hdr() http.Header { return http.Header{"X-Api-Key": {p.key.Reveal()}} }
+func (p *Provider) hdr() http.Header { return http.Header{"X-Api-Key": {p.cr.key.Reveal()}} }
 
 func (p *Provider) Type() string { return Type }
 
@@ -154,8 +150,20 @@ type site struct {
 // pages, or a final count differing from totalCount are all errors, never a
 // short list.
 func paginate[T any](ctx context.Context, p *Provider, op, path string, id func(T) string) ([]T, error) {
+	// the list changing under us (totalCount differs between pages) is retried once
+	all, err := paginateOnce(ctx, p, op, path, id)
+	if errors.Is(err, errListChanged) {
+		all, err = paginateOnce(ctx, p, op, path, id)
+	}
+	return all, err
+}
+
+var errListChanged = errors.New("list changed while reading")
+
+func paginateOnce[T any](ctx context.Context, p *Provider, op, path string, id func(T) string) ([]T, error) {
 	var all []T
 	seen := map[string]bool{}
+	total := -1
 	for pages := 0; ; pages++ {
 		if pages >= maxPages {
 			return nil, fmt.Errorf("unifi: %s: more than %d pages; refusing to continue", op, maxPages)
@@ -174,6 +182,10 @@ func paginate[T any](ctx context.Context, p *Provider, op, path string, id func(
 		if out.TotalCount == nil {
 			return nil, fmt.Errorf("unifi: %s: malformed response (no totalCount)", op)
 		}
+		if total >= 0 && *out.TotalCount != total {
+			return nil, fmt.Errorf("unifi: %s: totalCount changed from %d to %d between pages: %w", op, total, *out.TotalCount, errListChanged)
+		}
+		total = *out.TotalCount
 		for _, it := range *out.Data {
 			k := id(it)
 			if k == "" || seen[k] {
@@ -321,6 +333,9 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	for _, po := range pols {
 		e := po.record()
+		if e.Name == r.Name && (po.Type == "CNAME_RECORD" || po.Type == "FORWARD_DOMAIN") {
+			return dns.Record{}, fmt.Errorf("unifi: %s already has a %s policy, which conflicts with an %s record: %w", r.Name, po.Type, r.Type, dns.ErrRecordExists)
+		}
 		if e.Name != r.Name || e.Type != r.Type {
 			continue
 		}
@@ -402,6 +417,21 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 		return err
 	}
 	id := r.ID
+	if id != "" && (r.Name != "" || r.Type != "") {
+		// ID wins, but a caller that also names the record must name this one
+		pols, err := p.policies(ctx, sid)
+		if err != nil {
+			return err
+		}
+		for _, po := range pols {
+			if po.ID != id {
+				continue
+			}
+			if e := po.record(); (r.Name != "" && e.Name != r.Name) || (r.Type != "" && e.Type != r.Type) {
+				return fmt.Errorf("unifi: delete of policy %s: stored record is %s %s, not %s %s; refusing", id, e.Name, e.Type, r.Name, r.Type)
+			}
+		}
+	}
 	if id == "" {
 		pols, err := p.policies(ctx, sid)
 		if err != nil {

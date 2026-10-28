@@ -103,3 +103,21 @@ func TestCheckURL(t *testing.T) {
 		}
 	}
 }
+
+func TestBoolOptionAcceptsBoolsAndTrueFalseStrings(t *testing.T) {
+	ok := map[any]bool{true: true, false: false, "true": true, "TRUE": true, "False": false, "false": false}
+	for in, want := range ok {
+		got, err := httpx.BoolOption(map[string]any{"k": in}, "k")
+		if err != nil || got != want {
+			t.Errorf("%v: got %v err %v", in, got, err)
+		}
+	}
+	for _, bad := range []any{"yes", "1", 1, 0, "", "tru", 1.5, []string{"true"}} {
+		if _, err := httpx.BoolOption(map[string]any{"k": bad}, "k"); err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+	if got, err := httpx.BoolOption(map[string]any{}, "k"); err != nil || got {
+		t.Errorf("absent: %v %v", got, err)
+	}
+}

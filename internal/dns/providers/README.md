@@ -57,7 +57,20 @@ itself from `init()`.
   credential headers are never forwarded), and scrubs configured secrets from
   error text.
 
+## ACME challenge providers
+
+The record providers here manage A/AAAA/CNAME records for published services.
+They are **never** ACME DNS-01 challenge providers: route53, pihole, adguard and
+unifi cannot (or, for route53, are not made to) publish `_acme-challenge` TXT
+records through `dns.Provider`. Certificate issuance uses lego's own DNS
+provider catalog, configured separately from these providers.
+
 ## Config keys
+
+`dns.New` takes the provider's own settings (`config.ProviderCfg.Extra`; do not
+pass a map that still contains `type`). Boolean options accept real bools and
+the strings `"true"`/`"false"` (case-insensitive), which is what environment
+substitution produces.
 
 `dns.New` rejects config keys that are not declared in the provider's schema
 (the error names the key and lists the valid ones), so a typo such as
@@ -85,11 +98,11 @@ foreign records of other types read-only where its API exposes them.
 | type | writable types | wildcard A | TTL | IDs | notes |
 |---|---|---|---|---|---|
 | cloudflare | all via API | yes | yes | yes | token needs Zone:Read + DNS:Edit; records never proxied; Update refuses when several records match (name, type) |
-| route53 | A, AAAA, CNAME | yes | yes | no | zone auto-discovery by longest suffix; public preferred; a private zone only with `hosted_zone_id`; empty keys use the default AWS credential chain; TXT is not writable (quoting not implemented); Update refuses multi-value and alias sets |
+| route53 | A, AAAA, CNAME | yes | yes | no | zone auto-discovery by longest suffix; public preferred; a private zone only with `hosted_zone_id`; empty keys use the default AWS credential chain; TXT is not writable (quoting not implemented); Update refuses multi-value and alias sets, is a single compare-and-swap change batch, and every response is validated and every write re-read |
 | rfc2136 | A, AAAA, CNAME, TXT | yes | yes | no | TSIG mandatory and every response must be signed; listing is AXFR, so the server needs `allow-transfer` for the key; Update refuses multi-value sets; A is refused where a CNAME exists |
-| unifi | A | only with `wildcard: true` | yes | yes | Integration API DNS policies; other policy types are listed read-only (CNAME, AAAA, FORWARD_DOMAIN...); set `wildcard: true` only after confirming your controller accepts `*.zone` policies; a disabled policy at the same name blocks Create; list pagination fails closed |
+| unifi | A | only with `wildcard: true` | yes | yes | Integration API DNS policies; other policy types are listed read-only (CNAME, AAAA, FORWARD_DOMAIN...); set `wildcard: true` only after confirming your controller accepts `*.zone` policies; a disabled policy or a CNAME/FORWARD_DOMAIN policy at the same name blocks Create; list pagination fails closed and retries once if totalCount drifts |
 | technitium | A, AAAA, CNAME, TXT | yes | yes | no | token or username+password; Update preserves ttl, disabled flag and comments |
-| pihole | A, AAAA | no (dnsmasq `address=/.zone/ip` is not manageable through the API) | no | no | v6 API; user CNAMEs (`dns.cnameRecords`) are listed read-only and block an A at the same name; session re-auth; the provider implements `io.Closer` (ends the session), and since the registry has no lifecycle hook the owner of the Provider should close it |
+| pihole | A, AAAA | no (dnsmasq `address=/.zone/ip` is not manageable through the API) | no | no | v6 API; user CNAMEs (`dns.cnameRecords`, every alias of `alias[,alias],target[,ttl]`) are listed read-only and block an A at the same name; hosts lines naming several hosts are never edited; session re-auth; the provider implements `io.Closer` (ends the session), and since the registry has no lifecycle hook the owner of the Provider should close it |
 | adguard | A, AAAA, CNAME | yes | no | no | basic auth; raw rewrite strings are sent back on delete/update; answers `A`/`AAAA` are listed as type `KEEP` and are not writable; update falls back to add+delete on old servers |
 
 ## Multi-value record sets

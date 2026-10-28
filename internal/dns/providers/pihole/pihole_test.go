@@ -311,7 +311,74 @@ func TestListingFailsClosedAndSIDScrubbed(t *testing.T) {
 	if err := p.Test(ctx); err == nil || strings.Contains(err.Error(), "sid-") || strings.Contains(err.Error(), password) {
 		t.Fatalf("err = %v", err)
 	}
-	if _, err := dns.New("pihole", map[string]any{"url": "https://pi.lan", "password": "x", "insecure_skip_verify": "true"}, nil); err == nil {
+	if _, err := dns.New("pihole", map[string]any{"url": "https://pi.lan", "password": "x", "insecure_skip_verify": "maybe"}, nil); err == nil {
 		t.Fatal("non-bool flag accepted")
+	}
+}
+
+func TestCNAMEParsingMultipleAliasesAndTTL(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.cnames = []string{"a.example.test,b.example.test,target.example.test,300", "x.example.test,y.example.test,t2.example.test", "solo.example.test,t3.example.test,60", "p.example.test,t4.example.test"}
+	p := newProvider(t, b, password)
+	recs, err := p.ListRecords(ctx, "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]dns.Record{}
+	for _, r := range recs {
+		got[r.Name] = r
+	}
+	want := map[string][2]string{
+		"a.example.test": {"target.example.test", "300"}, "b.example.test": {"target.example.test", "300"},
+		"x.example.test": {"t2.example.test", "0"}, "y.example.test": {"t2.example.test", "0"},
+		"solo.example.test": {"t3.example.test", "60"}, "p.example.test": {"t4.example.test", "0"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("recs = %+v", recs)
+	}
+	for n, w := range want {
+		r := got[n]
+		if r.Type != "CNAME" || r.Value != w[0] || strconv.Itoa(r.TTL) != w[1] {
+			t.Errorf("%s = %+v, want %v", n, r, w)
+		}
+	}
+	// the second alias must block an A just like the first
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "b.example.test", Type: "A", Value: "192.0.2.1"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("second alias did not block: %v", err)
+	}
+	for _, bad := range []string{"onlyone", "a,,b", ",a,b", "a,b,99999999999999999999"} {
+		b.cnames = []string{bad}
+		if _, err := p.ListRecords(ctx, "example.test"); err == nil {
+			t.Errorf("malformed %q accepted", bad)
+		}
+	}
+}
+
+func TestSharedHostsLineNeverEdited(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.hosts = []string{"192.0.2.5 one.example.test two.example.test"}
+	p := newProvider(t, b, password)
+	_, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "one.example.test", Type: "A", Value: "192.0.2.6"})
+	if !errors.Is(err, dns.ErrRecordExists) || b.puts != 0 || len(b.hosts) != 1 {
+		t.Fatalf("err=%v puts=%d hosts=%v", err, b.puts, b.hosts)
+	}
+}
+
+func TestConcurrentFirstUseLogsInOnce(t *testing.T) {
+	b := newBackend()
+	p := newProvider(t, b, password)
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = p.Test(context.Background())
+		}()
+	}
+	wg.Wait()
+	if b.logins != 1 {
+		t.Fatalf("logins = %d, want 1 (session leak)", b.logins)
 	}
 }

@@ -52,7 +52,11 @@ func Register(typ string, f Factory, schema ConfigSchema, caps Capabilities) {
 	registry[typ] = entry{f, schema, caps}
 }
 
-// New constructs a provider of the given type. Unknown config keys are
+// New constructs a provider of the given type. cfg is the provider's own
+// settings, that is config.ProviderCfg.Extra (never a map that still contains
+// the `type` key, which would be rejected as an unknown field). Boolean options
+// may arrive as the strings "true"/"false" from environment substitution.
+// Unknown config keys are
 // rejected (a typo must not silently change behaviour), then required fields
 // are checked. Every key a provider honours must be declared in its schema.
 func New(typ string, cfg map[string]any, sr SecretResolver) (Provider, error) {

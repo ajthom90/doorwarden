@@ -23,7 +23,18 @@ const (
 	password = "adguard-PASSWORD-do-not-leak-1"
 )
 
-type rw struct{ Domain, Answer string }
+type rw struct {
+	Domain  string `json:"domain"`
+	Answer  string `json:"answer"`
+	Enabled *bool  `json:"enabled,omitempty"`
+}
+
+func eq(a, b rw) bool {
+	if a.Domain != b.Domain || a.Answer != b.Answer || (a.Enabled == nil) != (b.Enabled == nil) {
+		return false
+	}
+	return a.Enabled == nil || *a.Enabled == *b.Enabled
+}
 
 type backend struct {
 	rawList   string
@@ -74,7 +85,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var in rw
 		dec(&in)
 		for _, e := range b.rws {
-			if e == in {
+			if eq(e, in) {
 				http.Error(w, "rewrite already exists", 400)
 				return
 			}
@@ -84,7 +95,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var in rw
 		dec(&in)
 		for i, e := range b.rws {
-			if e == in {
+			if eq(e, in) {
 				b.rws = append(b.rws[:i], b.rws[i+1:]...)
 				return
 			}
@@ -97,7 +108,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var in struct{ Target, Update rw }
 		dec(&in)
 		for i, e := range b.rws {
-			if e == in.Target {
+			if eq(e, in.Target) {
 				b.rws[i] = in.Update
 				return
 			}
@@ -127,7 +138,7 @@ func TestConformance(t *testing.T) {
 			b.mu.Lock()
 			defer b.mu.Unlock()
 			for _, v := range values {
-				b.rws = append(b.rws, rw{name, v})
+				b.rws = append(b.rws, rw{Domain: name, Answer: v})
 			}
 			return nil
 		}})
@@ -156,7 +167,7 @@ func TestBasicAuthHeader(t *testing.T) {
 
 func TestTypeInferenceAndWildcard(t *testing.T) {
 	ctx := context.Background()
-	b := &backend{rws: []rw{{"a.example.test", "192.0.2.1"}, {"v6.example.test", "2001:db8::1"}, {"*.example.test", "192.0.2.2"}, {"c.example.test", "a.example.test"}}}
+	b := &backend{rws: []rw{{Domain: "a.example.test", Answer: "192.0.2.1"}, {Domain: "v6.example.test", Answer: "2001:db8::1"}, {Domain: "*.example.test", Answer: "192.0.2.2"}, {Domain: "c.example.test", Answer: "a.example.test"}}}
 	p := newProvider(t, b, password)
 	recs, err := p.ListRecords(ctx, "example.test")
 	if err != nil || len(recs) != 4 {
@@ -213,7 +224,7 @@ func TestContextAndConfig(t *testing.T) {
 
 func TestRawStringsSentOnDeleteAndUpdate(t *testing.T) {
 	ctx := context.Background()
-	b := &backend{rws: []rw{{"Mixed.Example.Test.", "Target.Example.Test."}, {"keep.example.test", "A"}}}
+	b := &backend{rws: []rw{{Domain: "Mixed.Example.Test.", Answer: "Target.Example.Test."}, {Domain: "keep.example.test", Answer: "A"}}}
 	p := newProvider(t, b, password)
 	recs, _ := p.ListRecords(ctx, "example.test")
 	got := map[string]string{}
@@ -229,7 +240,7 @@ func TestRawStringsSentOnDeleteAndUpdate(t *testing.T) {
 	if b.rws[0].Answer != "other.example.test" {
 		t.Fatalf("raw target not matched: %+v", b.rws)
 	}
-	b.rws[0] = rw{"Mixed.Example.Test.", "Other.Example.Test."}
+	b.rws[0] = rw{Domain: "Mixed.Example.Test.", Answer: "Other.Example.Test."}
 	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "mixed.example.test", Type: "CNAME", Value: "other.example.test"}); err != nil {
 		t.Fatal(err)
 	}
@@ -261,10 +272,41 @@ func TestListingFailsClosed(t *testing.T) {
 }
 
 func TestMultiValueUpdateRefused(t *testing.T) {
-	b := &backend{rws: []rw{{"m.example.test", "192.0.2.1"}, {"m.example.test", "192.0.2.2"}}}
+	b := &backend{rws: []rw{{Domain: "m.example.test", Answer: "192.0.2.1"}, {Domain: "m.example.test", Answer: "192.0.2.2"}}}
 	p := newProvider(t, b, password)
 	_, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.9"})
 	if !errors.Is(err, dns.ErrRecordExists) || len(b.rws) != 2 {
 		t.Fatalf("err=%v rws=%v", err, b.rws)
+	}
+}
+
+func TestWholeRawObjectSentBack(t *testing.T) {
+	ctx := context.Background()
+	off := false
+	b := &backend{rws: []rw{{Domain: "x.example.test", Answer: "192.0.2.1", Enabled: &off}}}
+	p := newProvider(t, b, password)
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "x.example.test", Type: "A", Value: "192.0.2.2"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.rws) != 1 || b.rws[0].Answer != "192.0.2.2" || b.rws[0].Enabled == nil || *b.rws[0].Enabled {
+		t.Fatalf("enabled flag lost on update: %+v", b.rws)
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "x.example.test", Type: "A", Value: "192.0.2.2"}); err != nil || len(b.rws) != 0 {
+		t.Fatalf("delete with unmodelled field: err=%v rws=%+v", err, b.rws)
+	}
+}
+
+func TestCNAMEBlocksARecord(t *testing.T) {
+	ctx := context.Background()
+	b := &backend{rws: []rw{{Domain: "c.example.test", Answer: "t.example.test"}, {Domain: "a.example.test", Answer: "192.0.2.1"}}}
+	p := newProvider(t, b, password)
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "CNAME", Value: "x.example.test"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(b.rws) != 2 {
+		t.Fatal("conflicting rewrite created")
 	}
 }

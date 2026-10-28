@@ -279,7 +279,7 @@ func TestMultiValueUpdateRefusedAndDeleteExact(t *testing.T) {
 	b := newBackend()
 	b.zones["example.test"] = []rec{{name: "m.example.test", typ: "A", val: "192.0.2.1"}, {name: "m.example.test", typ: "A", val: "192.0.2.2"}}
 	p := newProvider(t, b, nil)
-	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.9"}); err == nil || !strings.Contains(err.Error(), "2 values") {
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.9"}); !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "2 values") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -313,5 +313,22 @@ func TestSessionTokenScrubbedAndFlagsTyped(t *testing.T) {
 	}
 	if _, err := dns.New("technitium", map[string]any{"url": "https://x.example.test", "token": "t", "allow_insecure_http": "yes"}, nil); err == nil {
 		t.Fatal("non-bool flag accepted")
+	}
+}
+
+func TestCNAMEBlocksARecord(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.zones["example.test"] = []rec{{name: "c.example.test", typ: "CNAME", val: "t.example.test", ttl: 60}, {name: "a.example.test", typ: "A", val: "192.0.2.1", ttl: 60}}
+	p := newProvider(t, b, nil)
+	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.2"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "CNAME") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "CNAME", Value: "x.example.test"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(b.zones["example.test"]) != 2 {
+		t.Fatal("conflicting record created")
 	}
 }

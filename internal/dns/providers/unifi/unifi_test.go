@@ -26,19 +26,20 @@ const (
 )
 
 type backend struct {
-	listRaw      string // replaces list responses (HTTP 200) when set
-	ignoreOffset bool
-	failOffset   int // fail list requests at this offset when >0
-	postEmpty    bool
-	mu           sync.Mutex
-	sites        []map[string]any
-	pols         []map[string]any
-	n            int
-	status       int
-	slow         time.Duration
-	huge         bool
-	requests     []string // "METHOD path"
-	otherKey     string   // key seen at a redirect target
+	driftOnce, driftAlways bool   // totalCount changes on later pages
+	listRaw                string // replaces list responses (HTTP 200) when set
+	ignoreOffset           bool
+	failOffset             int // fail list requests at this offset when >0
+	postEmpty              bool
+	mu                     sync.Mutex
+	sites                  []map[string]any
+	pols                   []map[string]any
+	n                      int
+	status                 int
+	slow                   time.Duration
+	huge                   bool
+	requests               []string // "METHOD path"
+	otherKey               string   // key seen at a redirect target
 }
 
 func fixture(t *testing.T, name string) map[string]any {
@@ -111,7 +112,12 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			end = len(items)
 		}
 		data := append([]map[string]any{}, items[off:end]...)
-		reply(200, map[string]any{"offset": off, "limit": 3, "count": end - off, "totalCount": len(items), "data": data})
+		total := len(items)
+		if off > 0 && (b.driftOnce || b.driftAlways) {
+			total++
+			b.driftOnce = false
+		}
+		reply(200, map[string]any{"offset": off, "limit": 3, "count": end - off, "totalCount": total, "data": data})
 	}
 	if r.URL.Path == root+"/sites" {
 		paged(b.sites)
@@ -455,5 +461,54 @@ func TestDisabledPolicyAndMultiMatch(t *testing.T) {
 	_, err = p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.99"})
 	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "2 DNS policies") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCNAMEAndForwardPoliciesBlockA(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	p := newProvider(t, b, nil)
+	before := len(b.pols)
+	for _, name := range []string{"alias.example.test", "corp.example.test"} { // fixture CNAME_RECORD / FORWARD_DOMAIN
+		_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: name, Type: "A", Value: "192.0.2.50"})
+		if !errors.Is(err, dns.ErrRecordExists) {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+	}
+	if len(b.pols) != before {
+		t.Fatal("conflicting policy was created")
+	}
+}
+
+func TestTotalCountDriftRetriedOnceThenError(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	for i := 0; i < 7; i++ {
+		b.pols = append(b.pols, map[string]any{"type": "A_RECORD", "id": fmt.Sprint("p", i), "enabled": true, "domain": fmt.Sprintf("h%d.example.test", i), "ipv4Address": "192.0.2.1", "ttlSeconds": 0})
+	}
+	b.driftOnce = true
+	p := newProvider(t, b, func(c *unifi.Config) { c.SiteID = siteID })
+	if recs, err := p.ListRecords(ctx, "example.test"); err != nil || len(recs) != 10 {
+		t.Fatalf("single drift must be retried: recs=%d err=%v", len(recs), err)
+	}
+	b.driftAlways = true
+	if _, err := p.ListRecords(ctx, "example.test"); err == nil || !strings.Contains(err.Error(), "totalCount changed") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDeleteByIDRefusesNameMismatch(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	p := newProvider(t, b, nil)
+	id := "aaaaaaaa-0000-4000-8000-000000000001" // app.example.test A
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: id, Name: "other.example.test", Type: "A"}); err == nil {
+		t.Fatal("deleted a policy under the wrong name")
+	}
+	if len(b.pols) != 3 {
+		t.Fatal("policy removed")
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: id}); err != nil || len(b.pols) != 2 {
+		t.Fatalf("plain delete by ID: err=%v pols=%d", err, len(b.pols))
 	}
 }

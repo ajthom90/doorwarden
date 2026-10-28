@@ -64,6 +64,8 @@ type Config struct {
 	KeySecret secrets.Secret // base64
 	Algorithm string
 	Timeout   time.Duration
+	// Clock overrides time.Now for TSIG timestamps (tests only).
+	Clock func() time.Time
 }
 
 // Provider implements dns.Provider.
@@ -71,8 +73,16 @@ type Provider struct {
 	addr    string
 	keyName string
 	alg     string
-	secret  secrets.Secret
+	cr      *creds
 	timeout time.Duration
+	now     func() time.Time
+}
+
+// creds keeps the TSIG secret off the Provider struct itself, so a
+// dereferenced copy of the provider cannot print it.
+type creds struct {
+	dns.Redacted
+	secret secrets.Secret
 }
 
 // New validates cfg and builds a provider.
@@ -102,9 +112,13 @@ func New(c Config) (*Provider, error) {
 	if to <= 0 {
 		to = 10 * time.Second
 	}
+	now := c.Clock
+	if now == nil {
+		now = time.Now
+	}
 	return &Provider{
 		addr: net.JoinHostPort(host, port), keyName: mdns.Fqdn(strings.ToLower(c.KeyName)),
-		alg: full, secret: c.KeySecret, timeout: to,
+		alg: full, cr: &creds{secret: c.KeySecret}, timeout: to, now: now,
 	}, nil
 }
 
@@ -112,46 +126,115 @@ func (p *Provider) Type() string                   { return Type }
 func (p *Provider) Capabilities() dns.Capabilities { return staticCaps }
 
 func (p *Provider) scrub(s string) string {
-	if v := p.secret.Reveal(); v != "" {
+	if v := p.cr.secret.Reveal(); v != "" {
 		s = strings.ReplaceAll(s, v, "[redacted]")
 	}
 	return s
 }
 
-func (p *Provider) client() *mdns.Client {
-	return &mdns.Client{Net: "tcp", Timeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret.Reveal()}}
-}
-
 func (p *Provider) sign(m *mdns.Msg) *mdns.Msg {
-	m.SetTsig(p.keyName, p.alg, 300, time.Now().Unix())
+	m.SetTsig(p.keyName, p.alg, 300, p.now().Unix())
 	return m
 }
 
-func (p *Provider) exchange(ctx context.Context, op string, m *mdns.Msg) (*mdns.Msg, error) {
-	r, _, err := p.client().ExchangeContext(ctx, p.sign(m), p.addr)
-	if err != nil {
+// exchangeRaw sends one TSIG-signed message over TCP and returns the parsed,
+// TSIG-verified response. Verification is done here (not by the library
+// client) so a NOTAUTH answer can be told apart: BADKEY, BADSIG and BADTIME
+// are reported as such when the server says so in its TSIG record.
+func (p *Provider) exchangeRaw(ctx context.Context, op string, m *mdns.Msg) (*mdns.Msg, error) {
+	wrap := func(err error) error {
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("rfc2136: %s: %w", op, ctx.Err())
-		}
-		if errors.Is(err, mdns.ErrAuth) {
-			return nil, authErr(op)
+			return fmt.Errorf("rfc2136: %s: %w", op, ctx.Err())
 		}
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
-			return nil, fmt.Errorf("rfc2136: %s: %w", op, context.DeadlineExceeded)
+			return fmt.Errorf("rfc2136: %s: %w", op, context.DeadlineExceeded)
 		}
-		return nil, fmt.Errorf("rfc2136: %s: %s", op, p.scrub(err.Error()))
+		return fmt.Errorf("rfc2136: %s: %s", op, p.scrub(err.Error()))
 	}
-	if r.IsTsig() == nil {
+	p.sign(m)
+	out, reqMAC, err := mdns.TsigGenerate(m, p.cr.secret.Reveal(), "", false)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	nc, err := (&net.Dialer{Timeout: p.timeout}).DialContext(ctx, "tcp", p.addr)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	defer nc.Close()
+	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
+	defer stop()
+	_ = nc.SetDeadline(time.Now().Add(p.timeout))
+	co := &mdns.Conn{Conn: nc}
+	if _, err := co.Write(out); err != nil {
+		return nil, wrap(err)
+	}
+	raw, err := co.ReadMsgHeader(nil)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	r := new(mdns.Msg)
+	if err := r.Unpack(raw); err != nil {
+		return nil, wrap(err)
+	}
+	t := r.IsTsig()
+	if t == nil {
+		if r.Rcode == mdns.RcodeNotAuth {
+			return nil, authErr(op, "unsigned NOTAUTH reply")
+		}
 		return nil, fmt.Errorf("rfc2136: %s: server response is not TSIG-signed; refusing it", op)
+	}
+	if e := tsigErrorFromCode(op, int(t.Error)); e != nil {
+		return nil, e
+	}
+	if !strings.EqualFold(t.Hdr.Name, p.keyName) {
+		return nil, fmt.Errorf("rfc2136: %s: response signed with an unexpected key %q; refusing it", op, t.Hdr.Name)
+	}
+	if err := mdns.TsigVerify(raw, p.cr.secret.Reveal(), reqMAC, false); err != nil {
+		return nil, tsigVerifyError(op, err)
+	}
+	return r, nil
+}
+
+// tsigErrorFromCode maps a TSIG-record error code (RFC 8945 section 3.2) to a
+// specific message; nil for NOERROR.
+func tsigErrorFromCode(op string, code int) error {
+	switch code {
+	case 0:
+		return nil
+	case mdns.RcodeBadSig:
+		return fmt.Errorf("rfc2136: %s: server reports BADSIG: the TSIG secret or algorithm does not match the server's key", op)
+	case mdns.RcodeBadKey:
+		return fmt.Errorf("rfc2136: %s: server reports BADKEY: it does not know the TSIG key name %q", op, "key_name")
+	case mdns.RcodeBadTime:
+		return fmt.Errorf("rfc2136: %s: server reports BADTIME: the clocks of doorwarden and the DNS server differ by more than the TSIG fudge (300s); fix time synchronisation", op)
+	}
+	return fmt.Errorf("rfc2136: %s: server reports TSIG error %s", op, mdns.RcodeToString[code])
+}
+
+func tsigVerifyError(op string, err error) error {
+	switch {
+	case errors.Is(err, mdns.ErrTime):
+		return tsigErrorFromCode(op, mdns.RcodeBadTime)
+	case errors.Is(err, mdns.ErrSig):
+		return fmt.Errorf("rfc2136: %s: the server's TSIG signature did not verify (BADSIG); the secret or algorithm differs", op)
+	case errors.Is(err, mdns.ErrSecret):
+		return tsigErrorFromCode(op, mdns.RcodeBadKey)
+	}
+	return fmt.Errorf("rfc2136: %s: TSIG verification failed: %v", op, err)
+}
+
+func (p *Provider) exchange(ctx context.Context, op string, m *mdns.Msg) (*mdns.Msg, error) {
+	r, err := p.exchangeRaw(ctx, op, m)
+	if err != nil {
+		return nil, err
 	}
 	return r, p.rcodeErr(op, r)
 }
 
-// authErr is what a TSIG/zone authorisation failure looks like: the library
-// reports a NOTAUTH response (or a TSIG that does not verify) as ErrAuth.
-func authErr(op string) error {
-	return fmt.Errorf("rfc2136: %s: TSIG authentication failed or zone not served (NOTAUTH/bad signature); check key_name, key_secret, algorithm and the zone", op)
+// authErr is what a TSIG/zone authorisation failure looks like.
+func authErr(op, detail string) error {
+	return fmt.Errorf("rfc2136: %s: NOTAUTH (%s): the server rejected the TSIG key or does not serve the zone; check key_name, key_secret, algorithm and the zone", op, detail)
 }
 
 func (p *Provider) rcodeErr(op string, r *mdns.Msg) error {
@@ -159,41 +242,25 @@ func (p *Provider) rcodeErr(op string, r *mdns.Msg) error {
 	case mdns.RcodeSuccess:
 		return nil
 	case mdns.RcodeNotAuth:
-		return authErr(op)
+		return authErr(op, "signed reply")
 	case mdns.RcodeRefused:
 		return fmt.Errorf("rfc2136: %s: refused by the server (REFUSED); the TSIG key may not be permitted to update this zone", op)
 	case mdns.RcodeNameError:
 		return nil // NXDOMAIN is an empty answer for queries
+	case mdns.RcodeYXRrset, mdns.RcodeNXRrset:
+		return fmt.Errorf("rfc2136: %s: the record set changed concurrently (%s); retry: %w", op, mdns.RcodeToString[r.Rcode], dns.ErrRecordExists)
 	}
 	return fmt.Errorf("rfc2136: %s: server returned %s", op, mdns.RcodeToString[r.Rcode])
 }
 
-// Test sends a TSIG-signed SOA query for the root and requires the
-// server to answer with a valid TSIG; it proves reachability and key
-// agreement but not update permission (that is per zone).
+// Test sends a TSIG-signed SOA query for the root and requires a correctly
+// signed answer; it proves reachability and key agreement but not update
+// permission (that is per zone).
 func (p *Provider) Test(ctx context.Context) error {
 	m := new(mdns.Msg)
 	m.SetQuestion(".", mdns.TypeSOA)
-	r, _, err := p.client().ExchangeContext(ctx, p.sign(m), p.addr)
-	if err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("rfc2136: verify credentials: %w", ctx.Err())
-		}
-		if errors.Is(err, mdns.ErrAuth) {
-			return authErr("verify credentials")
-		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			return fmt.Errorf("rfc2136: verify credentials: %w", context.DeadlineExceeded)
-		}
-		return fmt.Errorf("rfc2136: verify credentials: %s", p.scrub(err.Error()))
-	}
-	// Servers answer a signed probe for a zone they do not serve with REFUSED
-	// (still signed); a wrong key yields NOTAUTH/BADKEY, surfaced above.
-	if r.IsTsig() == nil {
-		return errors.New("rfc2136: verify credentials: server did not sign its response with TSIG")
-	}
-	return nil
+	_, err := p.exchangeRaw(ctx, "verify credentials", m)
+	return err
 }
 
 func fqdn(name string) string { return mdns.Fqdn(strings.ToLower(name)) }
@@ -269,7 +336,7 @@ func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, 
 	defer nc.Close()
 	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
 	defer stop()
-	t := &mdns.Transfer{Conn: &mdns.Conn{Conn: nc}, ReadTimeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret.Reveal()}}
+	t := &mdns.Transfer{Conn: &mdns.Conn{Conn: nc}, ReadTimeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.cr.secret.Reveal()}}
 	ch, err := t.In(m, p.addr)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -361,7 +428,11 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 			return dns.Record{}, fmt.Errorf("rfc2136: %s already has a %s record, which cannot coexist with %s: %w", r.Name, t, r.Type, dns.ErrRecordExists)
 		}
 	}
-	if err := p.update(ctx, "create record "+r.Name, zone, func(m *mdns.Msg) { m.Insert([]mdns.RR{rr}) }); err != nil {
+	// prerequisite: no such RRset exists yet, so a concurrent writer cannot be overwritten
+	if err := p.update(ctx, "create record "+r.Name, zone, func(m *mdns.Msg) {
+		m.RRsetNotUsed([]mdns.RR{rr})
+		m.Insert([]mdns.RR{rr})
+	}); err != nil {
 		return dns.Record{}, err
 	}
 	out, _ := fromRR(rr)
@@ -387,7 +458,13 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		return dns.Record{}, fmt.Errorf("rfc2136: %s %s set has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(cur), dns.ErrRecordExists)
 	}
 	// one UPDATE message: replace the whole RRset atomically
+	// prerequisite: the RRset is still exactly what was read (value dependent)
+	curRR, err := toRR(dns.Record{Name: r.Name, Type: r.Type, Value: cur[0].Value, TTL: cur[0].TTL})
+	if err != nil {
+		return dns.Record{}, err
+	}
 	if err := p.update(ctx, "update record "+r.Name, zone, func(m *mdns.Msg) {
+		m.Used([]mdns.RR{curRR})
 		m.RemoveRRset([]mdns.RR{rr})
 		m.Insert([]mdns.RR{rr})
 	}); err != nil {

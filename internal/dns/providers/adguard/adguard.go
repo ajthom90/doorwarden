@@ -65,7 +65,14 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	c    *httpx.Client
+	c  *httpx.Client
+	cr *creds
+}
+
+// creds keeps the basic-auth token off the Provider struct itself, so a
+// dereferenced copy of the provider cannot print it.
+type creds struct {
+	dns.Redacted
 	auth secrets.Secret // base64 user:password
 }
 
@@ -83,11 +90,11 @@ func New(cfg Config) (*Provider, error) {
 	}
 	tok := secrets.Secret(base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password.Reveal())))
 	c.Secrets = []secrets.Secret{cfg.Password, tok}
-	return &Provider{c: c, auth: tok}, nil
+	return &Provider{c: c, cr: &creds{auth: tok}}, nil
 }
 
 func (p *Provider) hdr() http.Header {
-	return http.Header{"Authorization": {"Basic " + p.auth.Reveal()}}
+	return http.Header{"Authorization": {"Basic " + p.cr.auth.Reveal()}}
 }
 
 func (p *Provider) Type() string                   { return Type }
@@ -128,16 +135,16 @@ func typeOf(answer string) string {
 // those raw strings (not the normalised record) are what Delete/Update send.
 type entry struct {
 	rec dns.Record
-	raw rewrite
+	raw json.RawMessage // the complete rewrite object, including fields we do not model
 }
 
-func (rw rewrite) entry() entry {
+func (rw rewrite) entry(raw json.RawMessage) entry {
 	v := rw.Answer
 	t := typeOf(v)
 	if t == "CNAME" {
 		v = strings.ToLower(strings.TrimSuffix(v, "."))
 	}
-	return entry{rec: dns.Record{Name: strings.ToLower(strings.TrimSuffix(rw.Domain, ".")), Type: t, Value: v}, raw: rw}
+	return entry{rec: dns.Record{Name: strings.ToLower(strings.TrimSuffix(rw.Domain, ".")), Type: t, Value: v}, raw: raw}
 }
 
 func (p *Provider) Test(ctx context.Context) error {
@@ -155,16 +162,17 @@ func (p *Provider) list(ctx context.Context) ([]entry, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil, errors.New("adguard: list rewrites: empty response")
 	}
-	var rws []rewrite
-	if err := json.Unmarshal(body, &rws); err != nil { // a JSON null is a legitimately empty list
+	var raws []json.RawMessage
+	if err := json.Unmarshal(body, &raws); err != nil { // a JSON null is a legitimately empty list
 		return nil, fmt.Errorf("adguard: list rewrites: malformed response: %w", err)
 	}
-	out := make([]entry, 0, len(rws))
-	for _, rw := range rws {
-		if rw.Domain == "" || rw.Answer == "" {
+	out := make([]entry, 0, len(raws))
+	for _, raw := range raws {
+		var rw rewrite
+		if err := json.Unmarshal(raw, &rw); err != nil || rw.Domain == "" || rw.Answer == "" {
 			return nil, errors.New("adguard: list rewrites: entry without domain or answer")
 		}
-		out = append(out, rw.entry())
+		out = append(out, rw.entry(raw))
 	}
 	return out, nil
 }
@@ -234,6 +242,15 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if len(cur) > 0 {
 		return dns.Record{}, dns.ErrRecordExists
 	}
+	// a CNAME cannot coexist with address records for the same name
+	for _, e := range all {
+		if e.rec.Name != r.Name {
+			continue
+		}
+		if (r.Type == "CNAME" && (e.rec.Type == "A" || e.rec.Type == "AAAA")) || (r.Type != "CNAME" && e.rec.Type == "CNAME") {
+			return dns.Record{}, fmt.Errorf("adguard: %s already has a %s rewrite, which cannot coexist with %s: %w", r.Name, e.rec.Type, r.Type, dns.ErrRecordExists)
+		}
+	}
 	if err := p.post(ctx, "create rewrite "+r.Name, "/control/rewrite/add", rewrite{r.Name, r.Value}); err != nil {
 		return dns.Record{}, err
 	}
@@ -260,12 +277,15 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	default:
 		return dns.Record{}, fmt.Errorf("adguard: %s %s has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(old), dns.ErrRecordExists)
 	}
-	body := map[string]rewrite{"target": old[0].raw, "update": {r.Name, r.Value}}
+	upd := map[string]any{}
+	_ = json.Unmarshal(old[0].raw, &upd) // keep fields we do not model (for example "enabled")
+	upd["domain"], upd["answer"] = r.Name, r.Value
+	body := map[string]any{"target": old[0].raw, "update": upd}
 	_, err = p.c.Do(ctx, "PUT", "/control/rewrite/update", nil, p.hdr(), body, nil)
 	var se *httpx.StatusError
 	if errors.As(err, &se) && (se.Status == 404 || se.Status == 405) {
 		// older server without /update: add the new answer first, then drop the old
-		if err := p.post(ctx, "update rewrite "+r.Name, "/control/rewrite/add", rewrite{r.Name, r.Value}); err != nil {
+		if err := p.post(ctx, "update rewrite "+r.Name, "/control/rewrite/add", upd); err != nil {
 			return dns.Record{}, err
 		}
 		if err := p.post(ctx, "update rewrite "+r.Name+" (remove old)", "/control/rewrite/delete", old[0].raw); err != nil {

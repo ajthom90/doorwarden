@@ -85,7 +85,19 @@ func TestProviderStructsDoNotLeakSecrets(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", typ, err)
 		}
+		// a DEREFERENCED copy of the provider (String/GoString have pointer
+		// receivers) must not print credentials either: they live behind a
+		// pointer to a redacting struct
+		deref := reflect.ValueOf(p).Elem().Interface()
 		for _, f := range []string{"%v", "%+v", "%#v"} {
+			for _, v := range []any{p, deref} {
+				out := fmt.Sprintf(f, v)
+				for _, needle := range []string{sec, "TEFLQ0hFQ0tzM2NyZXQ=", "Basic ", "Bearer", "AKIALEAKCHECK"} {
+					if strings.Contains(out, needle) {
+						t.Errorf("%s %s (%T) leaks %q: %.200s", typ, f, v, needle, out)
+					}
+				}
+			}
 			out := fmt.Sprintf(f, p)
 			for _, needle := range []string{sec, "TEFLQ0hFQ0tzM2NyZXQ=", "Basic "} {
 				if strings.Contains(out, needle) || strings.Contains(out, "Bearer") {

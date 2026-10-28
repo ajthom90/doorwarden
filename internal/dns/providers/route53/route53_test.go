@@ -656,3 +656,21 @@ func TestTestResolvesAZone(t *testing.T) {
 		t.Fatal("malformed Test accepted")
 	}
 }
+
+func TestCNAMEBlocksARecord(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.zone("ZEXAMPLE").sets["c.example.test.|CNAME"] = &set{name: "c.example.test.", typ: "CNAME", ttl: 60, vals: []string{"t.example.test."}}
+	b.seed("ZEXAMPLE", "a.example.test", "192.0.2.1")
+	p := newProvider(t, b, nil)
+	n := len(b.zone("ZEXAMPLE").sets)
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "CNAME") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "CNAME", Value: "x.example.test"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(b.zone("ZEXAMPLE").sets) != n {
+		t.Fatal("conflicting set created")
+	}
+}

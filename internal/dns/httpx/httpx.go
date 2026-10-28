@@ -270,15 +270,25 @@ func trunc(s string) string {
 	return s
 }
 
-// BoolOption reads an optional bool config key; a non-bool value is an error.
+// BoolOption reads an optional bool config key. Booleans under `providers:`
+// can arrive as the strings "true"/"false" (environment substitution), so those
+// are accepted case-insensitively as well as real bools; anything else is an
+// error.
 func BoolOption(cfg map[string]any, key string) (bool, error) {
 	v, ok := cfg[key]
 	if !ok || v == nil {
 		return false, nil
 	}
-	b, ok := v.(bool)
-	if !ok {
-		return false, fmt.Errorf("config field %q must be a bool", key)
+	switch b := v.(type) {
+	case bool:
+		return b, nil
+	case string:
+		switch strings.ToLower(b) {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		}
 	}
-	return b, nil
+	return false, fmt.Errorf("config field %q must be true or false", key)
 }

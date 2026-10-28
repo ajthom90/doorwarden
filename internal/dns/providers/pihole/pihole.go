@@ -8,8 +8,10 @@
 //     address=/.zone/ip, but Pi-hole's API does not manage such lines, so
 //     WildcardA is false. Use a provider with wildcard support, or publish
 //     per-app names;
-//   - only A and AAAA records (the family is inferred from the IP); CNAMEs live
-//     in a separate Pi-hole list and are not handled.
+//   - only A and AAAA records are writable (the family is inferred from the IP).
+//     The user's CNAMEs (dns.cnameRecords, "alias[,alias...],target[,ttl]") are
+//     listed read-only and block creating an A/AAAA at the same name;
+//   - a hosts line naming several hosts ("ip a b") is never modified.
 //
 // Auth is a session: POST /api/auth with the password yields a session id sent
 // as X-FTL-SID. A 401 triggers one transparent re-login. Close deletes the
@@ -72,11 +74,20 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	c        *httpx.Client
-	password secrets.Secret
+	c  *httpx.Client
+	cr *creds
 
-	mu  sync.Mutex
-	sid secrets.Secret
+	loginMu sync.Mutex // single-flight login: no concurrent sessions leak
+	mu      sync.Mutex
+}
+
+// creds keeps the password and session id off the Provider struct itself, so a
+// dereferenced copy of the provider cannot print them. sid is guarded by
+// Provider.mu.
+type creds struct {
+	dns.Redacted
+	password secrets.Secret
+	sid      secrets.Secret
 }
 
 // New validates cfg and builds a provider.
@@ -92,7 +103,7 @@ func New(cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("pihole: %w", err)
 	}
 	c.Secrets = []secrets.Secret{cfg.Password}
-	return &Provider{c: c, password: cfg.Password}, nil
+	return &Provider{c: c, cr: &creds{password: cfg.Password}}, nil
 }
 
 func (p *Provider) Type() string                   { return Type }
@@ -111,7 +122,20 @@ func (p *Provider) mapErr(op string, err error) error {
 	return fmt.Errorf("pihole: %s: %w", op, err)
 }
 
-func (p *Provider) login(ctx context.Context) error {
+func (p *Provider) currentSID() secrets.Secret {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cr.sid
+}
+
+// login establishes a session unless another goroutine already did while we
+// waited (stale is the session id the caller found invalid, or empty).
+func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+	if cur := p.currentSID(); cur != "" && cur != stale {
+		return nil
+	}
 	var out struct {
 		Session struct {
 			Valid   bool   `json:"valid"`
@@ -119,14 +143,14 @@ func (p *Provider) login(ctx context.Context) error {
 			Message string `json:"message"`
 		} `json:"session"`
 	}
-	if _, err := p.c.Do(ctx, "POST", "/api/auth", nil, nil, map[string]string{"password": p.password.Reveal()}, &out); err != nil {
+	if _, err := p.c.Do(ctx, "POST", "/api/auth", nil, nil, map[string]string{"password": p.cr.password.Reveal()}, &out); err != nil {
 		return p.mapErr("login", err)
 	}
 	if !out.Session.Valid || out.Session.SID == "" {
 		return errors.New("pihole: login failed: password rejected or two-factor authentication is enabled (use an application password)")
 	}
 	p.mu.Lock()
-	p.sid = secrets.Secret(out.Session.SID)
+	p.cr.sid = secrets.Secret(out.Session.SID)
 	p.mu.Unlock()
 	p.c.AddSecret(secrets.Secret(out.Session.SID))
 	return nil
@@ -135,22 +159,20 @@ func (p *Provider) login(ctx context.Context) error {
 // do performs an authenticated call, logging in on demand and once more on 401.
 func (p *Provider) do(ctx context.Context, op, method, path string, body, out any) error {
 	for attempt := 0; ; attempt++ {
-		p.mu.Lock()
-		sid := p.sid
-		p.mu.Unlock()
+		sid := p.currentSID()
 		if sid == "" {
-			if err := p.login(ctx); err != nil {
+			if err := p.login(ctx, ""); err != nil {
 				return err
 			}
-			p.mu.Lock()
-			sid = p.sid
-			p.mu.Unlock()
+			sid = p.currentSID()
 		}
 		_, err := p.c.Do(ctx, method, path, nil, http.Header{"X-Ftl-Sid": {sid.Reveal()}}, body, out)
 		var se *httpx.StatusError
 		if errors.As(err, &se) && se.Status == 401 && attempt == 0 {
 			p.mu.Lock()
-			p.sid = ""
+			if p.cr.sid == sid {
+				p.cr.sid = ""
+			}
 			p.mu.Unlock()
 			continue
 		}
@@ -174,8 +196,8 @@ var _ io.Closer = (*Provider)(nil)
 // io.Closer (Pi-hole limits concurrent sessions).
 func (p *Provider) Close() error {
 	p.mu.Lock()
-	sid := p.sid
-	p.sid = ""
+	sid := p.cr.sid
+	p.cr.sid = ""
 	p.mu.Unlock()
 	if sid == "" {
 		return nil
@@ -188,7 +210,13 @@ func (p *Provider) Close() error {
 	return nil
 }
 
-func (p *Provider) hosts(ctx context.Context) ([]dns.Record, error) {
+// hostRec is a listed hosts entry; shared marks a line that names several hosts.
+type hostRec struct {
+	dns.Record
+	shared bool
+}
+
+func (p *Provider) hosts(ctx context.Context) ([]hostRec, error) {
 	var out struct {
 		Config *struct {
 			DNS *struct {
@@ -202,7 +230,7 @@ func (p *Provider) hosts(ctx context.Context) ([]dns.Record, error) {
 	if out.Config == nil || out.Config.DNS == nil || out.Config.DNS.Hosts == nil {
 		return nil, errors.New("pihole: list hosts: malformed response (no config.dns.hosts)")
 	}
-	var recs []dns.Record
+	var recs []hostRec
 	for _, e := range *out.Config.DNS.Hosts {
 		f := strings.Fields(e)
 		if len(f) < 2 {
@@ -212,11 +240,15 @@ func (p *Provider) hosts(ctx context.Context) ([]dns.Record, error) {
 		if ip, err := netip.ParseAddr(f[0]); err == nil && !ip.Is4() && !ip.Is4In6() {
 			typ = "AAAA"
 		}
+		var names []string
 		for _, h := range f[1:] {
 			if strings.HasPrefix(h, "#") {
 				break
 			}
-			recs = append(recs, dns.Record{Name: strings.ToLower(h), Type: typ, Value: f[0]})
+			names = append(names, h)
+		}
+		for _, h := range names {
+			recs = append(recs, hostRec{Record: dns.Record{Name: strings.ToLower(h), Type: typ, Value: f[0]}, shared: len(names) > 1})
 		}
 	}
 	return recs, nil
@@ -239,17 +271,57 @@ func (p *Provider) cnames(ctx context.Context) ([]dns.Record, error) {
 	}
 	var recs []dns.Record
 	for _, e := range *out.Config.DNS.CNAMEs {
-		f := strings.Split(e, ",")
-		if len(f) < 2 || strings.TrimSpace(f[0]) == "" {
-			return nil, fmt.Errorf("pihole: list cname records: unparseable entry %q", e)
+		rs, err := parseCNAME(e)
+		if err != nil {
+			return nil, fmt.Errorf("pihole: list cname records: %w", err)
 		}
-		r := dns.Record{Name: strings.ToLower(strings.TrimSpace(f[0])), Type: "CNAME", Value: strings.ToLower(strings.TrimSpace(f[1]))}
-		if len(f) > 2 {
-			r.TTL, _ = strconv.Atoi(strings.TrimSpace(f[2]))
-		}
-		recs = append(recs, r)
+		recs = append(recs, rs...)
 	}
 	return recs, nil
+}
+
+// parseCNAME reads "alias[,alias...],target[,ttl]": a final whole-number field
+// is the TTL, the field before it (or the last field when it is not numeric)
+// is the target, and every earlier field is an alias; each alias is its own
+// record.
+func parseCNAME(entry string) ([]dns.Record, error) {
+	f := strings.Split(entry, ",")
+	for i := range f {
+		f[i] = strings.ToLower(strings.TrimSpace(f[i]))
+		if f[i] == "" {
+			return nil, fmt.Errorf("unparseable entry %q (empty field)", entry)
+		}
+	}
+	ttl := 0
+	if len(f) >= 3 && isWholeNumber(f[len(f)-1]) {
+		n, err := strconv.Atoi(f[len(f)-1])
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("unparseable entry %q (bad TTL)", entry)
+		}
+		ttl = n
+		f = f[:len(f)-1]
+	}
+	if len(f) < 2 {
+		return nil, fmt.Errorf("unparseable entry %q (need alias and target)", entry)
+	}
+	target := f[len(f)-1]
+	var out []dns.Record
+	for _, alias := range f[:len(f)-1] {
+		out = append(out, dns.Record{Name: alias, Type: "CNAME", Value: target, TTL: ttl})
+	}
+	return out, nil
+}
+
+func isWholeNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func inZone(name, zone string) bool { return name == zone || strings.HasSuffix(name, "."+zone) }
@@ -263,9 +335,13 @@ func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, 
 	if err != nil {
 		return nil, err
 	}
-	all = append(all, cn...)
 	var out []dns.Record
 	for _, r := range all {
+		if inZone(r.Name, zone) {
+			out = append(out, r.Record)
+		}
+	}
+	for _, r := range cn {
 		if inZone(r.Name, zone) {
 			out = append(out, r)
 		}
@@ -318,7 +394,7 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	for _, e := range all {
 		if e.Name == r.Name && e.Type == r.Type {
 			if e.Value == r.Value {
-				return e, nil
+				return e.Record, nil
 			}
 			exists = true
 		}
@@ -344,7 +420,7 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
-	var old []dns.Record
+	var old []hostRec
 	for _, e := range all {
 		if e.Name == r.Name && e.Type == r.Type {
 			old = append(old, e)
@@ -355,6 +431,9 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	if len(old) != 1 {
 		return dns.Record{}, fmt.Errorf("pihole: %s %s has %d entries; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(old), dns.ErrRecordExists)
+	}
+	if old[0].shared {
+		return dns.Record{}, fmt.Errorf("pihole: %s is on a hosts line naming several hosts; refusing to edit it: %w", r.Name, dns.ErrRecordExists)
 	}
 	if old[0].Value == r.Value {
 		r.TTL = 0
@@ -368,7 +447,7 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		if o.Value == r.Value {
 			continue
 		}
-		if err := p.do(ctx, "update record "+r.Name+" (remove old value)", "DELETE", entryPath(o), nil, nil); err != nil {
+		if err := p.do(ctx, "update record "+r.Name+" (remove old value)", "DELETE", entryPath(o.Record), nil, nil); err != nil {
 			return dns.Record{}, fmt.Errorf("%w (the new value was added; the old one may remain)", err)
 		}
 	}
@@ -389,8 +468,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	for _, e := range all {
 		if e.Name == r.Name && e.Type == r.Type && e.Value == r.Value {
-			// A 404 here means the name shares a multi-hostname hosts line
-			// ("ip a b"); that surfaces as an error rather than a silent no-op.
+			if e.shared {
+				return fmt.Errorf("pihole: %s is on a hosts line naming several hosts; refusing to edit it: %w", r.Name, dns.ErrRecordExists)
+			}
 			return p.do(ctx, "delete record "+r.Name, "DELETE", entryPath(r), nil, nil)
 		}
 	}

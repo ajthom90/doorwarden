@@ -55,10 +55,17 @@ type Config struct {
 	BaseURL string
 }
 
+// creds keeps the token off the Provider struct itself, so a dereferenced copy
+// of the provider cannot print it.
+type creds struct {
+	dns.Redacted
+	tok secrets.Secret
+}
+
 // Provider implements dns.Provider.
 type Provider struct {
-	c   *httpx.Client
-	tok secrets.Secret
+	c  *httpx.Client
+	cr *creds
 
 	mu    sync.Mutex
 	zones map[string]string // zone name -> id
@@ -78,11 +85,11 @@ func New(cfg Config) (*Provider, error) {
 		return nil, errors.New("cloudflare: config field \"api_token\" is required")
 	}
 	c.Secrets = []secrets.Secret{cfg.APIToken}
-	return &Provider{c: c, tok: cfg.APIToken, zones: map[string]string{}}, nil
+	return &Provider{c: c, cr: &creds{tok: cfg.APIToken}, zones: map[string]string{}}, nil
 }
 
 func (p *Provider) hdr() http.Header {
-	return http.Header{"Authorization": {"Bearer " + p.tok.Reveal()}}
+	return http.Header{"Authorization": {"Bearer " + p.cr.tok.Reveal()}}
 }
 
 func (p *Provider) Type() string                   { return Type }
@@ -224,7 +231,7 @@ func (p *Provider) list(ctx context.Context, zid string, q url.Values) ([]apiRec
 		}
 		all = append(all, *out.Result...)
 		switch {
-		case out.ResultInfo != nil && out.ResultInfo.TotalPages != nil:
+		case out.ResultInfo != nil && out.ResultInfo.TotalPages != nil && *out.ResultInfo.TotalPages > 0:
 			if page >= *out.ResultInfo.TotalPages {
 				return all, nil
 			}
@@ -275,6 +282,22 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	if found {
 		return dns.Record{}, dns.ErrRecordExists
+	}
+	// a CNAME cannot coexist with other data at the same name
+	others := []string{"CNAME"}
+	if r.Type == "CNAME" {
+		others = []string{"A", "AAAA", "TXT"}
+	}
+	for _, t := range others {
+		o, err := p.list(ctx, zid, url.Values{"name.exact": {r.Name}, "type": {t}})
+		if err != nil {
+			return dns.Record{}, err
+		}
+		for _, e := range o {
+			if strings.EqualFold(e.Name, r.Name) && e.Type == t {
+				return dns.Record{}, fmt.Errorf("cloudflare: %s already has a %s record, which cannot coexist with %s: %w", r.Name, t, r.Type, dns.ErrRecordExists)
+			}
+		}
 	}
 	body := map[string]any{"type": r.Type, "name": r.Name, "content": r.Value, "ttl": apiTTL(r.TTL), "proxied": false}
 	var out struct {
@@ -367,10 +390,16 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 		return err
 	}
 	for _, cur := range curs {
-		if r.ID == "" && cur.Content != r.Value {
+		if r.ID != "" {
+			// ID wins, but a caller that also names the record must name this one
+			if (r.Name != "" && !strings.EqualFold(cur.Name, r.Name)) || (r.Type != "" && cur.Type != r.Type) {
+				return fmt.Errorf("cloudflare: delete of record %s: stored record is %s %s, not %s %s; refusing", r.ID, cur.Name, cur.Type, r.Name, r.Type)
+			}
+		} else if cur.Content != r.Value {
 			continue // never delete a record with a different value
 		}
-		_, err := p.c.Do(ctx, "DELETE", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.hdr(), nil, nil)
+		var out apiResult
+		_, err := p.c.Do(ctx, "DELETE", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.hdr(), nil, &out)
 		var se *httpx.StatusError
 		if errors.As(err, &se) && se.Status == 404 {
 			continue
@@ -378,12 +407,14 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 		if err != nil {
 			return p.wrapErr("delete record "+cur.Name, err)
 		}
+		if err := out.ok(); err != nil {
+			return fmt.Errorf("cloudflare: delete record %s: %s", cur.Name, p.c.Scrub(err.Error()))
+		}
 	}
 	return nil
 }
 
 // String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
+// provider.
 func (p *Provider) String() string   { return "cloudflare.Provider" }
 func (p *Provider) GoString() string { return "cloudflare.Provider" }

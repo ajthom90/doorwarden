@@ -23,14 +23,15 @@ const (
 )
 
 type fakeServer struct {
-	addr     string
-	mu       sync.Mutex
-	zones    map[string][]mdns.RR // zone fqdn -> records (without SOA)
-	noAXFR   bool
-	noSign   bool // reply without TSIG even to signed requests
-	delay    time.Duration
-	unsigned int // requests received without TSIG
-	srv      *mdns.Server
+	addr         string
+	mu           sync.Mutex
+	zones        map[string][]mdns.RR // zone fqdn -> records (without SOA)
+	noAXFR       bool
+	noSign       bool   // reply without TSIG even to signed requests
+	beforeUpdate func() // runs when an UPDATE arrives, before it is evaluated (simulates a racing writer)
+	delay        time.Duration
+	unsigned     int // requests received without TSIG
+	srv          *mdns.Server
 }
 
 func startServer(t *testing.T) *fakeServer {
@@ -95,11 +96,61 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 	q := r.Question[0]
 	switch r.Opcode {
 	case mdns.OpcodeUpdate:
+		if f.beforeUpdate != nil {
+			f.beforeUpdate()
+			f.beforeUpdate = nil
+		}
 		z := q.Name
 		recs, ok := f.zones[z]
 		if !ok {
 			m.Rcode = mdns.RcodeNotAuth
 			return
+		}
+		// prerequisites (RFC 2136 section 2.4)
+		exists := func(name string, typ uint16) []mdns.RR {
+			var out []mdns.RR
+			for _, e := range recs {
+				if strings.EqualFold(e.Header().Name, name) && e.Header().Rrtype == typ {
+					out = append(out, e)
+				}
+			}
+			return out
+		}
+		valueDep := map[string][]mdns.RR{}
+		for _, pr := range r.Answer {
+			h := pr.Header()
+			switch h.Class {
+			case mdns.ClassNONE: // NXRRSET: the RRset must not exist
+				if len(exists(h.Name, h.Rrtype)) > 0 {
+					m.Rcode = mdns.RcodeYXRrset
+					return
+				}
+			case mdns.ClassANY: // YXRRSET: the RRset must exist
+				if len(exists(h.Name, h.Rrtype)) == 0 {
+					m.Rcode = mdns.RcodeNXRrset
+					return
+				}
+			case mdns.ClassINET:
+				k := strings.ToLower(h.Name) + "|" + mdns.TypeToString[h.Rrtype]
+				valueDep[k] = append(valueDep[k], pr)
+			}
+		}
+		for _, want := range valueDep {
+			have := exists(want[0].Header().Name, want[0].Header().Rrtype)
+			if len(have) != len(want) {
+				m.Rcode = mdns.RcodeNXRrset
+				return
+			}
+			for _, w := range want {
+				found := false
+				for _, h := range have {
+					found = found || sameRData(h, w)
+				}
+				if !found {
+					m.Rcode = mdns.RcodeNXRrset
+					return
+				}
+			}
 		}
 		for _, rr := range r.Ns {
 			h := rr.Header()
@@ -335,5 +386,67 @@ func TestAXFRHonoursContext(t *testing.T) {
 	_, err := p.ListRecords(ctx, "example.test")
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
 		t.Fatalf("err = %v after %v", err, time.Since(start))
+	}
+}
+
+func TestPrerequisitesProtectAgainstConcurrentWriters(t *testing.T) {
+	f := startServer(t)
+	rr, _ := mdns.NewRR("c.example.test. 60 IN A 192.0.2.1")
+	f.zones["example.test."] = []mdns.RR{rr}
+	p := newProvider(t, f, nil)
+	ctx := context.Background()
+	// a competing writer changes the value between our read and our UPDATE: the
+	// value-dependent prerequisite must make the server refuse our replacement
+	f.beforeUpdate = func() {
+		other, _ := mdns.NewRR("c.example.test. 60 IN A 192.0.2.77")
+		f.zones["example.test."] = []mdns.RR{other}
+	}
+	_, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.2"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "concurrently") {
+		t.Fatalf("update err = %v", err)
+	}
+	if got := f.zones["example.test."][0].(*mdns.A).A.String(); got != "192.0.2.77" {
+		t.Fatalf("concurrent change lost: %s", got)
+	}
+	// create: someone else created the RRset after our existence check
+	f.zones["example.test."] = nil
+	f.beforeUpdate = func() {
+		other, _ := mdns.NewRR("n.example.test. 60 IN A 192.0.2.88")
+		f.zones["example.test."] = []mdns.RR{other}
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "n.example.test", Type: "A", Value: "192.0.2.3"}); err == nil || len(f.zones["example.test."]) != 1 {
+		t.Fatalf("create overwrote a concurrent RRset: err=%v", err)
+	}
+}
+
+func TestTSIGErrorsAreDistinguished(t *testing.T) {
+	for code, want := range map[int]string{mdns.RcodeBadSig: "BADSIG", mdns.RcodeBadKey: "BADKEY", mdns.RcodeBadTime: "BADTIME"} {
+		err := rfc2136.TSIGErrorFromCode("op", code)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("code %d: %v", code, err)
+		}
+	}
+	if rfc2136.TSIGErrorFromCode("op", 0) != nil {
+		t.Fatal("NOERROR must map to nil")
+	}
+	for e, want := range map[error]string{mdns.ErrTime: "BADTIME", mdns.ErrSig: "BADSIG", mdns.ErrSecret: "BADKEY"} {
+		if err := rfc2136.TSIGVerifyError("op", e); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%v: %v", e, err)
+		}
+	}
+}
+
+func TestClockSkewAndWrongKeyReportedClearly(t *testing.T) {
+	f := startServer(t)
+	ctx := context.Background()
+	// wrong secret: the server answers NOTAUTH without a signature
+	wrong := newProvider(t, f, func(c *rfc2136.Config) { c.KeySecret = "d3Jvbmctc2VjcmV0LXdyb25n" })
+	if err := wrong.Test(ctx); err == nil || !strings.Contains(err.Error(), "NOTAUTH") || !strings.Contains(err.Error(), "unsigned") {
+		t.Fatalf("wrong key: err = %v", err)
+	}
+	// a client clock an hour off: the server rejects the timestamp
+	skewed := newProvider(t, f, func(c *rfc2136.Config) { c.Clock = func() time.Time { return time.Now().Add(time.Hour) } })
+	if err := skewed.Test(ctx); err == nil {
+		t.Fatal("clock skew accepted")
 	}
 }

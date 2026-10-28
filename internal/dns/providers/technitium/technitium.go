@@ -75,13 +75,20 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	c        *httpx.Client
-	user     string
-	password secrets.Secret
-
-	mu    sync.Mutex
-	token secrets.Secret
+	c     *httpx.Client
+	user  string
+	cr    *creds
 	fixed bool // token configured; cannot re-login
+	mu    sync.Mutex
+}
+
+// creds keeps the password and tokens off the Provider struct itself, so a
+// dereferenced copy of the provider cannot print them. token is guarded by
+// Provider.mu.
+type creds struct {
+	dns.Redacted
+	password secrets.Secret
+	token    secrets.Secret
 }
 
 // New validates cfg and builds a provider.
@@ -97,7 +104,7 @@ func New(cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("technitium: %w", err)
 	}
 	c.Secrets = []secrets.Secret{cfg.Token, cfg.Password}
-	return &Provider{c: c, user: cfg.Username, password: cfg.Password, token: cfg.Token, fixed: cfg.Token != ""}, nil
+	return &Provider{c: c, user: cfg.Username, cr: &creds{password: cfg.Password, token: cfg.Token}, fixed: cfg.Token != ""}, nil
 }
 
 func (p *Provider) Type() string                   { return Type }
@@ -140,7 +147,7 @@ func (p *Provider) post(ctx context.Context, path string, form url.Values) (*env
 }
 
 func (p *Provider) login(ctx context.Context) error {
-	env, err := p.post(ctx, "/api/user/login", url.Values{"user": {p.user}, "pass": {p.password.Reveal()}, "includeInfo": {"false"}})
+	env, err := p.post(ctx, "/api/user/login", url.Values{"user": {p.user}, "pass": {p.cr.password.Reveal()}, "includeInfo": {"false"}})
 	if errors.Is(err, errInvalidToken) {
 		return errors.New("technitium: login failed: invalid credentials")
 	}
@@ -151,7 +158,7 @@ func (p *Provider) login(ctx context.Context) error {
 		return errors.New("technitium: login response carried no token")
 	}
 	p.mu.Lock()
-	p.token = secrets.Secret(env.Token)
+	p.cr.token = secrets.Secret(env.Token)
 	p.mu.Unlock()
 	p.c.AddSecret(secrets.Secret(env.Token))
 	return nil
@@ -161,14 +168,14 @@ func (p *Provider) login(ctx context.Context) error {
 func (p *Provider) call(ctx context.Context, path string, form url.Values) (*envelope, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		p.mu.Lock()
-		tok := p.token
+		tok := p.cr.token
 		p.mu.Unlock()
 		if tok == "" {
 			if err := p.login(ctx); err != nil {
 				return nil, err
 			}
 			p.mu.Lock()
-			tok = p.token
+			tok = p.cr.token
 			p.mu.Unlock()
 		}
 		f := url.Values{"token": {tok.Reveal()}}
@@ -181,7 +188,7 @@ func (p *Provider) call(ctx context.Context, path string, form url.Values) (*env
 				return nil, errors.New("technitium: the API token was rejected (invalid-token)")
 			}
 			p.mu.Lock()
-			p.token = ""
+			p.cr.token = ""
 			p.mu.Unlock()
 			continue
 		}
@@ -315,6 +322,20 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if len(cur) > 0 {
 		return dns.Record{}, dns.ErrRecordExists
 	}
+	// a CNAME cannot coexist with other data at the same name
+	others := []string{"CNAME"}
+	if r.Type == "CNAME" {
+		others = []string{"A", "AAAA", "TXT"}
+	}
+	for _, t := range others {
+		o, err := p.find(ctx, zone, r.Name, t)
+		if err != nil {
+			return dns.Record{}, err
+		}
+		if len(o) > 0 {
+			return dns.Record{}, fmt.Errorf("technitium: %s already has a %s record, which cannot coexist with %s: %w", r.Name, t, r.Type, dns.ErrRecordExists)
+		}
+	}
 	f := url.Values{"zone": {zone}, "domain": {r.Name}, "type": {r.Type}, "overwrite": {"false"}}
 	for k, v := range vp {
 		f[k] = v
@@ -343,7 +364,7 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		return dns.Record{}, dns.ErrNotFound
 	case 1:
 	default:
-		return dns.Record{}, fmt.Errorf("technitium: %s %s has %d values; refusing ambiguous update", r.Name, r.Type, len(cur))
+		return dns.Record{}, fmt.Errorf("technitium: %s %s has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(cur), dns.ErrRecordExists)
 	}
 	f := url.Values{"zone": {zone}, "domain": {r.Name}, "type": {r.Type}}
 	old := cur[0]
