@@ -106,3 +106,15 @@ func TestSortedAndDuplicatesBothReturned(t *testing.T) {
 		t.Fatalf("dups: %+v %+v", out[1], out[2])
 	}
 }
+
+func TestRepeatedListDoesNotAccumulateWarnings(t *testing.T) {
+	s := New(Config{Services: []config.StaticService{{Name: "bad", Host: "h.example.test:80"}}})
+	for i := 0; i < 3; i++ {
+		if _, err := s.List(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if w := s.Warnings(); len(w) != 1 {
+			t.Fatalf("list %d: warnings %v", i, w)
+		}
+	}
+}

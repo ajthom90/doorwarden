@@ -23,8 +23,9 @@ func (s StaticService) Key() string {
 	return "static:" + slug
 }
 
-// Target returns the effective backend after applying defaults (Upstream URL
-// overrides Host/Port; scheme http, or https with skip_verify; port 80/443 from
+// Target returns the effective backend after applying defaults (the Upstream
+// URL's scheme and host override Host; port is the upstream's explicit port,
+// else Port, else the scheme default; scheme http, or https with skip_verify; port 80/443 from
 // the scheme). Only meaningful when Problems() is empty.
 func (s StaticService) Target() (scheme, host string, port int) {
 	scheme, host, port = s.Scheme, strings.TrimSpace(s.Host), s.Port
@@ -33,9 +34,7 @@ func (s StaticService) Target() (scheme, host string, port int) {
 			scheme = pu.Scheme
 			host = pu.Hostname()
 			if p, err := strconv.Atoi(pu.Port()); err == nil {
-				port = p
-			} else {
-				port = 0
+				port = p // explicit upstream port wins; otherwise Port is kept
 			}
 		}
 	}
@@ -65,6 +64,9 @@ func (s StaticService) Problems() []string {
 	} else if strings.TrimSpace(s.ID) == "" && s.Key() == "" {
 		add("name %q has no characters usable in a key; set id", s.Name)
 	}
+	if strings.TrimSpace(s.ID) != "" && !validID(s.ID) {
+		add("id %q must match [A-Za-z0-9._-]+", s.ID)
+	}
 	if s.Scheme != "" && s.Scheme != "http" && s.Scheme != "https" {
 		add("scheme %q must be http or https", s.Scheme)
 	}
@@ -80,6 +82,8 @@ func (s StaticService) Problems() []string {
 	case up != "":
 		u, err := url.Parse(up)
 		switch {
+		case strings.Contains(up, "#"):
+			add("upstream must not contain a fragment")
 		case err != nil:
 			add("upstream is not a valid URL")
 		case u.Scheme != "http" && u.Scheme != "https":
@@ -93,6 +97,8 @@ func (s StaticService) Problems() []string {
 			if ph := u.Port(); ph != "" {
 				if n, err := strconv.Atoi(ph); err != nil || n < 1 || n > 65535 {
 					add("upstream port %q out of range 1..65535", ph)
+				} else if s.Port != 0 && s.Port != n {
+					add("port %d conflicts with upstream port %d", s.Port, n)
 				}
 			}
 			if !validHost(u.Hostname()) {
@@ -117,16 +123,45 @@ func validHostField(h string) bool {
 		ip := net.ParseIP(h[1 : len(h)-1])
 		return ip != nil && ip.To4() == nil
 	}
-	if net.ParseIP(h) != nil {
-		return true
-	}
 	return validHost(h)
 }
 
-// validHost accepts hostnames and IPs (IPv6 unbracketed).
+func validID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if !nameChar(id[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func nameChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-'
+}
+
+// validHost accepts an IP literal (IPv6 unbracketed) or a hostname made of
+// [A-Za-z0-9._-] with non-empty labels of at most 63 chars that neither start
+// nor end with '-', and at most 253 chars in total. The host flows into proxy
+// configuration, so everything else is rejected.
 func validHost(h string) bool {
 	if net.ParseIP(h) != nil {
 		return true
 	}
-	return h != "" && !strings.ContainsAny(h, " \t\r\n/:@?#[]\\")
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	for _, l := range strings.Split(h, ".") {
+		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(l); i++ {
+			if !nameChar(l[i]) || l[i] == '.' {
+				return false
+			}
+		}
+	}
+	return true
 }

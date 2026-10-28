@@ -18,10 +18,19 @@
 // again until re-approved. A service that disappears and returns unchanged
 // stays approved.
 //
-// Approve can only approve services seen by the most recent Resolve call (the
-// Gate keeps an in-memory key->fingerprint snapshot); other keys return
-// ErrUnknownService. The UI must therefore only offer approval for services
-// it has seen via Resolve.
+// Approve takes the fingerprint of the service the caller displayed and only
+// stores the approval if it still equals the Gate's snapshot (ErrStale
+// otherwise), so a service that changed after it was shown cannot be approved
+// by accident. Fingerprints returns the values to show and echo back.
+//
+// The snapshot is additive: each Resolve overwrites the entries for the keys it
+// saw and never wipes other keys, so a reconciler may call Resolve once per
+// source and every source's services stay approvable. ModeOff leaves it alone.
+// Skip'd, Stopped and Error services are removed from the snapshot (they
+// cannot be approved). Entries for services that have since disappeared are
+// harmless, since Approve always validates the fingerprint, but are not
+// garbage-collected; that is the reconciler's job (a later task). A key never
+// seen by Resolve returns ErrUnknownService.
 package approval
 
 import (
@@ -46,8 +55,11 @@ const (
 	ModeOff     Mode = "off"
 )
 
-// ErrUnknownService means the key was not in the most recent Resolve call.
+// ErrUnknownService means the key was never seen by Resolve (or cannot be approved).
 var ErrUnknownService = errors.New("unknown service")
+
+// ErrStale means the fingerprint does not match the service as last resolved.
+var ErrStale = errors.New("stale fingerprint")
 
 // Store is the persistence the gate needs; *store.Store satisfies it.
 type Store interface {
@@ -60,13 +72,14 @@ type Store interface {
 type Gate struct {
 	mu   sync.Mutex
 	st   Store
-	snap map[string]string // key -> fingerprint from the last Resolve
+	snap map[string]string // key -> fingerprint, additive across Resolve calls
 }
 
 // NewGate returns a Gate backed by st.
 func NewGate(st Store) *Gate { return &Gate{st: st, snap: map[string]string{}} }
 
-// Fingerprint returns the content fingerprint an approval is bound to.
+// Fingerprint returns the content fingerprint an approval is bound to. It is
+// the value a UI must echo back to Approve for the service it displayed.
 func Fingerprint(s model.Service) string {
 	mw := append([]string{}, s.Options.Middlewares...)
 	sort.Strings(mw)
@@ -92,40 +105,63 @@ func (g *Gate) Resolve(ctx context.Context, mode Mode, svcs []model.Service) ([]
 			return nil, err // snapshot untouched
 		}
 	}
-	snap := map[string]string{}
+	if mode == ModeOff {
+		return nil, nil
+	}
+	seen := map[string]string{} // key -> fingerprint; "" = not approvable
 	var out []model.Service
-	if mode != ModeOff {
-		for _, s := range svcs {
-			if s.Options.Skip {
-				continue
-			}
-			fp := Fingerprint(s)
-			if s.State == model.StateStopped || s.State == model.StateError {
-				out = append(out, s)
-				continue
-			}
-			snap[s.Key] = fp
-			if mode == ModeAuto {
-				s.State = model.StatePublished
-			} else if stored, ok := approved[s.Key]; ok && stored == fp {
-				s.State = model.StatePublished
-			} else {
-				s.State = model.StatePending
-			}
+	for _, s := range svcs {
+		if s.Options.Skip {
+			seen[s.Key] = ""
+			continue
+		}
+		if s.State == model.StateStopped || s.State == model.StateError {
+			seen[s.Key] = ""
 			out = append(out, s)
+			continue
+		}
+		fp := Fingerprint(s)
+		seen[s.Key] = fp
+		if mode == ModeAuto {
+			s.State = model.StatePublished
+		} else if stored, ok := approved[s.Key]; ok && stored == fp {
+			s.State = model.StatePublished
+		} else {
+			s.State = model.StatePending
+		}
+		out = append(out, s)
+	}
+	for k, fp := range seen {
+		if fp == "" {
+			delete(g.snap, k)
+		} else {
+			g.snap[k] = fp
 		}
 	}
-	g.snap = snap
 	return out, nil
 }
 
-// Approve persists approval of the content last seen for key.
-func (g *Gate) Approve(ctx context.Context, key string) error {
+// Fingerprints returns a copy of the snapshot (key -> fingerprint).
+func (g *Gate) Fingerprints() map[string]string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make(map[string]string, len(g.snap))
+	for k, v := range g.snap {
+		out[k] = v
+	}
+	return out
+}
+
+// Approve persists approval of key, provided fingerprint matches the snapshot.
+func (g *Gate) Approve(ctx context.Context, key, fingerprint string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	fp, ok := g.snap[key]
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrUnknownService, key)
+	}
+	if fingerprint != fp {
+		return fmt.Errorf("%w: %q changed since it was displayed", ErrStale, key)
 	}
 	return g.st.SetApproval(ctx, key, fp)
 }

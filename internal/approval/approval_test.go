@@ -62,6 +62,14 @@ func states(out []model.Service) map[string]string {
 	return m
 }
 
+// approveCur approves key with the gate's current fingerprint for it.
+func approveCur(t *testing.T, g *Gate, key string) {
+	t.Helper()
+	if err := g.Approve(ctx, key, g.Fingerprints()[key]); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func resolveState(t *testing.T, g *Gate, m Mode, s model.Service) string {
 	t.Helper()
 	out, err := g.Resolve(ctx, m, []model.Service{s})
@@ -93,7 +101,7 @@ func TestOffOmits(t *testing.T) {
 	if err != nil || len(out) != 0 {
 		t.Fatalf("%v %+v", err, out)
 	}
-	if err := g.Approve(ctx, "a"); !errors.Is(err, ErrUnknownService) {
+	if err := g.Approve(ctx, "a", "x"); !errors.Is(err, ErrUnknownService) {
 		t.Fatalf("off mode must not allow approval: %v", err)
 	}
 }
@@ -105,9 +113,7 @@ func TestApproveFlowAndRevoke(t *testing.T) {
 	if resolveState(t, g, ModeApprove, s) != model.StatePending {
 		t.Fatal("want pending")
 	}
-	if err := g.Approve(ctx, "a"); err != nil {
-		t.Fatal(err)
-	}
+	approveCur(t, g, "a")
 	if resolveState(t, g, ModeApprove, s) != model.StatePublished {
 		t.Fatal("want published")
 	}
@@ -131,14 +137,14 @@ func TestSkipWinsInApprove(t *testing.T) {
 	if err != nil || len(out) != 0 {
 		t.Fatalf("%v %+v", err, out)
 	}
-	if err := g.Approve(ctx, "a"); !errors.Is(err, ErrUnknownService) {
+	if err := g.Approve(ctx, "a", "x"); !errors.Is(err, ErrUnknownService) {
 		t.Fatalf("%v", err)
 	}
 }
 
 func TestUnknownKey(t *testing.T) {
 	g := NewGate(newFake())
-	if err := g.Approve(ctx, "nope"); !errors.Is(err, ErrUnknownService) {
+	if err := g.Approve(ctx, "nope", "x"); !errors.Is(err, ErrUnknownService) {
 		t.Fatalf("%v", err)
 	}
 	if err := g.Revoke(ctx, "nope"); err != nil {
@@ -174,9 +180,7 @@ func TestFingerprintChangesFlipToPending(t *testing.T) {
 		g := NewGate(newFake())
 		s := svc("a", model.StateDiscovered)
 		resolveState(t, g, ModeApprove, s)
-		if err := g.Approve(ctx, "a"); err != nil {
-			t.Fatal(err)
-		}
+		approveCur(t, g, "a")
 		if resolveState(t, g, ModeApprove, s) != model.StatePublished {
 			t.Fatalf("%s: not published before change", name)
 		}
@@ -187,9 +191,7 @@ func TestFingerprintChangesFlipToPending(t *testing.T) {
 			t.Errorf("%s: change did not revoke approval", name)
 		}
 		// re-approve the changed content publishes again
-		if err := g.Approve(ctx, "a"); err != nil {
-			t.Fatal(err)
-		}
+		approveCur(t, g, "a")
 		if resolveState(t, g, ModeApprove, c) != model.StatePublished {
 			t.Errorf("%s: re-approve did not publish", name)
 		}
@@ -200,9 +202,7 @@ func TestFingerprintIgnoresPortHostAndMiddlewareOrder(t *testing.T) {
 	g := NewGate(newFake())
 	s := svc("a", model.StateDiscovered)
 	resolveState(t, g, ModeApprove, s)
-	if err := g.Approve(ctx, "a"); err != nil {
-		t.Fatal(err)
-	}
+	approveCur(t, g, "a")
 	c := s
 	c.Backend.Port, c.Backend.Host = 32768, "198.51.100.9"
 	c.Options.Middlewares = []string{"rl", "auth"}
@@ -215,9 +215,7 @@ func TestReturningServiceStaysApproved(t *testing.T) {
 	g := NewGate(newFake())
 	s := svc("a", model.StateDiscovered)
 	resolveState(t, g, ModeApprove, s)
-	if err := g.Approve(ctx, "a"); err != nil {
-		t.Fatal(err)
-	}
+	approveCur(t, g, "a")
 	if out, err := g.Resolve(ctx, ModeApprove, nil); err != nil || len(out) != 0 {
 		t.Fatal(err)
 	}
@@ -237,11 +235,9 @@ func TestApprovalSurvivesRestartRealStore(t *testing.T) {
 	if resolveState(t, g1, ModeApprove, s) != model.StatePending {
 		t.Fatal("want pending")
 	}
-	if err := g1.Approve(ctx, "a"); err != nil {
-		t.Fatal(err)
-	}
+	approveCur(t, g1, "a")
 	g2 := NewGate(st)
-	if err := g2.Approve(ctx, "a"); !errors.Is(err, ErrUnknownService) {
+	if err := g2.Approve(ctx, "a", "x"); !errors.Is(err, ErrUnknownService) {
 		t.Fatalf("fresh gate has no snapshot: %v", err)
 	}
 	if resolveState(t, g2, ModeApprove, s) != model.StatePublished {
@@ -282,10 +278,8 @@ func TestResolveStoreErrorLeavesNoState(t *testing.T) {
 		t.Fatalf("unexpected writes: %d %v", f.writes, f.m)
 	}
 	f.failList = false
-	if err := g.Approve(ctx, "a"); err != nil { // snapshot unchanged by failed Resolve
-		t.Fatal(err)
-	}
-	if err := g.Approve(ctx, "b"); !errors.Is(err, ErrUnknownService) {
+	approveCur(t, g, "a") // snapshot unchanged by failed Resolve
+	if err := g.Approve(ctx, "b", "x"); !errors.Is(err, ErrUnknownService) {
 		t.Fatalf("%v", err)
 	}
 }
@@ -302,7 +296,7 @@ func TestConcurrentConsistency(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			if err := g.Approve(ctx, "a"); err != nil {
+			if err := g.Approve(ctx, "a", Fingerprint(in[0])); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -326,5 +320,102 @@ func TestConcurrentConsistency(t *testing.T) {
 	wg2.Wait()
 	if resolveState(t, g, ModeApprove, in[0]) != model.StatePending {
 		t.Fatal("revoke should leave pending")
+	}
+}
+
+func TestApproveFingerprintChecks(t *testing.T) {
+	f := newFake()
+	g := NewGate(f)
+	s := svc("a", model.StateDiscovered)
+	resolveState(t, g, ModeApprove, s)
+	fp := g.Fingerprints()["a"]
+	if fp != Fingerprint(s) {
+		t.Fatal("Fingerprints must expose Fingerprint")
+	}
+	for _, bad := range []string{"", "abc", fp + "00", fp[:len(fp)-1]} {
+		if err := g.Approve(ctx, "a", bad); !errors.Is(err, ErrStale) {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+	if len(f.m) != 0 || f.writes != 0 {
+		t.Fatalf("stale approve stored something: %v", f.m)
+	}
+	if err := g.Approve(ctx, "a", fp); err != nil || f.m["a"] != fp {
+		t.Fatalf("%v %v", err, f.m)
+	}
+}
+
+func TestApproveStaleAfterServiceChanges(t *testing.T) {
+	f := newFake()
+	g := NewGate(f)
+	s := svc("a", model.StateDiscovered)
+	resolveState(t, g, ModeApprove, s)
+	old := g.Fingerprints()["a"]
+	c := s
+	c.Options.Middlewares = []string{"rl"} // auth dropped
+	resolveState(t, g, ModeApprove, c)
+	if err := g.Approve(ctx, "a", old); !errors.Is(err, ErrStale) {
+		t.Fatalf("%v", err)
+	}
+	if len(f.m) != 0 {
+		t.Fatal("stored on stale")
+	}
+	if err := g.Approve(ctx, "a", g.Fingerprints()["a"]); err != nil {
+		t.Fatal(err)
+	}
+	if resolveState(t, g, ModeApprove, c) != model.StatePublished {
+		t.Fatal("new fp should publish")
+	}
+}
+
+func TestFingerprintsReturnsCopy(t *testing.T) {
+	g := NewGate(newFake())
+	resolveState(t, g, ModeApprove, svc("a", model.StateDiscovered))
+	m := g.Fingerprints()
+	m["a"] = "tampered"
+	if g.Fingerprints()["a"] == "tampered" {
+		t.Fatal("not a copy")
+	}
+}
+
+func TestSnapshotAdditiveAcrossSources(t *testing.T) {
+	f := newFake()
+	g := NewGate(f)
+	a, b := svc("docker:a", model.StateDiscovered), svc("truenas:b", model.StateDiscovered)
+	if _, err := g.Resolve(ctx, ModeApprove, []model.Service{a}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Resolve(ctx, ModeApprove, []model.Service{b}); err != nil {
+		t.Fatal(err)
+	}
+	approveCur(t, g, "docker:a")
+	approveCur(t, g, "truenas:b")
+	if len(f.m) != 2 {
+		t.Fatalf("%v", f.m)
+	}
+}
+
+func TestModeOffKeepsSnapshot(t *testing.T) {
+	g := NewGate(newFake())
+	resolveState(t, g, ModeApprove, svc("a", model.StateDiscovered))
+	if _, err := g.Resolve(ctx, ModeOff, []model.Service{svc("z", model.StateDiscovered)}); err != nil {
+		t.Fatal(err)
+	}
+	approveCur(t, g, "a")
+	if _, ok := g.Fingerprints()["z"]; ok {
+		t.Fatal("off-mode service must not enter snapshot")
+	}
+}
+
+func TestSnapshotDropsSkippedAndStopped(t *testing.T) {
+	g := NewGate(newFake())
+	s := svc("a", model.StateDiscovered)
+	resolveState(t, g, ModeApprove, s)
+	st := svc("a", model.StateStopped)
+	if _, err := g.Resolve(ctx, ModeApprove, []model.Service{st}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.Fingerprints()["a"]; ok {
+		t.Fatal("stopped service must leave the snapshot")
 	}
 }
