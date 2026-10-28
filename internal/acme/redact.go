@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Redaction: every string that leaves the Manager (cert rows, logs,
@@ -153,6 +154,8 @@ var (
 	}{
 		{regexp.MustCompile(`(?i)\bBearer\s+\S+`), "Bearer " + redacted},
 		{regexp.MustCompile(`(?i)\bAuthorization:\s*\S+(\s+\S+)?`), "Authorization: " + redacted},
+		// Basic credentials quoted without a header name.
+		{regexp.MustCompile(`(?i)\bBasic\s+[A-Za-z0-9+/=]{8,}`), "Basic " + redacted},
 	}
 	// kvKeyRe finds "<credential word>[quote]<sep>" before a value; the
 	// value itself is delimited by scrubKV (quote-aware), not by a regexp.
@@ -529,8 +532,25 @@ func (n redactNotifier) Notify(ctx context.Context, ev Event) {
 	n.inner.Notify(ctx, ev)
 }
 
-// secretKeyRe matches setting names that hold credentials.
-var secretKeyRe = regexp.MustCompile(`(?i)(token|secret|key|pass|hmac|credential|auth|private)`)
+// secretKeyRe matches setting names that hold credentials (substrings).
+var secretKeyRe = regexp.MustCompile(`(?i)(token|secret|key|pass|hmac|credential|auth|private|bearer|cookie|session|signature|seed)`)
+
+// secretWordRe matches short credential words only as a whole word of the
+// name ('_', '-' or '.' separated), so MAPPING does not read as PIN.
+var secretWordRe = regexp.MustCompile(`(?i)(^|[_.-])(otp|totp|pin|pwd|passwd)($|[_.-])`)
+
+// credentialOverrides forces specific lego variables of a provider type
+// into the credential set when their names do not give them away (lego
+// documents some secrets under Additional). Each entry must name a
+// variable the provider documents (tested).
+var credentialOverrides = map[string][]string{
+	// TOTP shared secret, documented under Additional.
+	"nicmanager": {"NICMANAGER_API_OTP"},
+}
+
+func looksLikeCredential(name string) bool {
+	return secretKeyRe.MatchString(name) || secretWordRe.MatchString(name)
+}
 
 // fileSettingRe matches lego settings whose value names a file holding
 // credentials (<VAR>_FILE, TSIG key files, keytabs, private key and
@@ -544,18 +564,20 @@ const maxSecretFile = 1 << 20
 // returns its trimmed contents and each trimmed line. The path itself is
 // not a secret and is never returned.
 func secretFileValues(path string) ([]string, error) {
-	st, err := os.Stat(path)
+	// Non-blocking open and a check of the opened file: a FIFO or device
+	// (also one swapped in for the path) cannot hang provider construction.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
 	if !st.Mode().IsRegular() {
 		return nil, errors.New("not a regular file")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, maxSecretFile+1))
 	if err != nil {
 		return nil, err
@@ -580,7 +602,8 @@ var keyTokenRe = regexp.MustCompile(`[A-Za-z0-9+/=_-]{16,}`)
 
 // isCredentialSetting reports whether a provider setting holds a secret:
 // it maps to one of the provider's documented Credentials (or its _FILE
-// form), or its name (setting key or lego variable) looks like one.
+// form) or to a credentialOverrides entry, or its name (setting key or lego
+// variable) looks like one.
 // Additional settings (TTLs, timeouts, base URLs) are not secrets.
 func isCredentialSetting(cat ChallengeProvider, key, envName string) bool {
 	if a, ok := settingAliases[cat.Name][settingKey(key)]; ok && a.Credential {
@@ -592,8 +615,13 @@ func isCredentialSetting(cat ChallengeProvider, key, envName string) bool {
 				return true
 			}
 		}
+		for _, c := range credentialOverrides[cat.Name] {
+			if envName == c || envName == c+"_FILE" {
+				return true
+			}
+		}
 	}
-	return secretKeyRe.MatchString(key) || (envName != "" && secretKeyRe.MatchString(envName))
+	return looksLikeCredential(key) || (envName != "" && looksLikeCredential(envName))
 }
 
 // registerSetting registers one provider setting's secret value(s): for a
@@ -619,6 +647,36 @@ func (m *Manager) registerSetting(cat ChallengeProvider, key, envName, value str
 	ok := m.red.add(value)
 	m.red.add(urlParts(value)...)
 	return ok
+}
+
+// userSettingRe matches settings naming an account (user, login, client
+// id): paired with a credential they may appear as HTTP Basic credentials.
+var userSettingRe = regexp.MustCompile(`(?i)(user|login|email|account|nickname|(^|_)id$)`)
+
+// registerBasicPairs registers "<user>:<secret>" (and with it its base64
+// forms, as sent in an HTTP Basic Authorization header) for every pair of
+// an account-like setting and a credential setting of one provider.
+func (m *Manager) registerBasicPairs(cat ChallengeProvider, settings map[string]string) {
+	var users, secrets []string
+	for k, v := range settings {
+		env := settingEnvName(cat, k)
+		if v == "" || (env != "" && fileSettingRe.MatchString(env)) {
+			continue
+		}
+		if userSettingRe.MatchString(k) || (env != "" && userSettingRe.MatchString(env)) {
+			users = append(users, v)
+		}
+		if isCredentialSetting(cat, k, env) {
+			secrets = append(secrets, v)
+		}
+	}
+	for _, u := range users {
+		for _, sec := range secrets {
+			if u != sec {
+				m.red.add(u + ":" + sec)
+			}
+		}
+	}
 }
 
 // urlParts returns the secret-bearing components of a URL-shaped credential
@@ -681,15 +739,18 @@ func (m *Manager) registerConfigSecrets() {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
+		vals := map[string]string{}
 		for _, k := range keys {
 			v, err := m.settingValue(pc.Extra[k])
 			if err != nil || v == "" {
 				continue
 			}
+			vals[k] = v
 			if !m.registerSetting(cat, k, settingEnvName(cat, k), v) {
 				m.log.Warn("acme: credential is too short to be redacted from errors and logs", "provider", n, "setting", k)
 			}
 		}
+		m.registerBasicPairs(cat, vals)
 	}
 	inames := make([]string, 0, len(m.cfg.Issuers))
 	for n := range m.cfg.Issuers {

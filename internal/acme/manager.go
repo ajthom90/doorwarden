@@ -1522,6 +1522,7 @@ func (m *Manager) withDNSProvider(name string, run func(challenge.Provider)) err
 	for k, v := range settings {
 		m.registerSetting(cat, k, settingEnvName(cat, k), v)
 	}
+	m.registerBasicPairs(cat, settings)
 	build := func() (challenge.Provider, error) {
 		p, err := m.providerByName(pc.Type)
 		if err != nil {
