@@ -22,8 +22,9 @@ type claimant struct {
 	phantom bool
 	// absent marks a known service of an available source that is no longer
 	// in desired (removal scheduled or due): its route still exists until
-	// RouteRemove, so it holds its hostname, but only while no present
-	// service claims it (it ranks below every present claimant).
+	// RouteRemove, so it holds its hostname until its grace period ends
+	// against lower source ranks; within its own rank it yields to present
+	// claimants. Absent services past their grace period do not claim.
 	absent bool
 }
 
@@ -52,15 +53,16 @@ func sourceRank(key, source string) int {
 func (c claimant) rank() int { return sourceRank(c.key, c.source) }
 
 // outranks is source-first: a lower-trust source never takes a hostname from
-// a higher-trust one, whatever their states. Exception: an absent claimant
-// (no longer in desired, route not yet removed) yields to every present one. Within one source rank, the
-// serving tier wins, then the smaller key.
+// a higher-trust one, whatever their states, even while the higher-trust one
+// is absent within its grace period. Within one source rank an absent
+// claimant (no longer in desired, route not yet removed) yields to a present
+// one; then the serving tier wins, then the smaller key.
 func outranks(a, b claimant) bool {
-	if a.absent != b.absent {
-		return b.absent // a service that is gone yields to any present claimant
-	}
 	if ra, rb := a.rank(), b.rank(); ra != rb {
 		return ra < rb
+	}
+	if a.absent != b.absent {
+		return b.absent // within one rank, a service that is gone yields to a present one
 	}
 	if a.serving != b.serving {
 		return a.serving
@@ -91,7 +93,7 @@ func resolveHostnames(cs []claimant) (winners map[string]claimant, losers map[st
 			case w.phantom:
 				why = "; its source is unavailable, so it keeps the name"
 			case w.absent:
-				why = "; it is no longer discovered and its route is removed after the grace period"
+				why = "; it is no longer discovered but outranks this service, so its route keeps the name until its grace period ends"
 			case !w.routable:
 				why = "; the winner is not published/routable, fix or approve it (or remove it)"
 			}

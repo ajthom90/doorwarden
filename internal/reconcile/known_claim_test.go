@@ -304,27 +304,72 @@ func TestPlanStoppedRouteWriteInUnconfiguredZoneSaysSo(t *testing.T) {
 
 // --- fix round 3: services removed but still within grace ----------------
 
-func TestE2EAbsentInGraceYieldsToPublishedNewcomer(t *testing.T) {
-	// static:app is removed from the config (its route waits for the grace
-	// period) while docker:new is Published at the same hostname: the removed
-	// service yields to the present one at once, whatever its source rank.
+func TestE2EAbsentHigherRankKeepsRouteAgainstLowerRankNewcomer(t *testing.T) {
+	// static:app is absent (e.g. a brief config edit) while docker:new is
+	// Published at its hostname: rank is compared first, so docker gets only a
+	// Conflict and the static route keeps serving through the grace period.
+	// Past the grace period the static route is removed and docker takes the
+	// hostname in the same cycle (no dark cycle).
 	for _, scheduled := range []bool{false, true} {
 		t.Run(map[bool]string{false: "same cycle", true: "after schedule"}[scheduled], func(t *testing.T) {
 			e := newE2E(t)
 			e.cycle([]model.Service{pub("static:app", "app", "example.test", 8080)})
+			before := e.mustRoute("static:app")
 			if scheduled {
 				e.now = t0.Add(time.Hour)
 				e.cycle(nil)
-				if r := e.mustRoute("static:app"); r.RemovedAfter == nil {
-					t.Fatal("not scheduled")
+				before = e.mustRoute("static:app")
+			}
+			dock := pub("docker:new", "app", "example.test", 9090)
+			for _, at := range []time.Duration{2 * time.Hour, 20 * time.Hour} {
+				e.now = t0.Add(at)
+				acts := e.cycle([]model.Service{dock})
+				if c := ofKind(forKey(acts, "docker:new"), Conflict); len(c) != 1 ||
+					!strings.Contains(c[0].Reason, "static:app") || !strings.Contains(c[0].Reason, "grace period") {
+					t.Fatalf("want docker Conflict naming the absent static winner, got %v", sums(acts))
+				}
+				assertNone(t, acts, RouteWrite, RouteRemove)
+				r := e.mustRoute("static:app")
+				if r.RemovedAfter == nil {
+					t.Fatal("removal not scheduled")
+				}
+				r.RemovedAfter, before.RemovedAfter = nil, nil
+				if !reflect.DeepEqual(r, before) {
+					t.Fatalf("static row changed %+v", r)
+				}
+				if _, ok := e.route("docker:new"); ok {
+					t.Fatal("docker routed during grace")
 				}
 			}
-			e.now = t0.Add(2 * time.Hour)
-			acts := e.cycle([]model.Service{pub("docker:new", "app", "example.test", 9090)})
+			// past grace: removed, and docker takes the name in the same cycle
+			e.now = t0.Add(48 * time.Hour)
+			acts := e.cycle([]model.Service{dock})
 			assertSums(t, forKey(acts, "static:app"), "RouteRemove example.test app.example.test static:app")
+			if rw := ofKind(acts, RouteWrite); len(rw) != 1 || rw[0].Key != "docker:new" {
+				t.Fatalf("docker not routed at expiry: %v", sums(acts))
+			}
+			assertNone(t, acts, Conflict)
+			if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != "docker:new" {
+				t.Fatalf("rows %+v", rs)
+			}
+		})
+	}
+}
+
+func TestE2EAbsentYieldsToSameOrHigherRankNewcomer(t *testing.T) {
+	for name, keys := range map[string][2]string{
+		"same rank":   {"docker:old", "docker:new"},
+		"higher rank": {"truenas:app", "static:app"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newE2E(t)
+			oldK, newK := keys[0], keys[1]
+			e.cycle([]model.Service{pub(oldK, "app", "example.test", 8080)})
+			e.now = t0.Add(time.Hour)
+			acts := e.cycle([]model.Service{pub(newK, "app", "example.test", 9090)})
+			assertSums(t, forKey(acts, oldK), "RouteRemove example.test app.example.test "+oldK)
 			assertNone(t, acts, Conflict, ScheduleRemoval, DNSDelete)
-			rs := listRoutes(t, e.st)
-			if len(rs) != 1 || rs[0].Key != "docker:new" {
+			if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != newK {
 				t.Fatalf("rows %+v", rs)
 			}
 		})

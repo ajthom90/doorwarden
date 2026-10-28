@@ -84,9 +84,10 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 		if !present[k.Key] && p.unavailable(k) && k.Hostname != "" {
 			// it is Known, i.e. it still has a route: serving tier
 			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true})
-		} else if !present[k.Key] && k.Hostname != "" {
-			// gone from an available source, route not yet removed: it holds
-			// its hostname as a non-serving claimant until removed
+		} else if !present[k.Key] && k.Hostname != "" && (k.RemovedAfter == nil || !now.After(*k.RemovedAfter)) {
+			// gone from an available source, route not yet removed and grace
+			// not over: it holds its hostname as a non-serving claimant (past
+			// grace it is removed this cycle, so it must not hold the name)
 			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, absent: true})
 		}
 	}
@@ -441,11 +442,11 @@ func (p *planner) planRemovals(present map[string]bool, winners map[string]claim
 			continue // present, or unknown state: never schedule or remove
 		}
 		zn, host := normName(k.Zone), normName(k.Hostname)
-		if l, lost := losers[k.Key]; lost && l.winner.published && l.winner.routable && !l.winner.phantom {
-			// a present Published, routable service (of any source rank)
-			// takes over its hostname now: remove its route without waiting
-			// for the grace period (its owned DNS record stays: the winner
-			// uses that hostname).
+		if l, lost := losers[k.Key]; lost && p.takesOver(k.Key, k.Source, l.winner) {
+			// a present Published, routable service of the same or a higher
+			// source rank takes over its hostname now: remove its route
+			// without waiting for the grace period (its owned DNS record
+			// stays: the winner uses that hostname).
 			p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key,
 				Reason: "service no longer discovered and hostname " + host + " now belongs to published " + l.winner.key})
 			continue
@@ -495,10 +496,18 @@ func (p *planner) routeBackend(s model.Service) (model.Backend, bool) {
 // (published, gets a RouteWrite, not a phantom, at least the loser's source
 // rank) and the loser's source is available (an outage never removes).
 func (p *planner) mayRemoveLoserRoute(loser model.Service, w claimant) bool {
-	if loser.Source == "" || p.obs.Unavailable[loser.Source] {
+	return p.takesOver(loser.Key, loser.Source, w)
+}
+
+// takesOver is the single rule for removing a hostname loser's route (a
+// present loser or an absent known service): the loser's source is
+// available and the winner is Published, routable, not a phantom, and of the
+// same or a higher source rank.
+func (p *planner) takesOver(key, source string, w claimant) bool {
+	if source == "" || p.obs.Unavailable[source] {
 		return false
 	}
-	return !w.phantom && w.published && w.routable && w.rank() <= sourceRank(loser.Key, loser.Source)
+	return !w.phantom && w.published && w.routable && w.rank() <= sourceRank(key, source)
 }
 
 func sortedKnown(m map[string]KnownService) []KnownService {

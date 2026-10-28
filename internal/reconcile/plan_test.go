@@ -737,10 +737,21 @@ func TestPlanLoserRouteRemovedThenRestored(t *testing.T) {
 	got = Plan([]model.Service{dk, st}, obs, cfg, t0)
 	assertSums(t, forKey(got, "docker:app"), "Conflict example.test app.example.test docker:app")
 
-	// winner disappears: docker is no longer a loser and gets its route back
+	// winner disappears: within its grace period the absent static winner
+	// still outranks docker, which only gets a Conflict (no dark hostname)
+	got = Plan([]model.Service{dk}, obs, cfg, t0)
+	assertSums(t, got, "Conflict example.test app.example.test docker:app",
+		"ScheduleRemoval example.test app.example.test static:app")
+
+	// past the static winner's grace period: its route is removed and
+	// docker gets its route back in the same plan
+	obs.Known = knownMap(known("static:app", "example.test", "app.example.test", tp(t0.Add(-time.Second))))
 	got = Plan([]model.Service{dk}, obs, cfg, t0)
 	if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:app" {
 		t.Fatalf("docker route not restored: %v", sums(got))
+	}
+	if rr := ofKind(got, RouteRemove); len(rr) != 1 || rr[0].Key != "static:app" {
+		t.Fatalf("static route not removed: %v", sums(got))
 	}
 	assertNone(t, got, Conflict, DNSDelete)
 }

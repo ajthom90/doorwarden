@@ -36,12 +36,27 @@
 // claim, below), the Known services of unavailable sources ("phantoms", whose
 // routes may still exist), and the Known services of available sources that
 // are absent from desired ("absent": removal scheduled or due, route not yet
-// removed). An absent claimant ranks below every present claimant: it keeps
-// its hostname only while no present service claims it, and when a present
-// Published, routable service of ANY source rank wins its hostname, its route
-// is removed at once (RouteRemove, no grace, no ScheduleRemoval, no
-// DNSDelete since the winner uses the name). Against a present but
-// non-routable winner it keeps its route until its grace period ends.
+// removed, grace period not over; once now is after RemovedAfter it no longer
+// claims, so the past-grace removal and a newcomer's RouteWrite happen in the
+// same plan with no dark cycle). Source rank is compared FIRST, so an absent
+// service keeps its hostname against every lower-ranked claimant until its
+// grace period ends (the newcomer gets a Conflict naming it): a lower-trust
+// source never takes a hostname from a higher-trust one, even a briefly
+// absent one. Within its own rank an absent claimant yields to every present
+// claimant; when the winner is a present Published, routable service of the
+// same or a higher rank, its route is removed at once (RouteRemove, no grace,
+// no ScheduleRemoval, no DNSDelete since the winner uses the name). Against a
+// present but non-routable winner it keeps its route until its grace period
+// ends. The same takeover rule (planner.takesOver: winner Published,
+// routable, not a phantom, rank <= loser's; loser's source available)
+// decides the RouteRemove of present losers and of absent services.
+//
+// Absent is admin intent: a service the approval gate filters out (a source
+// or service set to approval "off", or Skip) is absent from desired, not
+// unavailable. A whole source set to approval "off" therefore has its routes
+// removed after the grace period, and before that they can be evicted only
+// by same-or-higher-rank newcomers. A source whose state is unknown must be
+// marked Unavailable instead (see Caller duties).
 //
 // Stored-hostname claim: a present service that is NOT Published, or is
 // Published but Invalid because its labels no longer resolve, and has a
@@ -112,21 +127,21 @@
 // enforces. A Published service whose backend is not authoritative uses its
 // last-known backend, and a Skip plus the RouteWrite's Reason ("current
 // backend invalid (<problem>); using last-known backend") make the
-// misconfiguration visible; without a last-known backend it is Invalid. Stopped and Error services carry no
-// authoritative backend: if previously published (in Known) and a last-known
-// backend exists, RouteWrite carries the LAST-KNOWN backend; without one a
-// Skip is emitted and nothing is removed. Pending, Discovered and the rest
-// emit nothing. Such a RouteWrite also carries the service's CURRENT labels
-// (name, so Host; middlewares; websockets), which are not trustworthy while
-// it is stopped or errored, so the route executor (NewRouteExecutor) treats
-// a RouteWrite for a non-Published service as a no-op: the route is left as
-// last written, and only a Published service can change it. Such a
-// RouteWrite carries the stored zone/hostname (see Stored-hostname claim) and
-// the Reason "persisted route unchanged (service is <state>, not
-// Published); last-known backend kept". RouteRemove is
-// the only signal that removes a route: route executors must not remove a
-// route merely because no RouteWrite for it appeared. Route identity is the
-// service key.
+// misconfiguration visible; without a last-known backend it is Invalid.
+// Stopped and Error services carry no authoritative backend: if previously
+// published (in Known) and a last-known backend exists, RouteWrite carries
+// the LAST-KNOWN backend; without one a Skip is emitted and nothing is
+// removed. Pending, Discovered and the rest emit nothing. Such a RouteWrite
+// also carries the service's CURRENT labels (name, so Host; middlewares;
+// websockets), which are not trustworthy while it is stopped or errored, so
+// the route executor (NewRouteExecutor) treats a RouteWrite for a
+// non-Published service as a no-op: the route is left as last written, and
+// only a Published service can change it. Such a RouteWrite carries the
+// stored zone/hostname (see Stored-hostname claim) and the Reason "persisted
+// route unchanged (service is <state>, not Published); last-known backend
+// kept". RouteRemove is the only signal that removes a route: route
+// executors must not remove a route merely because no RouteWrite for it
+// appeared. Route identity is the service key.
 //
 // Records (zones[].records.mode): "off" and unset emit no DNS actions (routes
 // and certs still happen). "wildcard": one "*.zone" record per zone that has
@@ -178,15 +193,19 @@
 // still configured DNSDelete for owned rows of that hostname whose owner key
 // is the service key, unless another service now claims the same hostname.
 // An absent service whose hostname is taken over by a present Published,
-// routable service is removed earlier (see Hostname conflicts). Foreign records and the wildcard record are never deleted
-// automatically (a later UI action may). A present service with a
+// routable service of the same or a higher source rank is removed earlier
+// (see Hostname conflicts). Foreign records and the wildcard record are never
+// deleted automatically (a later UI action may). A present service with a
 // RemovedAfter gets CancelRemoval in any state.
 //
 // Known gaps, resolved conservatively: when a published service changes
 // hostname or zone, the old per-host record stays owned and is not deleted;
 // when a published service becomes Pending (fingerprint changed) its route is
 // left as last written, not removed; likewise a Stopped/Error service's route
-// is left as last written (its RouteWrite is a no-op in the route executor).
+// is left as last written (its RouteWrite is a no-op in the route executor);
+// when a hostname loser's route is removed (or an absent service is evicted)
+// its owned per-host DNS record is kept for the winner, which uses the same
+// name, but it stays owned by the loser's key and is never re-owned.
 //
 // # Execution
 //
@@ -198,10 +217,12 @@
 // persist ScheduleRemoval/CancelRemoval; forget a service's Known entry once
 // its RouteRemove was applied (removal past grace, or a conflict loser) and
 // its ownership rows once their DNSDelete was applied; mark a source
-// Unavailable when it failed to construct, its List failed, or its approvals
-// failed to load; key Unavailable (and fill Known.Source) with the value
-// services carry in Service.Source, which is what Plan compares, not
-// necessarily Source.Name(). Persist last-known backends ONLY from
+// Unavailable when it failed to construct, its List failed, its services
+// could not be resolved (a Resolve/merge error), or its approvals failed to
+// load (otherwise its services would look absent and be removed); key
+// Unavailable (and fill Known.Source) with the value services carry in
+// Service.Source, which is what Plan compares, not necessarily
+// Source.Name(). Persist last-known backends ONLY from
 // Action.Backend of RouteWrite actions (for a stopped service that already is
 // the last-known one) or from Discovered/Published services, never from
 // Svc.Backend of a Stopped/Error service.
