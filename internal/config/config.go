@@ -34,6 +34,7 @@ type Config struct {
 	// under http.middlewares: name -> {<one middleware type>: options}.
 	Middlewares map[string]map[string]any `yaml:"middlewares"`
 	Traefik     Traefik                   `yaml:"traefik"`
+	ACME        ACME                      `yaml:"acme"`
 }
 
 // MiddlewareDefs returns Middlewares as name -> definition (any), the shape
