@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ajthom90/doorwarden/internal/reconcile"
+	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/store"
 	"gopkg.in/yaml.v3"
 )
@@ -230,14 +230,14 @@ func TestRenderOneRouterPerHostnameWinnerRule(t *testing.T) {
 	}
 }
 
-// The renderer must use reconcile.SourceRank itself, including its
+// The renderer must use model.SourceRank itself, including its
 // source-name fallback for keys without a known prefix.
-func TestRenderWinnerUsesReconcileSourceRank(t *testing.T) {
+func TestRenderWinnerUsesModelSourceRank(t *testing.T) {
 	a := rt("other:a", "app", 1)
 	a.Source = "docker"
 	b := rt("other:b", "app", 2)
 	b.Source = "static"
-	if reconcile.SourceRank(b.Key, b.Source) >= reconcile.SourceRank(a.Key, a.Source) {
+	if model.SourceRank(b.Key, b.Source) >= model.SourceRank(a.Key, a.Source) {
 		t.Fatal("test premise")
 	}
 	_, _, d := mustRender(t, []store.Route{a, b}, nil, nil, Options{})
@@ -328,12 +328,18 @@ func TestRenderInvalidDefinitionNotRenderedAndReferencesSkipped(t *testing.T) {
 		"bad name": map[string]any{"headers": map[string]any{}},
 		"x@file":   map[string]any{"headers": map[string]any{}},
 		"ok":       map[string]any{"headers": map[string]any{"customRequestHeaders": map[string]any{"X-A": "1"}}},
+		"tmpl":     map[string]any{"headers": map[string]any{"customRequestHeaders": map[string]any{"X-A": "{{ .X }}"}}},
+		"chainbad": map[string]any{"chain": map[string]any{"middlewares": []any{"ok", "nope"}}},
 	}
 	r := rt("static:app", "app", 80)
 	r.Middlewares = []string{"two"}
+	tm := rt("static:tmpl", "tmpl", 80)
+	tm.Middlewares = []string{"tmpl"}
+	ch := rt("static:chain", "chain", 80)
+	ch.Middlewares = []string{"chainbad@file"}
 	ok := rt("static:ok", "ok", 80)
 	ok.Middlewares = []string{"ok@file"}
-	_, probs, d := mustRender(t, []store.Route{r, ok}, defs, nil, Options{})
+	f, probs, d := mustRender(t, []store.Route{r, tm, ch, ok}, defs, nil, Options{})
 	if !reflect.DeepEqual(keysOf(d.HTTP.Middlewares), []string{"ok"}) {
 		t.Fatalf("middlewares %v", d.HTTP.Middlewares)
 	}
@@ -350,11 +356,27 @@ func TestRenderInvalidDefinitionNotRenderedAndReferencesSkipped(t *testing.T) {
 		}
 	}
 	sort.Strings(defProbs)
-	if !reflect.DeepEqual(defProbs, []string{"bad name", "none", "scalar", "two", "x@file"}) {
+	if !reflect.DeepEqual(defProbs, []string{"bad name", "chainbad", "none", "scalar", "tmpl", "two", "x@file"}) {
 		t.Fatalf("definition problems %v", probs)
 	}
-	if got := kinds(probs)[KindUndefinedMiddleware]; !reflect.DeepEqual(got, []string{"static:app"}) {
+	if got := kinds(probs)[KindUndefinedMiddleware]; !reflect.DeepEqual(got, []string{"static:app", "static:chain", "static:tmpl"}) {
 		t.Fatalf("problems %v", probs)
+	}
+	if strings.Contains(string(f[RoutesFile]), "{{") {
+		t.Fatal("template text rendered")
+	}
+}
+
+func TestRenderValidChainRendered(t *testing.T) {
+	defs := MiddlewareDefs{
+		"hdr":  map[string]any{"headers": map[string]any{"customRequestHeaders": map[string]any{"X-A": "1"}}},
+		"both": map[string]any{"chain": map[string]any{"middlewares": []any{"hdr", "crowdsec@docker"}}},
+	}
+	r := rt("static:app", "app", 80)
+	r.Middlewares = []string{"both@file"}
+	_, probs, d := mustRender(t, []store.Route{r}, defs, nil, Options{ExternalMiddlewares: []string{"crowdsec@docker"}})
+	if len(probs) != 0 || len(d.HTTP.Routers) != 1 || !reflect.DeepEqual(keysOf(d.HTTP.Middlewares), []string{"both", "hdr"}) {
+		t.Fatalf("%v %+v", probs, d.HTTP)
 	}
 }
 

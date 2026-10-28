@@ -10,7 +10,7 @@
 //   - One router per hostname (compared case-insensitively). When several
 //     rows share a hostname (a crash window, or a source outage; see
 //     internal/reconcile doc.go) the winner is the row with the strongest
-//     reconcile.SourceRank (static > truenas > docker > other), then the
+//     model.SourceRank (static > truenas > docker > other), then the
 //     smaller key: the same rule the reconcile tests' renderer-agreement
 //     helper encodes. The other rows get a Problem of KindShadowed.
 //   - The winner is chosen BEFORE it is validated. When the winner cannot be
@@ -24,6 +24,10 @@
 //     without its auth.
 //   - Routes with RemovedAfter set are still rendered: they are live until
 //     the reconciler's RouteRemove deletes the row.
+//   - Middleware definitions are validated as a set (model.ValidateMiddlewareDefs:
+//     one type key, mapping options, no "{{" or "}}" anywhere since Traefik
+//     templates file-provider files, chain members resolvable and acyclic);
+//     an invalid one is not rendered and routes using it are skipped.
 //   - Certificates come from tls.certificates in TLSFile; routers carry an
 //     empty "tls: {}" and never a certResolver (Traefik's ACME is not used).
 package traefik
@@ -41,7 +45,6 @@ import (
 	"strings"
 
 	"github.com/ajthom90/doorwarden/internal/model"
-	"github.com/ajthom90/doorwarden/internal/reconcile"
 	"github.com/ajthom90/doorwarden/internal/store"
 	"gopkg.in/yaml.v3"
 )
@@ -292,24 +295,18 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 	conf := httpConf{Routers: map[string]router{}, Services: map[string]service{},
 		Middlewares: map[string]any{}, ServersTransports: map[string]transport{}}
 
-	// Definitions: verbatim, only when valid.
-	for name, def := range mw {
-		if !model.ValidMiddlewareName(name) {
-			probs = append(probs, Problem{Kind: KindInvalidDefinition, Middleware: name,
-				Detail: "definition name must be [A-Za-z0-9_.-]+ (no @provider)"})
-			continue
-		}
-		if err := model.ValidateMiddlewareDef(def); err != nil {
-			probs = append(probs, Problem{Kind: KindInvalidDefinition, Middleware: name, Detail: err.Error()})
-			continue
-		}
-		conf.Middlewares[name] = def
+	// Definitions: verbatim, only when valid (model.ValidateMiddlewareDefs,
+	// the rule config validation and Plan use too).
+	valid, defProbs := model.ValidateMiddlewareDefs(map[string]any(mw), opts.ExternalMiddlewares)
+	for name, err := range defProbs {
+		probs = append(probs, Problem{Kind: KindInvalidDefinition, Middleware: name, Detail: err.Error()})
+	}
+	for name := range valid {
+		conf.Middlewares[name] = mw[name]
 	}
 	defined := func(n string) bool { _, ok := conf.Middlewares[n]; return ok }
 
-	// Group rows by hostname.
 	seenKey, seenName := map[string]bool{}, map[string]string{}
-	byHost := map[string][]store.Route{}
 	for _, r := range routes {
 		if seenKey[r.Key] {
 			return nil, nil, fmt.Errorf("traefik: duplicate route key %q", r.Key)
@@ -320,18 +317,8 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 			return nil, nil, fmt.Errorf("traefik: route keys %q and %q map to the same name %q", o, r.Key, n)
 		}
 		seenName[n] = r.Key
-		h := strings.ToLower(r.Hostname)
-		byHost[h] = append(byHost[h], r)
 	}
-	for h, group := range byHost {
-		sort.Slice(group, func(i, j int) bool {
-			ri := reconcile.SourceRank(group[i].Key, group[i].Source)
-			rj := reconcile.SourceRank(group[j].Key, group[j].Source)
-			if ri != rj {
-				return ri < rj
-			}
-			return group[i].Key < group[j].Key
-		})
+	for h, group := range ByHostname(routes) {
 		w := group[0]
 		for _, l := range group[1:] {
 			probs = append(probs, Problem{Kind: KindShadowed, Key: l.Key, Hostname: h,
@@ -403,6 +390,30 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 		return nil, nil, err
 	}
 	return Files{RoutesFile: rb, TLSFile: tb}, probs, nil
+}
+
+// ByHostname groups rows by lowercased hostname. Each group is sorted so
+// that its first row is the one rendered: the strongest model.SourceRank
+// (static > truenas > docker > other), then the smaller key. This is the
+// renderer's whole winner rule; the reconcile tests' agreement helper calls
+// it too.
+func ByHostname(routes []store.Route) map[string][]store.Route {
+	byHost := map[string][]store.Route{}
+	for _, r := range routes {
+		h := strings.ToLower(r.Hostname)
+		byHost[h] = append(byHost[h], r)
+	}
+	for _, group := range byHost {
+		sort.Slice(group, func(i, j int) bool {
+			ri := model.SourceRank(group[i].Key, group[i].Source)
+			rj := model.SourceRank(group[j].Key, group[j].Source)
+			if ri != rj {
+				return ri < rj
+			}
+			return group[i].Key < group[j].Key
+		})
+	}
+	return byHost
 }
 
 // checkRoute re-validates a winner row: hostname, backend (the shared

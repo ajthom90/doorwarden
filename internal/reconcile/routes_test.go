@@ -279,11 +279,21 @@ func newE2E(t *testing.T) *e2e {
 	e := &e2e{t: t, st: openStore(t), now: t0,
 		// no records mode and no issuer: only route actions are planned
 		cfg: &config.Config{Zones: []config.Zone{{Name: "example.test", TargetIP: target}},
-			Settings: config.Settings{GracePeriod: 24 * time.Hour}}}
+			Settings:    config.Settings{GracePeriod: 24 * time.Hour},
+			Middlewares: e2eMiddlewares()}}
 	re := NewRouteExecutor(e.st, func() time.Time { return e.now })
 	e.ex = NewMultiExecutor(nil).Handle(RouteWrite, re).Handle(RouteRemove, re).
 		Handle(ScheduleRemoval, re).Handle(CancelRemoval, re)
 	return e
+}
+
+// e2eMiddlewares defines the middlewares the E2E services reference (Plan
+// fails services with undefined middlewares closed).
+func e2eMiddlewares() map[string]map[string]any {
+	return map[string]map[string]any{
+		"auth": {"forwardAuth": map[string]any{"address": "http://192.0.2.50:9091/verify"}},
+		"gzip": {"compress": map[string]any{}},
+	}
 }
 
 // cycle runs one reconcile at e.now with Observed built from the store.

@@ -148,3 +148,99 @@ static:
 		t.Fatalf("errs %v", errs)
 	}
 }
+
+// Placeholders under middlewares stay exact strings, like under providers:
+// header values and secrets must not be retyped (0123 -> 83, 1e3 -> 1000).
+func TestMiddlewarePlaceholdersStayStrings(t *testing.T) {
+	for _, v := range []string{"0123", "1e3", "0x1F", "true", "null", "~", "12", "a: b", "{{x}}"} {
+		yml := base + `
+middlewares:
+  hdr:
+    headers:
+      customRequestHeaders:
+        X-Key: ${V}
+      sslRedirect: ${V}
+`
+		c, err := loadStr(t, yml, map[string]string{"V": v})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := c.Middlewares["hdr"]["headers"].(map[string]any)
+		if got := h["customRequestHeaders"].(map[string]any)["X-Key"]; got != v {
+			t.Errorf("%q became %#v", v, got)
+		}
+		if got := h["sslRedirect"]; got != v {
+			t.Errorf("%q became %#v", v, got)
+		}
+	}
+}
+
+// Outside providers and middlewares, typed substitution is unchanged.
+func TestTypedSubstitutionOutsideMiddlewaresUnchanged(t *testing.T) {
+	yml := base + `
+settings:
+  dry_run: ${D}
+middlewares:
+  hdr:
+    headers: {}
+`
+	c, err := loadStr(t, yml, map[string]string{"D": "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Settings.DryRun {
+		t.Fatal("dry_run not typed")
+	}
+}
+
+func TestMiddlewareChainAndTemplateValidation(t *testing.T) {
+	for name, extra := range map[string]string{
+		"chain to undefined": `
+middlewares:
+  Auth:
+    chain:
+      middlewares: [nope]
+`,
+		"template": `
+middlewares:
+  hdr:
+    headers:
+      customRequestHeaders:
+        X-A: "{{ .Foo }}"
+`,
+		"template via env": `
+middlewares:
+  hdr:
+    headers:
+      customRequestHeaders:
+        X-A: "${T}"
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := loadStr(t, base+extra, map[string]string{"T": "a}}b"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if errs := c.Validate(caps(true)); len(errs) == 0 {
+				t.Fatal("no error")
+			}
+		})
+	}
+	ok := base + `
+traefik:
+  external_middlewares: [crowdsec@docker]
+middlewares:
+  hdr:
+    headers: {}
+  both:
+    chain:
+      middlewares: [hdr, crowdsec@docker]
+static:
+  - name: wiki
+    host: 198.51.100.7
+    middlewares: [both@file]
+`
+	if errs := mustLoad(t, ok).Validate(caps(true)); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+}

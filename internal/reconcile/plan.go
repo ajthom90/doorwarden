@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -42,7 +43,11 @@ type planner struct {
 	zoneNames []string // config order, normalized
 	defZone   string   // settings.default_zone, or the only zone; "" if none
 	foreign   map[string][]dns.Record
-	out       []Action
+	// mwValid are the usable middleware definitions and mwExternal the
+	// allowlist (the renderer's rule, model.ValidateMiddlewareDefs).
+	mwValid    map[string]bool
+	mwExternal []string
+	out        []Action
 }
 
 // Plan computes the actions that bring the world in line with desired. It is
@@ -131,6 +136,8 @@ func newPlanner(obs Observed, cfg *config.Config, now time.Time) *planner {
 	if p.grace <= 0 {
 		p.grace = defaultGrace
 	}
+	p.mwValid, _ = model.ValidateMiddlewareDefs(cfg.MiddlewareDefs(), cfg.Traefik.ExternalMiddlewares)
+	p.mwExternal = cfg.Traefik.ExternalMiddlewares
 	for _, z := range cfg.Zones {
 		n := normName(z.Name)
 		if n == "" || p.zones[n] != nil {
@@ -221,8 +228,29 @@ func (p *planner) resolve(s model.Service) entry {
 		e.host, e.err = h, fmt.Errorf("hostname %s is %d characters; the limit is %d (253)", h, len(h), maxHostname)
 	default:
 		e.host = normName(h)
+		e.err = p.middlewareProblem(s)
 	}
 	return e
+}
+
+// middlewareProblem fails a service closed when one of its middleware
+// references is malformed or resolves to no valid definition and is not
+// allowlisted (model.CheckMiddlewareRef, the renderer's own check). Such a
+// service is Invalid: never routable, so it can never evict a working
+// neighbor; a route it already has stays as last written.
+func (p *planner) middlewareProblem(s model.Service) error {
+	defined := func(n string) bool { return p.mwValid[n] }
+	for _, ref := range s.Options.Middlewares {
+		err := model.CheckMiddlewareRef(ref, defined, p.mwExternal)
+		switch {
+		case err == nil:
+		case errors.Is(err, model.ErrInvalidMiddlewareRef):
+			return fmt.Errorf("middleware reference %q is invalid; the service is not routed (fail closed)", ref)
+		default:
+			return fmt.Errorf("middleware %q is not defined (middlewares, or traefik.external_middlewares for other providers); the service is not routed (fail closed)", ref)
+		}
+	}
+	return nil
 }
 
 // planLoser emits Conflict for a hostname loser and, when the winner really
@@ -535,7 +563,7 @@ func (p *planner) takesOver(key, source string, w claimant) bool {
 	if source == "" || p.obs.Unavailable[source] {
 		return false
 	}
-	return !w.phantom && w.published && w.routable && w.rank() <= SourceRank(key, source)
+	return !w.phantom && w.published && w.routable && w.rank() <= model.SourceRank(key, source)
 }
 
 func sortedKnown(m map[string]KnownService) []KnownService {

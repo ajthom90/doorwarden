@@ -37,22 +37,14 @@ func (c *Config) validateTraefik() []error {
 		}
 	}
 
-	names := make([]string, 0, len(c.Middlewares))
-	for n := range c.Middlewares {
+	valid, probs := model.ValidateMiddlewareDefs(c.MiddlewareDefs(), t.ExternalMiddlewares)
+	names := make([]string, 0, len(probs))
+	for n := range probs {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	valid := map[string]bool{}
 	for _, n := range names {
-		if !model.ValidMiddlewareName(n) {
-			add("middlewares %q: name must be [A-Za-z0-9_.-]+ (no @provider)", n)
-			continue
-		}
-		if err := model.ValidateMiddlewareDef(map[string]any(c.Middlewares[n])); err != nil {
-			add("middlewares %q: %v", n, err)
-			continue
-		}
-		valid[n] = true
+		add("middlewares %q: %v", n, probs[n])
 	}
 	defined := func(n string) bool { return valid[n] }
 	for i, st := range c.Static {

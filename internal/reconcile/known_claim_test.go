@@ -2,7 +2,6 @@ package reconcile
 
 import (
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -10,25 +9,16 @@ import (
 	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/store"
+	"github.com/ajthom90/doorwarden/internal/traefik"
 )
 
-// renderWinners applies the T10b renderer rule to persisted rows: one router
-// per hostname, chosen by source rank (key prefix) then key. It also returns
+// renderWinners applies the Traefik renderer's own pick (traefik.ByHostname)
+// to persisted rows: one router per hostname, by model.SourceRank then key. It also returns
 // how many rows share each hostname.
 func renderWinners(routes []store.Route) (winner map[string]string, count map[string]int) {
 	winner, count = map[string]string{}, map[string]int{}
-	byHost := map[string][]store.Route{}
-	for _, r := range routes {
-		byHost[r.Hostname] = append(byHost[r.Hostname], r)
-	}
-	for h, rs := range byHost {
-		sort.Slice(rs, func(i, j int) bool {
-			ri, rj := SourceRank(rs[i].Key, rs[i].Source), SourceRank(rs[j].Key, rs[j].Source)
-			if ri != rj {
-				return ri < rj
-			}
-			return rs[i].Key < rs[j].Key
-		})
+	// the renderer's own grouping and pick (rank, then smaller key)
+	for h, rs := range traefik.ByHostname(routes) {
 		winner[h], count[h] = rs[0].Key, len(rs)
 	}
 	return winner, count

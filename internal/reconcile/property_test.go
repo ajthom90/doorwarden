@@ -33,7 +33,8 @@ type propCase struct {
 // one row per hostname, removal unset, in grace or past grace) and a role:
 // absent, Published (often renamed away from its row), Published with an
 // invalid backend, Stopped, Pending, Published with invalid labels (held
-// Invalid when it has a row), or Error. Some sources are unavailable (their
+// Invalid when it has a row), Error, or Published with an undefined
+// middleware (Invalid; held when it has a row). Some sources are unavailable (their
 // services are then not in desired, and their rows are phantoms).
 func genProp(r *rand.Rand) propCase {
 	c := propCase{unavailable: map[string]bool{}}
@@ -64,7 +65,7 @@ func genProp(r *rand.Rand) propCase {
 				Hostname: rowHost + ".example.test", Scheme: "http", Host: "198.51.100.9",
 				Port: 1000 + r.Intn(100), RemovedAfter: ra})
 		}
-		role := r.Intn(8)
+		role := r.Intn(9)
 		cur := hosts[r.Intn(3)]
 		if hasRow && r.Intn(2) == 0 {
 			cur = rowHost
@@ -83,6 +84,9 @@ func genProp(r *rand.Rand) propCase {
 			s = pub(k, cur, "missing.test", 2000) // invalid labels
 		case 7:
 			s = svc(k, cur, "example.test", model.StateError, "", 0)
+		case 8:
+			s = pub(k, cur, "example.test", 2000)
+			s.Options.Middlewares = []string{"undefined@file"} // fails closed: Invalid
 		} // 0, 1: absent
 		if s.Key != "" && !c.unavailable[s.Source] {
 			c.desired = append(c.desired, s)
@@ -207,7 +211,7 @@ func propRun(t *testing.T, shard int64) {
 				if isPresent && s.State == model.StatePublished && claimed != k.Hostname {
 					continue // renamed-away loser: its old hostname is unclaimed by it
 				}
-				if !w.published || !w.routable || w.phantom || w.rank() > SourceRank(a.Key, k.Source) {
+				if !w.published || !w.routable || w.phantom || w.rank() > model.SourceRank(a.Key, k.Source) {
 					fail("RouteRemove %s by a winner that does not take over: %+v", a.Key, w)
 				}
 				if !writes[claimed] {
@@ -220,7 +224,7 @@ func propRun(t *testing.T, shard int64) {
 			// itself now acts at a different hostname (a rename: it moved its
 			// row, or lost its new hostname and its old row was removed).
 			for h, bk := range bw {
-				if ak, ok := aw[h]; ok && SourceRank(ak, rowSource(ak)) <= SourceRank(bk, rowSource(bk)) {
+				if ak, ok := aw[h]; ok && model.SourceRank(ak, rowSource(ak)) <= model.SourceRank(bk, rowSource(bk)) {
 					continue
 				}
 				k := known[bk]

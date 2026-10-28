@@ -3,7 +3,8 @@ package reconcile
 import (
 	"fmt"
 	"sort"
-	"strings"
+
+	"github.com/ajthom90/doorwarden/internal/model"
 )
 
 // claimant is a service that holds or wants a hostname this cycle.
@@ -34,25 +35,8 @@ type loss struct {
 	reason string
 }
 
-// SourceRank orders hostname precedence: static > truenas > docker > other
-// (lower is stronger). The stable key prefix decides first (source names are
-// configurable, key prefixes are not); the source name is only a fallback.
-// It is exported so the Traefik renderer picks the same per-hostname winner
-// among persisted rows (rank, then smaller key) as Plan and the tests do.
-func SourceRank(key, source string) int {
-	ranks := map[string]int{"static": 0, "truenas": 1, "docker": 2}
-	if i := strings.IndexByte(key, ':'); i > 0 {
-		if r, ok := ranks[key[:i]]; ok {
-			return r
-		}
-	}
-	if r, ok := ranks[strings.ToLower(source)]; ok {
-		return r
-	}
-	return len(ranks)
-}
-
-func (c claimant) rank() int { return SourceRank(c.key, c.source) }
+// rank is model.SourceRank, shared with the Traefik renderer.
+func (c claimant) rank() int { return model.SourceRank(c.key, c.source) }
 
 // outranks is source-first: a lower-trust source never takes a hostname from
 // a higher-trust one, whatever their states, even while the higher-trust one

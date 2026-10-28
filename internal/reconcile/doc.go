@@ -19,8 +19,11 @@
 // Invalid: a hostname error (unknown zone, including a zone removed from the
 // config; a name with no DNS-valid characters; no zone and no default), a
 // hostname over 253 characters, an earlier duplicate of a key (the last
-// occurrence wins, like the approval gate), or a Published service with
-// neither a backend nor a last-known backend. It is never planned (no DNS,
+// occurrence wins, like the approval gate), a middleware reference that is
+// malformed or resolves to no valid definition in cfg.Middlewares and is not
+// in cfg.Traefik.ExternalMiddlewares (model.CheckMiddlewareRef over
+// model.ValidateMiddlewareDefs, exactly the Traefik renderer's rule), or a
+// Published service with neither a backend nor a last-known backend. It is never planned (no DNS,
 // cert or RouteWrite) and, being present, never scheduled for removal. It is
 // not routable, so it never causes another service's route to be removed.
 // Its existing route is left as is UNLESS a Published, routable claimant that
@@ -30,6 +33,14 @@
 // and its stored row is removed like any loser. When nobody takes the name
 // over (e.g. its Known zone was removed from the config) only Invalid is
 // emitted and nothing is removed.
+//
+// Middlewares fail closed: a service with an undefined middleware is Invalid
+// and so never routable, and it can never evict a working neighbor. A route
+// it already has stays as last written: its stored middlewares are what the
+// renderer serves (so a label typo keeps the old, defined auth in place).
+// When a stored middleware itself becomes undefined (its definition was
+// removed or broken), the renderer, which re-checks every row, stops serving
+// that route: the hostname goes dark rather than serve without its auth.
 //
 // Hostname conflicts are decided on the resulting hostname, case-insensitive,
 // among every desired service with a valid hostname (or a stored-hostname

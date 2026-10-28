@@ -2,6 +2,14 @@
 //
 // Note: in flow-style mappings placeholders must be quoted ({k: "${V}"}),
 // because braces are YAML syntax.
+//
+// Placeholders under the top-level providers: and middlewares: keys always
+// substitute as plain strings. A Traefik middleware option that is a bool or
+// number and is written as a placeholder (sslRedirect: ${X}) therefore
+// reaches the generated Traefik file as a quoted string ("true"); write such
+// options literally if Traefik must see the typed value. Elsewhere an
+// unquoted whole-value placeholder takes the bool/int/float type of its
+// value.
 package config
 
 import (
@@ -26,6 +34,16 @@ type Config struct {
 	// under http.middlewares: name -> {<one middleware type>: options}.
 	Middlewares map[string]map[string]any `yaml:"middlewares"`
 	Traefik     Traefik                   `yaml:"traefik"`
+}
+
+// MiddlewareDefs returns Middlewares as name -> definition (any), the shape
+// model.ValidateMiddlewareDefs and the Traefik renderer take.
+func (c *Config) MiddlewareDefs() map[string]any {
+	out := make(map[string]any, len(c.Middlewares))
+	for n, d := range c.Middlewares {
+		out[n] = map[string]any(d)
+	}
+	return out
 }
 
 // Traefik configures the file-provider writer.

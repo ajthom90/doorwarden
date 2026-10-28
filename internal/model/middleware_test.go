@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -95,5 +96,62 @@ func TestValidateExternalMiddleware(t *testing.T) {
 		if err := ValidateExternalMiddleware(r); err == nil {
 			t.Errorf("%q accepted", r)
 		}
+	}
+}
+
+func TestValidateMiddlewareDefRejectsTemplates(t *testing.T) {
+	for _, d := range []any{
+		map[string]any{"headers": map[string]any{"customRequestHeaders": map[string]any{"X-A": "{{ .Env }}"}}},
+		map[string]any{"headers": map[string]any{"customRequestHeaders": map[string]any{"X-A": "a}}b"}}},
+		map[string]any{"basicAuth": map[string]any{"users": []any{"u:{{x"}}},
+		map[string]any{"headers": map[any]any{"{{k}}": "v"}},
+	} {
+		if err := ValidateMiddlewareDef(d); err == nil {
+			t.Errorf("%#v accepted", d)
+		}
+	}
+	if err := ValidateMiddlewareDef(map[string]any{"headers": map[string]any{"X": "a{b}c"}}); err != nil {
+		t.Errorf("single braces rejected: %v", err)
+	}
+}
+
+func TestValidateMiddlewareDefsChains(t *testing.T) {
+	hdr := map[string]any{"headers": map[string]any{}}
+	chain := func(ms ...any) any { return map[string]any{"chain": map[string]any{"middlewares": ms}} }
+	defs := map[string]any{
+		"hdr":        hdr,
+		"good":       chain("hdr", "hdr@file", "ext@docker"),
+		"nope":       chain("nope2"),
+		"badref":     chain("a b"),
+		"notlist":    map[string]any{"chain": map[string]any{"middlewares": "hdr"}},
+		"nomembers":  map[string]any{"chain": map[string]any{}},
+		"viabad":     chain("nope"), // member is itself invalid
+		"cyc1":       chain("cyc2"),
+		"cyc2":       chain("cyc1"),
+		"self":       chain("self"),
+		"two":        map[string]any{"headers": map[string]any{}, "chain": map[string]any{}},
+		"bad name":   hdr,
+		"nested":     chain("good"),
+		"intmembers": chain(1),
+	}
+	valid, probs := ValidateMiddlewareDefs(defs, []string{"ext@docker"})
+	want := map[string]bool{"hdr": true, "good": true, "nested": true}
+	if !reflect.DeepEqual(valid, want) {
+		t.Fatalf("valid %v", valid)
+	}
+	for n := range defs {
+		if _, bad := probs[n]; bad == want[n] {
+			t.Errorf("%s: problem presence %v (valid %v)", n, bad, want[n])
+		}
+	}
+}
+
+func TestSourceRank(t *testing.T) {
+	if !(SourceRank("static:a", "") < SourceRank("truenas:a", "") && SourceRank("truenas:a", "") < SourceRank("docker:a", "") &&
+		SourceRank("docker:a", "") < SourceRank("x:a", "")) {
+		t.Fatal("prefix order")
+	}
+	if SourceRank("x:a", "Static") != SourceRank("static:a", "") || SourceRank("docker:a", "static") != SourceRank("docker:b", "") {
+		t.Fatal("source fallback only for unknown prefixes")
 	}
 }

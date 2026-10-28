@@ -42,9 +42,7 @@ type composer struct {
 	ex    *reconcile.MultiExecutor
 	now   time.Time
 	dir   string
-	defs  traefik.MiddlewareDefs
 	certs []traefik.TLSCert
-	opts  traefik.Options
 	files traefik.Files
 	probs []traefik.Problem
 }
@@ -56,10 +54,11 @@ func newComposer(t *testing.T) *composer {
 	}
 	t.Cleanup(func() { st.Close() })
 	c := &composer{t: t, st: st, now: t0, dir: t.TempDir(),
+		// one config feeds both Plan (fail-closed middleware check) and Render
 		cfg: &config.Config{Zones: []config.Zone{{Name: "example.test", TargetIP: "192.0.2.10"}},
-			Settings: config.Settings{GracePeriod: 24 * time.Hour}},
-		defs: traefik.MiddlewareDefs{"auth": map[string]any{"forwardAuth": map[string]any{
-			"address": "http://192.0.2.50:9091/api/verify", "trustForwardHeader": true}}},
+			Settings: config.Settings{GracePeriod: 24 * time.Hour},
+			Middlewares: map[string]map[string]any{"auth": {"forwardAuth": map[string]any{
+				"address": "http://192.0.2.50:9091/api/verify", "trustForwardHeader": true}}}},
 		certs: []traefik.TLSCert{{Domains: []string{"*.example.test", "example.test"},
 			CertFile: "example.test/fullchain.pem", KeyFile: "example.test/privkey.pem"}},
 	}
@@ -112,7 +111,8 @@ func (c *composer) cycle(desired []model.Service, unavailable ...string) []recon
 // idempotency and the directory-ownership rules.
 func (c *composer) renderWrite() {
 	c.t.Helper()
-	f, probs, err := traefik.Render(c.rows(), c.defs, c.certs, c.opts)
+	f, probs, err := traefik.Render(c.rows(), traefik.MiddlewareDefs(c.cfg.MiddlewareDefs()), c.certs,
+		traefik.Options{ExternalMiddlewares: c.cfg.Traefik.ExternalMiddlewares})
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -395,18 +395,33 @@ func TestComposePlanExecutorStoreRender(t *testing.T) {
 	c.assertProblems()
 	c.assertUnchanged(removed)
 
-	// 8. static now references an undefined middleware: its route is
-	// persisted but NOT served (fail closed), and its previous route is gone.
+	// 8a. static's labels now reference an undefined middleware: Plan fails
+	// it closed (Invalid, no RouteWrite), so its route stays as last written
+	// and is still served WITH its defined auth.
 	c.now = t0.Add(31 * time.Hour)
-	c.cycle([]model.Service{wiki("wiki", "auth@file", "missing@file")})
-	if r, _, _ := c.st.GetRoute(context.Background(), "static:wiki"); len(r.Middlewares) != 2 {
+	acts = c.cycle([]model.Service{wiki("wiki", "auth@file", "missing@file")})
+	if !hasAction(acts, reconcile.Invalid, "static:wiki") || hasAction(acts, reconcile.RouteWrite, "static:wiki") {
+		t.Fatalf("actions %v", acts)
+	}
+	if r, _, _ := c.st.GetRoute(context.Background(), "static:wiki"); !reflect.DeepEqual(r.Middlewares, []string{"auth@file"}) {
 		t.Fatalf("row %+v", r)
 	}
+	c.assertProblems()
+	c.assertUnchanged(removed)
+
+	// 8b. the auth DEFINITION is removed from the config: Plan keeps the
+	// service Invalid, the renderer no longer serves its persisted route
+	// (fail closed: the hostname goes dark rather than serve without auth).
+	c.now = t0.Add(31*time.Hour + 30*time.Minute)
+	auth := c.cfg.Middlewares["auth"]
+	delete(c.cfg.Middlewares, "auth")
+	c.cycle([]model.Service{wiki("wiki", "auth@file")})
 	c.assertProblems(traefik.KindUndefinedMiddleware + " static:wiki")
 	if got := c.served(); len(got) != 0 {
 		t.Fatalf("served %v", got)
 	}
 	c.golden("08-undefined-middleware")
+	c.cfg.Middlewares["auth"] = auth
 
 	// 9. fixed and renamed: the route moves to the new hostname
 	c.now = t0.Add(32 * time.Hour)

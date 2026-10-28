@@ -36,11 +36,18 @@ func substituteEnv(in string, env func(string) (string, bool)) (string, error) {
 
 // substituteNode expands variables only inside string scalar values of the
 // node tree (never keys, comments or non-string scalars). Missing variables
-// are collected in missing. Under the top-level "providers" subtree results
-// are always plain strings. Elsewhere, an unquoted scalar that is exactly one
+// are collected in missing. Under the top-level "providers" and
+// "middlewares" subtrees (stringOnlyTopKeys) results are always plain
+// strings. Elsewhere, an unquoted scalar that is exactly one
 // placeholder takes the type (bool/int/float only) its substituted text
 // resolves to; quoted or mixed text always stays a string. Substituted text
 // is never re-parsed as YAML structure.
+// stringOnlyTopKeys are the top-level subtrees whose substituted scalars are
+// always plain strings: provider settings (secrets) and middleware
+// definitions (header values, secrets), which must reach their consumer
+// exactly as written (0123, 1e3, 0x1F, true stay those strings).
+var stringOnlyTopKeys = map[string]bool{"providers": true, "middlewares": true}
+
 func substituteNode(n *yaml.Node, env func(string) (string, bool), missing *[]string) {
 	walkNode(n, env, missing, true, false)
 }
@@ -57,7 +64,7 @@ func walkNode(n *yaml.Node, env func(string) (string, bool), missing *[]string, 
 		}
 	case yaml.MappingNode:
 		for i := 0; i+1 < len(n.Content); i += 2 { // skip keys
-			so := strOnly || (top && n.Content[i].Value == "providers")
+			so := strOnly || (top && stringOnlyTopKeys[n.Content[i].Value])
 			walkNode(n.Content[i+1], env, missing, false, so)
 		}
 	case yaml.ScalarNode:

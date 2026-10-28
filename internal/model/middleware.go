@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -126,7 +127,177 @@ func ValidateMiddlewareDef(def any) error {
 	}
 	switch val.(type) {
 	case map[string]any, map[any]any:
-		return nil
+	default:
+		return fmt.Errorf("middleware type %q: options must be a mapping, got %T", ts, val)
 	}
-	return fmt.Errorf("middleware type %q: options must be a mapping, got %T", ts, val)
+	if err := noTemplates(val); err != nil {
+		return fmt.Errorf("middleware type %q: %w", ts, err)
+	}
+	if ts == "chain" {
+		if _, err := chainMembers(val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// noTemplates rejects "{{" or "}}" in any string key or value: Traefik runs
+// Go templating over file-provider files, so such text would break (or be
+// interpreted in) the whole generated file.
+func noTemplates(v any) error {
+	bad := func(s string) bool { return strings.Contains(s, "{{") || strings.Contains(s, "}}") }
+	switch x := v.(type) {
+	case string:
+		if bad(x) {
+			return fmt.Errorf("value %q contains {{ or }} (Traefik templating)", x)
+		}
+	case map[string]any:
+		for k, e := range x {
+			if bad(k) {
+				return fmt.Errorf("key %q contains {{ or }} (Traefik templating)", k)
+			}
+			if err := noTemplates(e); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		for k, e := range x {
+			if err := noTemplates(k); err != nil {
+				return err
+			}
+			if err := noTemplates(e); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if err := noTemplates(e); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// chainMembers returns the middleware references of a chain's options
+// ({middlewares: [ref, ...]}, non-empty, each a valid reference).
+func chainMembers(opts any) ([]string, error) {
+	var raw any
+	switch m := opts.(type) {
+	case map[string]any:
+		raw = m["middlewares"]
+	case map[any]any:
+		raw = m["middlewares"]
+	}
+	list, ok := raw.([]any)
+	if ss, isStrs := raw.([]string); isStrs {
+		for _, s := range ss {
+			list = append(list, s)
+		}
+		ok = true
+	}
+	if !ok || len(list) == 0 {
+		return nil, errors.New("chain: middlewares must be a non-empty list of middleware references")
+	}
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		s, isStr := e.(string)
+		if !isStr {
+			return nil, fmt.Errorf("chain: member %v is not a string", e)
+		}
+		if _, _, err := ParseMiddlewareRef(s); err != nil {
+			return nil, fmt.Errorf("chain: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// ValidateMiddlewareDefs validates a whole set of definitions and returns
+// the names that are usable (valid) and a problem for every other name. A
+// definition is valid when its name passes ValidMiddlewareName, it passes
+// ValidateMiddlewareDef, and, for a chain, every member resolves
+// (CheckMiddlewareRef) to a VALID definition or an allowlisted external
+// reference, with no chain cycle. This is the single rule config
+// validation, the reconcile plan and the Traefik renderer share.
+func ValidateMiddlewareDefs(defs map[string]any, external []string) (valid map[string]bool, problems map[string]error) {
+	valid, problems = map[string]bool{}, map[string]error{}
+	members := map[string][]string{}
+	for n, d := range defs {
+		if !ValidMiddlewareName(n) {
+			problems[n] = fmt.Errorf("definition name %q must be [A-Za-z0-9_.-]+ (no @provider)", n)
+			continue
+		}
+		if err := ValidateMiddlewareDef(d); err != nil {
+			problems[n] = err
+			continue
+		}
+		valid[n] = true
+		if m, ok := chainOpts(d); ok {
+			members[n], _ = chainMembers(m)
+		}
+	}
+	defined := func(n string) bool { return valid[n] }
+	for changed := true; changed; {
+		changed = false
+		names := make([]string, 0, len(members))
+		for n := range members {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			if !valid[n] {
+				continue
+			}
+			for _, ref := range members[n] {
+				if err := CheckMiddlewareRef(ref, defined, external); err != nil {
+					problems[n] = fmt.Errorf("chain member: %w", err)
+					delete(valid, n)
+					changed = true
+					break
+				}
+			}
+		}
+		for _, n := range names {
+			if valid[n] && chainReaches(n, n, members, valid, map[string]bool{}) {
+				problems[n] = fmt.Errorf("chain %q is part of a cycle", n)
+				delete(valid, n)
+				changed = true
+			}
+		}
+	}
+	return valid, problems
+}
+
+func chainOpts(def any) (any, bool) {
+	switch m := def.(type) {
+	case map[string]any:
+		v, ok := m["chain"]
+		return v, ok
+	case map[any]any:
+		v, ok := m["chain"]
+		return v, ok
+	}
+	return nil, false
+}
+
+// chainReaches reports whether chain from reaches target through local
+// (unqualified or @file) members that are still valid.
+func chainReaches(from, target string, members map[string][]string, valid, seen map[string]bool) bool {
+	for _, ref := range members[from] {
+		name, provider, _ := ParseMiddlewareRef(ref)
+		if provider != "" && provider != "file" || !valid[name] {
+			continue
+		}
+		if name == target {
+			return true
+		}
+		if !seen[name] {
+			seen[name] = true
+			if chainReaches(name, target, members, valid, seen) {
+				return true
+			}
+		}
+	}
+	return false
 }
