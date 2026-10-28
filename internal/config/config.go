@@ -34,6 +34,8 @@ type Config struct {
 	// under http.middlewares: name -> {<one middleware type>: options}.
 	Middlewares map[string]map[string]any `yaml:"middlewares"`
 	Traefik     Traefik                   `yaml:"traefik"`
+	// Notifications configures alert senders (see notify.go).
+	Notifications Notifications `yaml:"notifications"`
 }
 
 // MiddlewareDefs returns Middlewares as name -> definition (any), the shape
@@ -172,6 +174,7 @@ func Load(path string, env func(string) (string, bool)) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	c.Notifications.applyDefaults()
 	for name, is := range c.Issuers {
 		if is.Directory == "" {
 			is.Directory = "staging"

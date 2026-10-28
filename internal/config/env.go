@@ -46,7 +46,7 @@ func substituteEnv(in string, env func(string) (string, bool)) (string, error) {
 // always plain strings: provider settings (secrets) and middleware
 // definitions (header values, secrets), which must reach their consumer
 // exactly as written (0123, 1e3, 0x1F, true stay those strings).
-var stringOnlyTopKeys = map[string]bool{"providers": true, "middlewares": true}
+var stringOnlyTopKeys = map[string]bool{"providers": true, "middlewares": true, "notifications": true}
 
 func substituteNode(n *yaml.Node, env func(string) (string, bool), missing *[]string) {
 	walkNode(n, env, missing, true, false)
