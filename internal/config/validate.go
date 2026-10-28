@@ -128,6 +128,7 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 			}
 		}
 	}
+	errs = append(errs, c.validateTraefik()...)
 	return errs
 }
 

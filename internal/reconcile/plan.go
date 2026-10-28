@@ -535,7 +535,7 @@ func (p *planner) takesOver(key, source string, w claimant) bool {
 	if source == "" || p.obs.Unavailable[source] {
 		return false
 	}
-	return !w.phantom && w.published && w.routable && w.rank() <= sourceRank(key, source)
+	return !w.phantom && w.published && w.routable && w.rank() <= SourceRank(key, source)
 }
 
 func sortedKnown(m map[string]KnownService) []KnownService {

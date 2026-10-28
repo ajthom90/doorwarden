@@ -22,6 +22,25 @@ type Config struct {
 	Sources   Sources                `yaml:"sources"`
 	Static    []StaticService        `yaml:"static"`
 	Settings  Settings               `yaml:"settings"`
+	// Middlewares are Traefik middleware definitions, rendered verbatim
+	// under http.middlewares: name -> {<one middleware type>: options}.
+	Middlewares map[string]map[string]any `yaml:"middlewares"`
+	Traefik     Traefik                   `yaml:"traefik"`
+}
+
+// Traefik configures the file-provider writer.
+type Traefik struct {
+	// DynamicDir is Traefik's watched file-provider directory (default
+	// /etc/traefik/dynamic).
+	DynamicDir string `yaml:"dynamic_dir"`
+	// EntryPoint every router listens on (default websecure).
+	EntryPoint string `yaml:"entry_point"`
+	// CertPathPrefix is where Traefik sees doorwarden's certificate
+	// directory (default /certs).
+	CertPathPrefix string `yaml:"cert_path_prefix"`
+	// ExternalMiddlewares allowlists qualified references (name@provider)
+	// to middlewares defined outside doorwarden (e.g. crowdsec@docker).
+	ExternalMiddlewares []string `yaml:"external_middlewares"`
 }
 
 type Zone struct {
@@ -140,6 +159,15 @@ func (c *Config) applyDefaults() {
 			is.Directory = "staging"
 			c.Issuers[name] = is
 		}
+	}
+	if c.Traefik.DynamicDir == "" {
+		c.Traefik.DynamicDir = "/etc/traefik/dynamic"
+	}
+	if c.Traefik.EntryPoint == "" {
+		c.Traefik.EntryPoint = "websecure"
+	}
+	if c.Traefik.CertPathPrefix == "" {
+		c.Traefik.CertPathPrefix = "/certs"
 	}
 	if c.Settings.GracePeriod == 0 {
 		c.Settings.GracePeriod = 24 * time.Hour

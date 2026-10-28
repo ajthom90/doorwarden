@@ -23,7 +23,7 @@ func renderWinners(routes []store.Route) (winner map[string]string, count map[st
 	}
 	for h, rs := range byHost {
 		sort.Slice(rs, func(i, j int) bool {
-			ri, rj := sourceRank(rs[i].Key, rs[i].Source), sourceRank(rs[j].Key, rs[j].Source)
+			ri, rj := SourceRank(rs[i].Key, rs[i].Source), SourceRank(rs[j].Key, rs[j].Source)
 			if ri != rj {
 				return ri < rj
 			}

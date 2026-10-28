@@ -34,10 +34,12 @@ type loss struct {
 	reason string
 }
 
-// sourceRank orders hostname precedence: static > truenas > docker > other
+// SourceRank orders hostname precedence: static > truenas > docker > other
 // (lower is stronger). The stable key prefix decides first (source names are
 // configurable, key prefixes are not); the source name is only a fallback.
-func sourceRank(key, source string) int {
+// It is exported so the Traefik renderer picks the same per-hostname winner
+// among persisted rows (rank, then smaller key) as Plan and the tests do.
+func SourceRank(key, source string) int {
 	ranks := map[string]int{"static": 0, "truenas": 1, "docker": 2}
 	if i := strings.IndexByte(key, ':'); i > 0 {
 		if r, ok := ranks[key[:i]]; ok {
@@ -50,7 +52,7 @@ func sourceRank(key, source string) int {
 	return len(ranks)
 }
 
-func (c claimant) rank() int { return sourceRank(c.key, c.source) }
+func (c claimant) rank() int { return SourceRank(c.key, c.source) }
 
 // outranks is source-first: a lower-trust source never takes a hostname from
 // a higher-trust one, whatever their states, even while the higher-trust one

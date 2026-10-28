@@ -207,7 +207,7 @@ func propRun(t *testing.T, shard int64) {
 				if isPresent && s.State == model.StatePublished && claimed != k.Hostname {
 					continue // renamed-away loser: its old hostname is unclaimed by it
 				}
-				if !w.published || !w.routable || w.phantom || w.rank() > sourceRank(a.Key, k.Source) {
+				if !w.published || !w.routable || w.phantom || w.rank() > SourceRank(a.Key, k.Source) {
 					fail("RouteRemove %s by a winner that does not take over: %+v", a.Key, w)
 				}
 				if !writes[claimed] {
@@ -220,7 +220,7 @@ func propRun(t *testing.T, shard int64) {
 			// itself now acts at a different hostname (a rename: it moved its
 			// row, or lost its new hostname and its old row was removed).
 			for h, bk := range bw {
-				if ak, ok := aw[h]; ok && sourceRank(ak, rowSource(ak)) <= sourceRank(bk, rowSource(bk)) {
+				if ak, ok := aw[h]; ok && SourceRank(ak, rowSource(ak)) <= SourceRank(bk, rowSource(bk)) {
 					continue
 				}
 				k := known[bk]
