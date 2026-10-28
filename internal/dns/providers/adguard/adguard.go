@@ -275,15 +275,15 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, fmt.Errorf("adguard: update rewrite %s: %w", r.Name, err)
 	}
-	body := map[string]json.RawMessage{"target": old[0].raw, "update": upd}
+	body := httpx.RawJSON(`{"target":` + string(old[0].raw) + `,"update":` + string(upd) + `}`)
 	_, err = p.c.Do(ctx, "PUT", "/control/rewrite/update", nil, p.hdr(), body, nil)
 	var se *httpx.StatusError
 	if errors.As(err, &se) && (se.Status == 404 || se.Status == 405) {
 		// older server without /update: add the new answer first, then drop the old
-		if err := p.post(ctx, "update rewrite "+r.Name, "/control/rewrite/add", upd); err != nil {
+		if err := p.post(ctx, "update rewrite "+r.Name, "/control/rewrite/add", httpx.RawJSON(upd)); err != nil {
 			return dns.Record{}, err
 		}
-		if err := p.post(ctx, "update rewrite "+r.Name+" (remove old)", "/control/rewrite/delete", old[0].raw); err != nil {
+		if err := p.post(ctx, "update rewrite "+r.Name+" (remove old)", "/control/rewrite/delete", httpx.RawJSON(old[0].raw)); err != nil {
 			return dns.Record{}, err
 		}
 		err = nil
@@ -295,19 +295,16 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	return r, nil
 }
 
-// withAnswer returns raw with only the value of "answer" replaced. Key order,
-// unknown fields, number text and the stored domain (including its case and
-// trailing dot) are kept byte for byte.
+// withAnswer returns raw with only the bytes of the "answer" value replaced
+// (spliced in place): key spelling and escapes, key order, unknown fields,
+// number text, whitespace and the stored domain (case, trailing dot) are all
+// kept byte for byte. The new value is encoded without HTML escaping.
 func withAnswer(raw json.RawMessage, answer string) (json.RawMessage, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil, errors.New("rewrite is not a JSON object")
 	}
-	newAns, _ := json.Marshal(answer)
-	var out bytes.Buffer
-	out.WriteByte('{')
-	replaced := false
-	for first := true; dec.More(); first = false {
+	for dec.More() {
 		kt, err := dec.Token()
 		if err != nil {
 			return nil, err
@@ -320,22 +317,27 @@ func withAnswer(raw json.RawMessage, answer string) (json.RawMessage, error) {
 		if err := dec.Decode(&val); err != nil {
 			return nil, err
 		}
-		if key == "answer" {
-			val, replaced = newAns, true
+		if key != "answer" {
+			continue
 		}
-		if !first {
-			out.WriteByte(',')
+		end := int(dec.InputOffset())
+		start := end - len(val)
+		if start < 0 || !bytes.Equal(raw[start:end], val) {
+			return nil, errors.New("cannot locate the answer value in the rewrite")
 		}
-		kb, _ := json.Marshal(key)
-		out.Write(kb)
-		out.WriteByte(':')
-		out.Write(val)
+		var enc bytes.Buffer
+		e := json.NewEncoder(&enc)
+		e.SetEscapeHTML(false)
+		if err := e.Encode(answer); err != nil {
+			return nil, err
+		}
+		out := make([]byte, 0, len(raw)+enc.Len())
+		out = append(out, raw[:start]...)
+		out = append(out, bytes.TrimRight(enc.Bytes(), "\n")...)
+		out = append(out, raw[end:]...)
+		return out, nil
 	}
-	if !replaced {
-		return nil, errors.New("rewrite has no answer field")
-	}
-	out.WriteByte('}')
-	return out.Bytes(), nil
+	return nil, errors.New("rewrite has no answer field")
 }
 
 func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) error {
@@ -351,7 +353,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	for _, e := range matching(all, r) {
 		if e.rec.Value == r.Value {
-			return p.post(ctx, "delete rewrite "+r.Name, "/control/rewrite/delete", e.raw)
+			return p.post(ctx, "delete rewrite "+r.Name, "/control/rewrite/delete", httpx.RawJSON(e.raw))
 		}
 	}
 	return nil

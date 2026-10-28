@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -47,6 +48,11 @@ func (e *StatusError) Error() string {
 
 // IsAuth reports 401/403.
 func (e *StatusError) IsAuth() bool { return e.Status == 401 || e.Status == 403 }
+
+// RawJSON is a request body sent byte for byte. json.Marshal would re-compact
+// it and HTML-escape "<", ">" and "&", which matters when a server stores and
+// later compares the exact text.
+type RawJSON []byte
 
 // Client talks to one base URL. The secrets it scrubs from error text are held
 // only inside closures (see dns.Scrubber), never in a field, so formatting a
@@ -142,7 +148,20 @@ type scrubbed struct {
 }
 
 func (e *scrubbed) Error() string { return e.msg }
-func (e *scrubbed) Unwrap() error { return e.err }
+
+// There is deliberately no Unwrap: the wrapped error (a *url.Error, a syscall
+// error) carries unscrubbed text and could be unwrapped and printed by a caller.
+// Is delegates identity checks (context.DeadlineExceeded, net errors by
+// sentinel), and As exposes only the allowlisted types callers branch on.
+func (e *scrubbed) Is(target error) bool { return errors.Is(e.err, target) }
+
+func (e *scrubbed) As(target any) bool {
+	switch target.(type) {
+	case **StatusError, *net.Error:
+		return errors.As(e.err, target)
+	}
+	return false
+}
 
 func (c *Client) wrap(err error) error {
 	if err == nil {
@@ -156,7 +175,7 @@ func (c *Client) wrap(err error) error {
 }
 
 // Do sends a request. body (if non-nil) is JSON-encoded; out (if non-nil) is
-// JSON-decoded from the response. A url.Values body is sent form-encoded. query may be nil. The response status is
+// JSON-decoded from the response. A url.Values body is sent form-encoded and a RawJSON body verbatim. query may be nil. The response status is
 // returned even on error when a response was received.
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, hdr http.Header, body, out any) (int, error) {
 	u := *c.Base
@@ -174,6 +193,8 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	ctype := "application/json"
 	if form, ok := body.(url.Values); ok {
 		rd, ctype = strings.NewReader(form.Encode()), "application/x-www-form-urlencoded"
+	} else if raw, ok := body.(RawJSON); ok {
+		rd = bytes.NewReader(raw)
 	} else if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {

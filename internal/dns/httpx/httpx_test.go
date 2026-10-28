@@ -3,8 +3,10 @@ package httpx_test
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -118,5 +120,53 @@ func TestBoolOptionAcceptsBoolsAndTrueFalseStrings(t *testing.T) {
 	}
 	if got, err := httpx.BoolOption(map[string]any{}, "k"); err != nil || got {
 		t.Errorf("absent: %v %v", got, err)
+	}
+}
+
+func TestScrubbedErrorDoesNotExposeRawError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { time.Sleep(300 * time.Millisecond) }))
+	defer srv.Close()
+	c, _ := httpx.New(srv.URL, false, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err := c.Do(ctx, "GET", "/", nil, nil, nil, nil)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Is must delegate: %v", err)
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		t.Fatal("the raw *url.Error must not be reachable through As")
+	}
+	var perr *net.OpError
+	if errors.As(err, &perr) {
+		t.Fatal("a raw net.OpError must not be reachable")
+	}
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if _, raw := e.(*url.Error); raw {
+			t.Fatal("raw error reachable through Unwrap")
+		}
+	}
+	// allowlisted: net.Error (timeouts) and *StatusError
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) }))
+	defer srv2.Close()
+	c2, _ := httpx.New(srv2.URL, false, 0)
+	_, err = c2.Do(context.Background(), "GET", "/", nil, nil, nil, nil)
+	var se *httpx.StatusError
+	if !errors.As(err, &se) || se.Status != 500 {
+		t.Fatalf("StatusError must stay reachable: %v", err)
+	}
+	// connection refused: the text is scrubbed and a net.Error is reachable
+	srv3 := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url3 := srv3.URL
+	srv3.Close()
+	c3, _ := httpx.New(url3, false, 0)
+	c3.AddSecret("127.0.0.1")
+	_, err = c3.Do(context.Background(), "GET", "/", nil, nil, nil, nil)
+	var ne net.Error
+	if err == nil || !errors.As(err, &ne) || strings.Contains(err.Error(), "127.0.0.1") {
+		t.Fatalf("err = %v", err)
 	}
 }

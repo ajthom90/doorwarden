@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -350,5 +351,57 @@ func TestKeepRewriteBlocksARecord(t *testing.T) {
 	}
 	if len(b.rws) != 2 {
 		t.Fatal("rewrite created over a KEEP rewrite")
+	}
+}
+
+func TestUpdateSplicesWithoutReescaping(t *testing.T) {
+	// escapes and spacing in the stored object, "é" and "&" in values
+	const stored = `{ "dom\u0061in" : "Caf\u00e9.Example.Test." , "note":"a&b <é>", "answer" : "old.example.test" , "z":[1,  2] }`
+	var got struct{ Target, Update json.RawMessage }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/control/rewrite/list":
+			_, _ = w.Write([]byte("[" + stored + "]"))
+		case "/control/rewrite/update":
+			_ = json.NewDecoder(r.Body).Decode(&got)
+		}
+	}))
+	defer srv.Close()
+	p, err := adguard.New(adguard.Config{URL: srv.URL, Username: user, Password: password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the listing normalises the name, so ask for the normalised form
+	if _, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "café.example.test", Type: "CNAME", Value: "new&é.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(stored, `"old.example.test"`, `"new&é.example.test"`, 1)
+	if string(got.Update) != want {
+		t.Fatalf("update:\n got %s\nwant %s", got.Update, want)
+	}
+	// json.NewDecoder re-wraps the RawMessage as-is, so the target must be the stored text
+	if string(got.Target) != stored {
+		t.Fatalf("target changed:\n got %s\nwant %s", got.Target, stored)
+	}
+}
+
+func TestDeleteBodyIsTheStoredTextVerbatim(t *testing.T) {
+	const stored = `{ "domain" : "a.example.test" , "answer":"192.0.2.1", "note":"x&y <é>" }`
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/control/rewrite/list":
+			_, _ = w.Write([]byte("[" + stored + "]"))
+		case "/control/rewrite/delete":
+			body, _ = io.ReadAll(r.Body)
+		}
+	}))
+	defer srv.Close()
+	p, _ := adguard.New(adguard.Config{URL: srv.URL, Username: user, Password: password})
+	if err := p.DeleteRecord(context.Background(), "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != stored {
+		t.Fatalf("delete body re-encoded:\n got %s\nwant %s", body, stored)
 	}
 }
