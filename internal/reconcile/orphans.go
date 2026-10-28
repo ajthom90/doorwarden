@@ -91,7 +91,10 @@ func (p *planner) sourceEvidence(entries []entry) map[string]map[string]bool {
 // (the prefix itself, compared case-insensitively, and every source name
 // carried by a desired or Known key with that prefix) is Unavailable, or
 // when an Unavailable source name maps to no prefix at all (it could be the
-// owner's renamed source).
+// owner's renamed source). A name maps to a prefix only through evidence (a
+// desired service or Known entry with that prefix carrying that Source),
+// never because it looks like a prefix: a TrueNAS source named "docker"
+// that is down blocks every prefix's rows until evidence maps it.
 func (p *planner) ownerSourceUnknown(owner string, ev map[string]map[string]bool) bool {
 	if k, ok := p.obs.Known[owner]; ok {
 		if k.Key == "" {
@@ -112,7 +115,10 @@ func (p *planner) ownerSourceUnknown(owner string, ev map[string]map[string]bool
 		if ln == pre || ev[pre][name] {
 			return true
 		}
-		mapped := keyPrefixSources[ln]
+		// Only evidence maps a name to a prefix: a source's name alone
+		// says nothing about its kind (a TrueNAS source may be named
+		// "docker").
+		mapped := false
 		for _, names := range ev {
 			mapped = mapped || names[name]
 		}

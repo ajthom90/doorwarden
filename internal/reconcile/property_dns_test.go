@@ -24,12 +24,35 @@ type dnsPropCase struct {
 	modes       map[string]string // zone -> records mode
 	desc        []string
 	unavailable map[string]bool
+	alias       map[string]string // key prefix -> its source's name
+}
+
+// srcOf is the source name key's service really has: its prefix's alias, or
+// the prefix itself for prefixes without one.
+func (c dnsPropCase) srcOf(key string) string {
+	if a, ok := c.alias[sourceOf(key)]; ok {
+		return a
+	}
+	return sourceOf(key)
+}
+
+// dnsPropAliases are source naming schemes: the identity (Source equals the
+// key prefix) and names unrelated to, or swapped with, the prefixes (a
+// TrueNAS source named "docker").
+var dnsPropAliases = []map[string]string{
+	{"static": "static", "truenas": "truenas", "docker": "docker"},
+	{"static": "files", "truenas": "docker", "docker": "dock1"},
+	{"static": "static", "truenas": "docker", "docker": "truenas"},
+	{"static": "static", "truenas": "nas", "docker": "docker"},
 }
 
 var dnsPropOwners = []string{"static:a", "truenas:a", "docker:a", "docker:b", "other:a", "", "zone:example.test"}
 
 func genDNSProp(r *rand.Rand) dnsPropCase {
-	c := dnsPropCase{modes: map[string]string{}, unavailable: map[string]bool{}}
+	c := dnsPropCase{modes: map[string]string{}, unavailable: map[string]bool{}, alias: dnsPropAliases[0]}
+	if r.Intn(3) == 0 {
+		c.alias = dnsPropAliases[1+r.Intn(len(dnsPropAliases)-1)]
+	}
 	modes := []string{"per-host", "per-host", "wildcard", "off"}
 	zA, zB := zone("example.test", "per-host", "wildcard"), zone("other.test", modes[r.Intn(len(modes))], "wildcard")
 	if r.Intn(5) == 0 {
@@ -42,7 +65,7 @@ func genDNSProp(r *rand.Rand) dnsPropCase {
 	c.modes["example.test"], c.modes["other.test"] = zA.Records.Mode, zB.Records.Mode
 	for _, src := range []string{"static", "truenas", "docker"} {
 		if r.Intn(5) == 0 {
-			c.unavailable[src] = true
+			c.unavailable[c.alias[src]] = true
 		}
 	}
 	zones := []string{"example.test", "other.test", "gone.test"}
@@ -67,14 +90,17 @@ func genDNSProp(r *rand.Rand) dnsPropCase {
 			s = pub(k, name, zn, 2000)
 			s.Options.Middlewares = []string{"undefined@file"}
 		} // 0, 1: absent
+		s.Source = c.srcOf(k)
 		if s.Key != "" && !c.unavailable[s.Source] {
 			c.desired = append(c.desired, s)
 		}
 		if r.Intn(2) == 0 {
-			c.obs.Known[k] = known(k, zn, names[r.Intn(len(names))]+"."+zn, ras[r.Intn(len(ras))])
+			kn := known(k, zn, names[r.Intn(len(names))]+"."+zn, ras[r.Intn(len(ras))])
+			kn.Source = c.srcOf(k)
+			c.obs.Known[k] = kn
 			c.obs.LastKnown = map[string]model.Backend{}
 		}
-		c.desc = append(c.desc, fmt.Sprintf("%s role=%d %s.%s", k, role, name, zn))
+		c.desc = append(c.desc, fmt.Sprintf("%s (source %q) role=%d %s.%s", k, c.srcOf(k), role, name, zn))
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 2+r.Intn(8); i++ {
@@ -182,13 +208,15 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 			if isPresent && (s.State != model.StatePublished || s.Backend.Port == 0 || len(s.Options.Middlewares) > 0 || s.Zone == "missing.test") {
 				fail("%s for a present non-Published or invalid owner", a.Kind)
 			}
-			// an absent owner's source: its Known entry's, else its key
-			// prefix, which must be static, truenas or docker
-			src, inferred := sourceOf(o.OwnerKey), true
+			// an absent owner's source: its Known entry's, else the source
+			// its key prefix really belongs to (the planner sees only the
+			// prefix), which must be static, truenas or docker
+			pre := sourceOf(o.OwnerKey)
+			src, inferred := c.srcOf(o.OwnerKey), true
 			if k, ok := c.obs.Known[o.OwnerKey]; ok {
 				src, inferred = k.Source, false
 			}
-			if !isPresent && (c.unavailable[src] || inferred && src != "static" && src != "truenas" && src != "docker") {
+			if !isPresent && (c.unavailable[src] || inferred && pre != "static" && pre != "truenas" && pre != "docker") {
 				fail("%s for an owner whose source is unavailable or unknown", a.Kind)
 			}
 			switch a.Kind {

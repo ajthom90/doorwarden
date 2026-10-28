@@ -164,6 +164,12 @@ func TestOrphanSourceUnavailableOrUnknownNeverRemoves(t *testing.T) {
 			Observed{Owned: row("docker:gone", past), Unavailable: map[string]bool{"dock1": true},
 				Known: map[string]KnownService{"docker:x": {Key: "docker:x", Source: "dock1", Zone: "example.test", Hostname: "x.example.test"}}}},
 		{"no Known, an unmappable source is unavailable", nil, Observed{Owned: row("docker:gone", past), Unavailable: map[string]bool{"mystery": true}}},
+		{"no Known, a source named like another prefix is unavailable and maps to nothing", nil,
+			Observed{Owned: row("truenas:gone", past), Unavailable: map[string]bool{"docker": true}}},
+		{"no Known, a source named like another prefix is unavailable and maps to nothing (other prefix)", nil,
+			Observed{Owned: row("docker:gone", past), Unavailable: map[string]bool{"truenas": true}}},
+		{"no Known, a TrueNAS source named docker is unavailable; docker evidence elsewhere does not map it", []model.Service{pub("docker:x", "x", "example.test", 80)},
+			Observed{Owned: row("truenas:gone", past), Unavailable: map[string]bool{"nas": true}}},
 		{"unknown key prefix", nil, Observed{Owned: row("other:gone", past)}},
 		{"unknown key prefix, unscheduled", nil, Observed{Owned: row("other:gone", nil)}},
 		{"no prefix", nil, Observed{Owned: row("gone", past)}},
@@ -178,9 +184,17 @@ func TestOrphanSourceUnavailableOrUnknownNeverRemoves(t *testing.T) {
 			assertOrphans(t, got)
 		})
 	}
-	// control: another source's outage does not block a mapped owner
-	obs := Observed{Foreign: listed("example.test"), Owned: row("docker:gone", past), Unavailable: map[string]bool{"truenas": true}}
+	// control: another source's outage does not block an owner once evidence
+	// (a desired or Known key) maps the unavailable name to another prefix.
+	// A source's name alone never maps it: a TrueNAS source may be named
+	// "docker" (T19 contract: Service.Source equals the key prefix, or Known
+	// carries the Source).
+	obs := Observed{Foreign: listed("example.test"), Owned: row("docker:gone", past), Unavailable: map[string]bool{"truenas": true},
+		Known: map[string]KnownService{"truenas:x": {Key: "truenas:x", Source: "truenas", Zone: "example.test", Hostname: "x.example.test"}}}
 	assertOrphans(t, Plan(nil, obs, phCfg(), t0), "DNSDelete example.test gone.example.test docker:gone [gone.example.test A 192.0.2.10]")
+	obs.Known = nil
+	stopped := svc("truenas:y", "y", "example.test", model.StateStopped, "198.51.100.5", 80)
+	assertOrphans(t, Plan([]model.Service{stopped}, obs, phCfg(), t0), "DNSDelete example.test gone.example.test docker:gone [gone.example.test A 192.0.2.10]")
 }
 
 // (c) the wildcard record is never scheduled or deleted.
