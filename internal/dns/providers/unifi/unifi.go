@@ -346,7 +346,7 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	var out policy
 	path := apiRoot + "/sites/" + url.PathEscape(sid) + "/dns/policies"
 	if _, err := p.c.Do(ctx, "POST", path, nil, p.hdr(), body(r), &out); err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			// timeout, reset or unparseable answer: the policy may exist (without a
 			// known ID; Delete matches name/type/value), so the caller must record it
 			return r, p.c.Ambiguous("unifi: create DNS policy "+r.Name, err)
@@ -406,7 +406,7 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	b.Enabled = cur.Enabled
 	var out policy
 	if _, err := p.c.Do(ctx, "PUT", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies/"+url.PathEscape(cur.ID), nil, p.hdr(), b, &out); err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			r.ID = cur.ID
 			return r, p.c.Ambiguous("unifi: update DNS policy "+r.Name, err)
 		}
@@ -461,7 +461,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 		return nil
 	}
 	if err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			return p.c.Ambiguous("unifi: delete DNS policy", err) // keep the ownership row
 		}
 		return p.wrapErr("delete DNS policy", err)

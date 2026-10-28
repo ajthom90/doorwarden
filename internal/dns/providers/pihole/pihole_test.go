@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -435,18 +436,62 @@ func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
 	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
 		t.Fatalf("delete: %v", err)
 	}
-	// a definitive error status is plain
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "PUT" {
-			w.WriteHeader(500)
-			return
+}
+
+// TestWriteStatusClassification answers ONLY the mutating request with each
+// error status: a 4xx is a plain error with an empty Record, every 5xx
+// (including an HTML proxy page) wraps dns.ErrUnconfirmed with the record.
+func TestWriteStatusClassification(t *testing.T) {
+	dnstest.CheckWriteStatuses(t, dnstest.WriteStatusHarness{
+		Zone: "example.test",
+		New: func(t *testing.T, wrap func(http.Handler) http.Handler) (dns.Provider, dns.Provider) {
+			b := newBackend()
+			srv := httptest.NewServer(wrap(b))
+			t.Cleanup(srv.Close)
+			p, err := pihole.New(pihole.Config{URL: srv.URL, Password: secretOf(password)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return newProvider(t, b, password), p
+		},
+		IsWrite: func(r *http.Request) bool {
+			return (r.Method == "PUT" || r.Method == "DELETE") && strings.HasPrefix(r.URL.Path, "/api/config/")
+		},
+		Create:      dns.Record{Name: "new.example.test", Type: "A", Value: "192.0.2.10"},
+		Existing:    dns.Record{Name: "old.example.test", Type: "A", Value: "192.0.2.11"},
+		UpdateValue: "192.0.2.12",
+	})
+}
+
+// TestUpdateOldValueRemovalFailureKeepsTheNewRecord: Update adds the new value
+// (PUT succeeds) and then removes the old one; when that DELETE fails, with ANY
+// status, the new value already exists, so the caller must get the record with
+// dns.ErrUnconfirmed (never a plain error that would leave it unowned).
+func TestUpdateOldValueRemovalFailureKeepsTheNewRecord(t *testing.T) {
+	ctx := context.Background()
+	for _, ws := range dnstest.WriteStatuses {
+		b := newBackend()
+		seed := newProvider(t, b, password)
+		if _, err := seed.CreateRecord(ctx, "example.test", dns.Record{Name: "u.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+			t.Fatal(err)
 		}
-		b.ServeHTTP(w, r)
-	}))
-	defer srv2.Close()
-	p2, _ := pihole.New(pihole.Config{URL: srv2.URL, Password: secretOf(password)})
-	got, err = p2.CreateRecord(ctx, "example.test", dns.Record{Name: "z.example.test", Type: "A", Value: "192.0.2.7"})
-	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
-		t.Fatalf("500: got %+v err %v", got, err)
+		var hits atomic.Int32
+		srv := httptest.NewServer(dnstest.AnswerWrites(b, func(r *http.Request) bool {
+			return r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/config/")
+		}, ws, &hits))
+		p, _ := pihole.New(pihole.Config{URL: srv.URL, Password: secretOf(password)})
+		got, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "u.example.test", Type: "A", Value: "192.0.2.2"})
+		srv.Close()
+		if hits.Load() == 0 || !errors.Is(err, dns.ErrUnconfirmed) || got.Name != "u.example.test" || got.Value != "192.0.2.2" {
+			t.Errorf("status %d: got %+v err %v (delete hits %d)", ws.Status, got, err, hits.Load())
+		}
+		recs, _ := seed.ListRecords(ctx, "example.test")
+		found := false
+		for _, r := range recs {
+			found = found || (r.Name == "u.example.test" && r.Value == "192.0.2.2")
+		}
+		if !found {
+			t.Errorf("status %d: the new value was not added: %v", ws.Status, recs)
+		}
 	}
 }

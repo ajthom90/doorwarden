@@ -470,15 +470,27 @@ func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
 	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
 		t.Fatalf("delete: %v", err)
 	}
-	// a definitive answer (500) is a plain error with no record
-	b2 := newBackend()
-	p2 := newProvider(t, b2, fakeToken)
-	if _, err := p2.CreateRecord(ctx, "example.test", dns.Record{Name: "ok.example.test", Type: "A", Value: "192.0.2.3"}); err != nil {
-		t.Fatal(err)
-	}
-	b2.status = 500
-	got, err = p2.UpdateRecord(ctx, "example.test", dns.Record{Name: "ok.example.test", Type: "A", Value: "192.0.2.4"})
-	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
-		t.Fatalf("500: got %+v err %v", got, err)
-	}
+}
+
+// TestWriteStatusClassification answers ONLY the mutating request with each
+// error status: a 4xx is a plain error with an empty Record, every 5xx
+// (including an HTML proxy page) wraps dns.ErrUnconfirmed with the record.
+func TestWriteStatusClassification(t *testing.T) {
+	dnstest.CheckWriteStatuses(t, dnstest.WriteStatusHarness{
+		Zone: "example.test",
+		New: func(t *testing.T, wrap func(http.Handler) http.Handler) (dns.Provider, dns.Provider) {
+			b := newBackend()
+			srv := httptest.NewServer(wrap(b))
+			t.Cleanup(srv.Close)
+			p, err := cloudflare.New(cloudflare.Config{APIToken: secrets.Secret(fakeToken), BaseURL: srv.URL + "/client/v4"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return newProvider(t, b, fakeToken), p
+		},
+		IsWrite:     func(r *http.Request) bool { return r.Method != "GET" },
+		Create:      dns.Record{Name: "new.example.test", Type: "A", Value: "192.0.2.10"},
+		Existing:    dns.Record{Name: "old.example.test", Type: "A", Value: "192.0.2.11"},
+		UpdateValue: "192.0.2.12",
+	})
 }

@@ -136,10 +136,25 @@ this against a fake backend.
 `dns.ErrUnconfirmed` means a write may exist even though the call did not
 report plain success: the service accepted it but a verification read did not
 show it (route53), or the request was in flight when it timed out, was
-cancelled, was cut off or got an unparseable answer. Providers decide with
-`httpx.IsDefinitiveRejection` (the server ANSWERED with an error status or API
-error: plain error, empty Record) versus everything else (ambiguous: the
-attempted Record plus an error wrapping `ErrUnconfirmed`). Create and Update
-return the Record so the caller can record ownership; Delete returns the error
-so the caller keeps its ownership row. Errors raised before the request is sent
-(validation, zone mismatch, dial failure) stay plain.
+cancelled, was cut off or got an unparseable answer. The rule is "when in
+doubt, ambiguous": a plain error for a write that DID apply would leave a record
+nobody owns, while ErrUnconfirmed for a write that did not apply only leaves an
+ownership row that drift repair cleans up.
+
+HTTP providers decide with `httpx.NotApplied(err)`. It is true only when the
+request provably was not applied: it was never sent (`httpx.ErrNotSent`: path
+or body encoding error, context already done, dial/TLS failure; `httpx.Do`
+tracks with an `httptrace.ClientTrace` whether the request headers were written)
+or the server refused it with a 4xx status (`httpx.IsDefinitiveRejection`; the
+401/403/429 mappings stay plain errors). Then the result is a plain error and an
+empty Record. Everything else is ambiguous: a 5xx (including a reverse proxy's
+HTML 502/504 page), a failure after the request was written (timeout,
+cancellation, reset), a truncated, oversized or unparseable answer, or a 2xx
+without the expected data. Create and Update then return the attempted Record
+plus an error wrapping `ErrUnconfirmed` so the caller can record ownership;
+Delete returns the error so the caller keeps its ownership row. A two-step
+update (pihole, adguard without `/rewrite/update`: add the new value, then
+remove the old one) whose second step fails in any way returns the new Record
+with `ErrUnconfirmed`, because the new value exists. API-level refusals inside a
+2xx (`success:false`, `status:error`) are definitive. Validation, zone mismatch
+and login failures happen before the write and stay plain.

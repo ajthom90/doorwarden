@@ -548,22 +548,21 @@ func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
 	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
 		t.Fatalf("delete: %v", err)
 	}
-	b2 := newBackend(t)
-	p2 := newProvider(t, b2, nil)
-	if _, err := p2.Test(ctx), error(nil); err != nil {
-		t.Fatal(err)
-	}
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			w.WriteHeader(500)
-			return
-		}
-		b2.ServeHTTP(w, r)
-	}))
-	defer srv2.Close()
-	p3, _ := unifi.New(unifi.Config{URL: srv2.URL, APIKey: fakeKey})
-	got, err = p3.CreateRecord(ctx, "example.test", rec)
-	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
-		t.Fatalf("500: got %+v err %v", got, err)
-	}
+}
+
+// TestWriteStatusClassification answers ONLY the mutating request with each
+// error status: a 4xx is a plain error with an empty Record, every 5xx
+// (including an HTML proxy page) wraps dns.ErrUnconfirmed with the record.
+func TestWriteStatusClassification(t *testing.T) {
+	dnstest.CheckWriteStatuses(t, dnstest.WriteStatusHarness{
+		Zone: "example.test",
+		New: func(t *testing.T, wrap func(http.Handler) http.Handler) (dns.Provider, dns.Provider) {
+			b := newBackend(t)
+			return newProvider(t, b, nil), newProvider(t, wrap(b), nil)
+		},
+		IsWrite:     func(r *http.Request) bool { return r.Method != "GET" },
+		Create:      dns.Record{Name: "new.example.test", Type: "A", Value: "192.0.2.10"},
+		Existing:    dns.Record{Name: "old.example.test", Type: "A", Value: "192.0.2.11"},
+		UpdateValue: "192.0.2.12",
+	})
 }

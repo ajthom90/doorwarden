@@ -14,9 +14,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/dns"
@@ -46,14 +48,28 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("http status %d: %s", e.Status, e.Msg)
 }
 
-// IsDefinitiveRejection reports whether err shows that the server ANSWERED
-// the request with an error status (4xx/5xx): the write was refused, so a plain
-// error is right. Every other failure (timeout, cancellation, connection reset,
-// truncated or unparseable response, an otherwise-successful answer without the
-// expected data) is ambiguous: the request may have been applied.
+// ErrNotSent marks a failure that happened before the request reached the
+// server: building the request (path, body encoding), a context already done, a
+// dial or TLS failure. Such a request cannot have been applied.
+var ErrNotSent = errors.New("request not sent")
+
+// IsDefinitiveRejection reports whether err is a 4xx answer: the server
+// ANSWERED and refused the request, so it was not applied. A 5xx answer is NOT
+// definitive: a gateway (502/504) or an overloaded backend (500/503) may answer
+// after the write was applied.
 func IsDefinitiveRejection(err error) bool {
 	var se *StatusError
-	return errors.As(err, &se)
+	return errors.As(err, &se) && se.Status >= 400 && se.Status < 500
+}
+
+// NotApplied reports whether err proves that a request was NOT applied: it was
+// never sent (ErrNotSent) or the server refused it with a 4xx status. Every
+// other failure of a write is ambiguous (timeout, cancellation or connection
+// loss after the request was written, a 5xx status, a truncated, oversized or
+// unparseable answer): the write may have been applied, and providers return
+// the attempted Record with an error built by Ambiguous.
+func NotApplied(err error) bool {
+	return err != nil && (errors.Is(err, ErrNotSent) || IsDefinitiveRejection(err))
 }
 
 // Ambiguous builds the error for a write whose outcome is unknown: it wraps
@@ -192,8 +208,10 @@ func (c *Client) wrap(err error) error {
 }
 
 // Do sends a request. body (if non-nil) is JSON-encoded; out (if non-nil) is
-// JSON-decoded from the response. A url.Values body is sent form-encoded and a RawJSON body verbatim. query may be nil. The response status is
-// returned even on error when a response was received.
+// JSON-decoded from the response. A url.Values body is sent form-encoded and a
+// RawJSON body verbatim. query may be nil. The response status is returned even
+// on error when a response was received. A failure before any request byte was
+// written wraps ErrNotSent (see NotApplied).
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, hdr http.Header, body, out any) (int, error) {
 	u := *c.Base
 	// path is already escaped by the caller (url.PathEscape on variable parts)
@@ -201,7 +219,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if up, err := url.PathUnescape(u.RawPath); err == nil {
 		u.Path = up
 	} else {
-		return 0, fmt.Errorf("invalid request path: %w", err)
+		return 0, fmt.Errorf("invalid request path: %w: %w", ErrNotSent, err)
 	}
 	if query != nil {
 		u.RawQuery = query.Encode()
@@ -215,13 +233,22 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	} else if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("encode request body: %w: %w", ErrNotSent, err)
 		}
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), rd)
+	// written turns true once the request headers were handed to the
+	// connection: from then on the server may have received (and applied) it.
+	// A failure before that (dial, TLS, a context already done) means nothing
+	// was sent. Callbacks can run on transport goroutines, hence the atomic.
+	var written atomic.Bool
+	tctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteHeaders: func() { written.Store(true) },
+		WroteRequest: func(httptrace.WroteRequestInfo) { written.Store(true) },
+	})
+	req, err := http.NewRequestWithContext(tctx, method, u.String(), rd)
 	if err != nil {
-		return 0, c.wrap(err)
+		return 0, c.wrap(fmt.Errorf("%w: %w", ErrNotSent, err))
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -232,10 +259,14 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	}
 	resp, err := c.HC.Do(req)
 	if err != nil {
+		cause := unwrapURLErr(err)
 		if ctx.Err() != nil {
-			return 0, c.wrap(fmt.Errorf("%s %s: %w", method, path, ctx.Err()))
+			cause = ctx.Err()
 		}
-		return 0, c.wrap(fmt.Errorf("%s %s: %w", method, path, unwrapURLErr(err)))
+		if !written.Load() {
+			return 0, c.wrap(fmt.Errorf("%s %s: %w: %w", method, path, ErrNotSent, cause))
+		}
+		return 0, c.wrap(fmt.Errorf("%s %s: %w", method, path, cause))
 	}
 	defer resp.Body.Close()
 	max := c.MaxBody

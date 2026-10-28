@@ -20,18 +20,19 @@ var (
 	// ErrUnconfirmed is returned (wrapped) when a write was ACCEPTED by the
 	// service but could not be confirmed within the provider's verification
 	// window, and also when the request MAY have been applied but its outcome is
-	// unknown (a timeout, cancellation, dropped connection or unparseable answer
-	// while the write was in flight). A definitive rejection (the service
-	// answered with an error status or API error) is an ordinary error with an
-	// empty Record. The Record returned alongside it describes what was written, so
-	// callers MUST treat a Create/Update that returns errors.Is(err,
-	// ErrUnconfirmed) with a non-empty Record.Name as done (create the ownership
-	// row, warn, verify on a later cycle): ignoring it would leave a record the
-	// service holds but nobody owns. For DeleteRecord the error wraps
-	// ErrUnconfirmed and the caller must KEEP its ownership row, because the
-	// record may or may not be gone yet. Providers return it only after the
-	// service acknowledged the change and no read showed a conflicting value; a
-	// conflicting value (another writer) is an ordinary error.
+	// unknown (a timeout, cancellation, dropped connection, server-side failure
+	// such as an HTTP 5xx or DNS SERVFAIL, or an unparseable answer after the
+	// write was sent). A definitive rejection (an HTTP 4xx, an AWS 4xx API error,
+	// a DNS REFUSED/NOTAUTH/prerequisite failure) and any failure before the
+	// request was sent are ordinary errors with an empty Record. The Record
+	// returned alongside ErrUnconfirmed describes what was written, so callers
+	// MUST treat a Create/Update that returns errors.Is(err, ErrUnconfirmed) with
+	// a non-empty Record.Name as done (create the ownership row, warn, verify on
+	// a later cycle): ignoring it would leave a record the service holds but
+	// nobody owns. For DeleteRecord the error wraps ErrUnconfirmed and the caller
+	// must KEEP its ownership row, because the record may or may not be gone yet.
+	// A conflicting value seen by a verification read (another writer) is an
+	// ordinary error.
 	ErrUnconfirmed = errors.New("dns: write accepted but not confirmed")
 )
 

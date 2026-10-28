@@ -298,7 +298,7 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 		Result apiRecord `json:"result"`
 	}
 	if _, err := p.c.Do(ctx, "POST", "/zones/"+zid+"/dns_records", nil, p.hdr(), body, &out); err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			return r, p.c.Ambiguous("cloudflare: create record "+r.Name, err) // may exist: the caller must record it
 		}
 		return dns.Record{}, p.wrapErr("create record "+r.Name, err)
@@ -371,7 +371,7 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		Result apiRecord `json:"result"`
 	}
 	if _, err := p.c.Do(ctx, "PATCH", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.hdr(), body, &out); err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			r.ID = cur.ID
 			return r, p.c.Ambiguous("cloudflare: update record "+r.Name, err)
 		}
@@ -412,7 +412,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 			continue
 		}
 		if err != nil {
-			if !httpx.IsDefinitiveRejection(err) {
+			if !httpx.NotApplied(err) {
 				return p.c.Ambiguous("cloudflare: delete record "+cur.Name, err) // keep the ownership row
 			}
 			return p.wrapErr("delete record "+cur.Name, err)

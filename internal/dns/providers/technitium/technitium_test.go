@@ -378,3 +378,28 @@ func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
 		t.Fatalf("api error: got %+v err %v", got, err)
 	}
 }
+
+// TestWriteStatusClassification answers ONLY the mutating request with each
+// error status: a 4xx is a plain error with an empty Record, every 5xx
+// (including an HTML proxy page) wraps dns.ErrUnconfirmed with the record.
+func TestWriteStatusClassification(t *testing.T) {
+	dnstest.CheckWriteStatuses(t, dnstest.WriteStatusHarness{
+		Zone: "example.test",
+		New: func(t *testing.T, wrap func(http.Handler) http.Handler) (dns.Provider, dns.Provider) {
+			b := newBackend()
+			srv := httptest.NewServer(wrap(b))
+			t.Cleanup(srv.Close)
+			p, err := technitium.New(technitium.Config{URL: srv.URL, Token: secrets.Secret(apiToken)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return newProvider(t, b, nil), p
+		},
+		IsWrite: func(r *http.Request) bool {
+			return strings.Contains(r.URL.Path, "/records/") && !strings.HasSuffix(r.URL.Path, "/get")
+		},
+		Create:      dns.Record{Name: "new.example.test", Type: "A", Value: "192.0.2.10"},
+		Existing:    dns.Record{Name: "old.example.test", Type: "A", Value: "192.0.2.11"},
+		UpdateValue: "192.0.2.12",
+	})
+}

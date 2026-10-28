@@ -131,7 +131,7 @@ func (p *Provider) post(ctx context.Context, path string, form url.Values) (*env
 		if errors.As(err, &se) && se.Status == 429 {
 			return nil, errors.New("technitium: rate limited by the server (status 429); retry later")
 		}
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			// timeout, cancellation, reset, unparseable body: the call may have been applied
 			return nil, fmt.Errorf("technitium: %w: %w", errAmbiguous, err)
 		}

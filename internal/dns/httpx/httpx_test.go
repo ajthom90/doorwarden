@@ -3,11 +3,13 @@ package httpx_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,5 +170,119 @@ func TestScrubbedErrorDoesNotExposeRawError(t *testing.T) {
 	var ne net.Error
 	if err == nil || !errors.As(err, &ne) || strings.Contains(err.Error(), "127.0.0.1") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestWriteOutcomeClassification pins which failures prove a request was NOT
+// applied (NotApplied: never sent, or a 4xx answer) and which leave the outcome
+// unknown (5xx answers, failures after the request reached the wire).
+func TestWriteOutcomeClassification(t *testing.T) {
+	ctx := context.Background()
+	post := func(c *httpx.Client, cx context.Context) error {
+		_, err := c.Do(cx, "POST", "/w", nil, nil, map[string]string{"k": "v"}, nil)
+		return err
+	}
+	// dial refused: nothing was sent
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	c, _ := httpx.New("http://"+addr, false, 0)
+	if err := post(c, ctx); err == nil || !httpx.NotApplied(err) || !errors.Is(err, httpx.ErrNotSent) {
+		t.Errorf("dial refused must be not-applied: %v", err)
+	}
+	// context cancelled before Do: nothing was sent
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+	c, _ = httpx.New(srv.URL, false, 0)
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := post(c, cctx); err == nil || !httpx.NotApplied(err) || !errors.Is(err, context.Canceled) {
+		t.Errorf("pre-cancelled ctx must be not-applied: %v", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("a cancelled request reached the server")
+	}
+	// an unencodable body and an invalid path fail before sending
+	if _, err := c.Do(ctx, "POST", "/w", nil, nil, map[string]any{"f": func() {}}, nil); err == nil || !httpx.NotApplied(err) {
+		t.Errorf("marshal error must be not-applied: %v", err)
+	}
+	if _, err := c.Do(ctx, "POST", "/%zz", nil, nil, nil, nil); err == nil || !httpx.NotApplied(err) {
+		t.Errorf("bad path must be not-applied: %v", err)
+	}
+	if _, err := c.Do(ctx, "BAD METHOD", "/w", nil, nil, nil, nil); err == nil || !httpx.NotApplied(err) {
+		t.Errorf("NewRequest error must be not-applied: %v", err)
+	}
+	// the server reads (applies) the request, then cuts the connection
+	var applied atomic.Bool
+	cut := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		applied.Store(true)
+		if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer cut.Close()
+	c, _ = httpx.New(cut.URL, false, 0)
+	if err := post(c, ctx); err == nil || httpx.NotApplied(err) || !applied.Load() {
+		t.Errorf("applied-then-cut must be ambiguous: %v (applied %v)", err, applied.Load())
+	}
+	// the connection is reset right after the request headers arrive
+	reset := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0) // RST instead of FIN
+			}
+			_ = conn.Close()
+		}
+	}))
+	defer reset.Close()
+	c, _ = httpx.New(reset.URL, false, 0)
+	if err := post(c, ctx); err == nil || httpx.NotApplied(err) {
+		t.Errorf("reset after headers must be ambiguous: %v", err)
+	}
+	// the caller's deadline expires while the server holds the request
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { time.Sleep(300 * time.Millisecond) }))
+	defer slow.Close()
+	c, _ = httpx.New(slow.URL, false, 0)
+	tctx, tcancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer tcancel()
+	if err := post(c, tctx); err == nil || httpx.NotApplied(err) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("timeout in flight must be ambiguous: %v", err)
+	}
+	// status answers: 4xx is a refusal, 5xx (including a proxy's HTML page) is not
+	for _, tc := range []struct {
+		status     int
+		ctype      string
+		body       string
+		notApplied bool
+	}{
+		{400, "application/json", `{"message":"bad"}`, true},
+		{404, "application/json", `{"message":"nope"}`, true},
+		{409, "application/json", `{"message":"conflict"}`, true},
+		{422, "application/json", `{"message":"invalid"}`, true},
+		{500, "application/json", `{"message":"boom"}`, false},
+		{502, "text/html", `<html><body><h1>502 Bad Gateway</h1></body></html>`, false},
+		{503, "text/plain", `unavailable`, false},
+		{504, "text/html", `<html><body><h1>504 Gateway Time-out</h1></body></html>`, false},
+	} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", tc.ctype)
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(tc.body))
+		}))
+		c, _ := httpx.New(s.URL, false, 0)
+		err := post(c, ctx)
+		var se *httpx.StatusError
+		if !errors.As(err, &se) || se.Status != tc.status || httpx.NotApplied(err) != tc.notApplied {
+			t.Errorf("status %d: NotApplied=%v want %v (%v)", tc.status, httpx.NotApplied(err), tc.notApplied, err)
+		}
+		s.Close()
+	}
+	if httpx.NotApplied(nil) {
+		t.Error("nil is not a failure")
 	}
 }

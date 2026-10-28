@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -441,10 +442,57 @@ func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
 	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
 		t.Fatalf("delete: %v", err)
 	}
-	b2 := &backend{status: 500}
-	p2 := newProvider(t, b2, password)
-	got, err = p2.CreateRecord(ctx, "example.test", rec)
-	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
-		t.Fatalf("500: got %+v err %v", got, err)
+}
+
+// TestWriteStatusClassification answers ONLY the mutating request with each
+// error status: a 4xx is a plain error with an empty Record, every 5xx
+// (including an HTML proxy page) wraps dns.ErrUnconfirmed with the record.
+func TestWriteStatusClassification(t *testing.T) {
+	dnstest.CheckWriteStatuses(t, dnstest.WriteStatusHarness{
+		Zone: "example.test",
+		New: func(t *testing.T, wrap func(http.Handler) http.Handler) (dns.Provider, dns.Provider) {
+			b := &backend{}
+			srv := httptest.NewServer(wrap(b))
+			t.Cleanup(srv.Close)
+			p, err := adguard.New(adguard.Config{URL: srv.URL, Username: user, Password: secrets.Secret(password)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return newProvider(t, b, password), p
+		},
+		IsWrite:     func(r *http.Request) bool { return r.Method != "GET" },
+		Create:      dns.Record{Name: "new.example.test", Type: "A", Value: "192.0.2.10"},
+		Existing:    dns.Record{Name: "old.example.test", Type: "A", Value: "192.0.2.11"},
+		UpdateValue: "192.0.2.12",
+	})
+}
+
+// TestFallbackUpdateOldValueRemovalFailureKeepsTheNewRecord: on a server
+// without /control/rewrite/update, Update adds the new answer and then deletes
+// the old one. When that delete fails, with ANY status, the new rewrite exists,
+// so the caller must get the record with dns.ErrUnconfirmed; a plain error would
+// leave it unowned (and the next Update would see two values and refuse).
+func TestFallbackUpdateOldValueRemovalFailureKeepsTheNewRecord(t *testing.T) {
+	ctx := context.Background()
+	for _, ws := range dnstest.WriteStatuses {
+		b := &backend{noUpdate: true}
+		seed := newProvider(t, b, password)
+		if _, err := seed.CreateRecord(ctx, "example.test", dns.Record{Name: "u.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+			t.Fatal(err)
+		}
+		var hits atomic.Int32
+		srv := httptest.NewServer(dnstest.AnswerWrites(b, func(r *http.Request) bool { return r.URL.Path == "/control/rewrite/delete" }, ws, &hits))
+		p, _ := adguard.New(adguard.Config{URL: srv.URL, Username: user, Password: secrets.Secret(password)})
+		got, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "u.example.test", Type: "A", Value: "192.0.2.2"})
+		srv.Close()
+		if hits.Load() == 0 || !errors.Is(err, dns.ErrUnconfirmed) || got.Name != "u.example.test" || got.Value != "192.0.2.2" {
+			t.Errorf("status %d: got %+v err %v (delete hits %d)", ws.Status, got, err, hits.Load())
+		}
+		b.mu.Lock()
+		n := len(b.rws)
+		b.mu.Unlock()
+		if n != 2 {
+			t.Errorf("status %d: want the new answer added next to the old one, have %d rewrites", ws.Status, n)
+		}
 	}
 }

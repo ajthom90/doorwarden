@@ -170,7 +170,7 @@ func (p *Provider) doOpt(ctx context.Context, op, method, path string, body, out
 			continue
 		}
 		if err != nil {
-			if mutating && !httpx.IsDefinitiveRejection(err) {
+			if mutating && !httpx.NotApplied(err) {
 				return p.c.Ambiguous("pihole: "+op, err)
 			}
 			return p.mapErr(op, err)

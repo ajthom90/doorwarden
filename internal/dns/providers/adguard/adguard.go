@@ -201,7 +201,7 @@ func check(r dns.Record) error {
 
 func (p *Provider) post(ctx context.Context, op, path string, body any) error {
 	if _, err := p.c.Do(ctx, "POST", path, nil, p.hdr(), body, nil); err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			return p.c.Ambiguous("adguard: "+op, err)
 		}
 		return p.mapErr(op, err)
@@ -294,16 +294,19 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 			return dns.Record{}, err
 		}
 		if err := p.post(ctx, "update rewrite "+r.Name+" (remove old)", "/control/rewrite/delete", httpx.RawJSON(old[0].raw)); err != nil {
+			// the new answer was added, so the caller must own it either way;
+			// a plain error would leave it unowned (and the next Update would
+			// see two answers and refuse)
 			if errors.Is(err, dns.ErrUnconfirmed) {
 				return r, err
 			}
-			return dns.Record{}, err
+			return r, fmt.Errorf("%w (the new answer was added; the old one may remain)", errors.Join(err, dns.ErrUnconfirmed))
 		}
 		return r, nil
 	}
 	r.TTL = 0
 	if err != nil {
-		if !httpx.IsDefinitiveRejection(err) {
+		if !httpx.NotApplied(err) {
 			return r, p.c.Ambiguous("adguard: update rewrite "+r.Name, err)
 		}
 		return dns.Record{}, p.mapErr("update rewrite "+r.Name, err)
