@@ -553,25 +553,13 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 		return res
 	}
 
-	var prov challenge.Provider
-	if ch == ChallengeDNS01 {
-		prov, err = m.dnsChallengeProvider(z.Certificate.DNSProvider)
-	} else {
-		prov, err = m.http01()
-	}
-	if err != nil {
-		r, ev := m.recordFailure(context.WithoutCancel(ctx), z, issuer, dir, id, names, err, false)
-		m.notify(context.WithoutCancel(ctx), ev)
-		return r
-	}
-
 	select {
 	case issueSem <- struct{}{}:
 	case <-ctx.Done():
 		res.Err = fmt.Errorf("acme: waiting for another order: %w", ctx.Err())
 		return res
 	}
-	o := order{Issuer: issuer, IssuerCfg: isCfg, Dir: dir, Names: names, Challenge: ch, Provider: prov}
+	o := order{Issuer: issuer, IssuerCfg: isCfg, Dir: dir, Names: names, Challenge: ch}
 	done := make(chan Result, 1)
 	handedOff = true
 	go func() {
@@ -597,15 +585,24 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 					r, ev = m.recordFailure(bg, z, issuer, dir, id, names, fmt.Errorf("acme: order panicked: %v", p), started)
 				}
 			}()
-			m.beginAttempt(bg, issuer, id)
-			started = true
-			ob, err := m.obtain(ctx, o)
-			m.endAttempt(bg, issuer, id, err == nil)
-			if err != nil {
-				r, ev = m.recordFailure(bg, z, issuer, dir, id, names, err, true)
-				return
+			// The provider is built only now, with the order slot held: no
+			// other order's settings are in the environment, and a lazy
+			// provider keeps its settings there for the whole order.
+			cerr := m.withChallengeProvider(z, ch, func(prov challenge.Provider) {
+				o.Provider = prov
+				m.beginAttempt(bg, issuer, id)
+				started = true
+				ob, err := m.obtain(ctx, o)
+				m.endAttempt(bg, issuer, id, err == nil)
+				if err != nil {
+					r, ev = m.recordFailure(bg, z, issuer, dir, id, names, err, true)
+					return
+				}
+				r, ev = m.recordSuccess(bg, z, issuer, dir, id, names, ob)
+			})
+			if cerr != nil {
+				r, ev = m.recordFailure(bg, z, issuer, dir, id, names, cerr, false)
 			}
-			r, ev = m.recordSuccess(bg, z, issuer, dir, id, names, ob)
 		}()
 		// Notifications go out only after the process-wide slot is free.
 		release()
@@ -1229,11 +1226,36 @@ func (m *Manager) switchIssuer(ctx context.Context, issuer, to string) ([]Result
 }
 
 // dnsChallengeProvider builds the lego DNS provider named by a providers:
-// entry, mapping its settings to lego's environment variables under envMu
-// and restoring the environment afterwards.
+// entry (see withDNSProvider). For a lazyEnvProviders type the environment
+// is already restored when it returns; orders use withDNSProvider.
 func (m *Manager) dnsChallengeProvider(name string) (challenge.Provider, error) {
+	var p challenge.Provider
+	err := m.withDNSProvider(name, func(prov challenge.Provider) { p = prov })
+	return p, err
+}
+
+// withChallengeProvider builds the zone's challenge provider and calls run
+// with it. It returns only a construction error; run reports its own.
+func (m *Manager) withChallengeProvider(z config.Zone, ch string, run func(challenge.Provider)) error {
+	if ch != ChallengeDNS01 {
+		p, err := m.http01()
+		if err != nil {
+			return err
+		}
+		run(p)
+		return nil
+	}
+	return m.withDNSProvider(z.Certificate.DNSProvider, run)
+}
+
+// withDNSProvider builds the lego DNS provider named by a providers: entry,
+// mapping its settings to lego's environment variables under envMu, and
+// calls run with it. The environment is restored once the provider is
+// built, or, for a lazyEnvProviders type, once run returns (run then holds
+// envMu and must not build another provider).
+func (m *Manager) withDNSProvider(name string, run func(challenge.Provider)) error {
 	if err := checkChallengeProvider(m.cfg, name); err != nil {
-		return nil, fmt.Errorf("acme: %w", err)
+		return fmt.Errorf("acme: %w", err)
 	}
 	pc := m.cfg.Providers[name]
 	cat, _ := LookupChallengeProvider(pc.Type)
@@ -1241,7 +1263,7 @@ func (m *Manager) dnsChallengeProvider(name string) (challenge.Provider, error) 
 	for k, raw := range pc.Extra {
 		v, err := m.settingValue(raw)
 		if err != nil {
-			return nil, fmt.Errorf("acme: provider %q setting %s: %w", name, k, err)
+			return fmt.Errorf("acme: provider %q setting %s: %w", name, k, err)
 		}
 		settings[k] = v
 	}
@@ -1252,11 +1274,29 @@ func (m *Manager) dnsChallengeProvider(name string) (challenge.Provider, error) 
 	for k, v := range settings {
 		m.registerSetting(cat, k, settingEnvName(cat, k), v)
 	}
-	p, err := withEnv(env, func() (challenge.Provider, error) { return m.providerByName(pc.Type) })
-	if err != nil {
-		return nil, fmt.Errorf("acme: challenge provider %q (%s): %w", name, pc.Type, err)
+	build := func() (challenge.Provider, error) {
+		p, err := m.providerByName(pc.Type)
+		if err != nil {
+			return nil, fmt.Errorf("acme: challenge provider %q (%s): %w", name, pc.Type, err)
+		}
+		return withPropagationTimeout(p, m.cfg.ACME.DNSPropagationTimeout), nil
 	}
-	return withPropagationTimeout(p, m.cfg.ACME.DNSPropagationTimeout), nil
+	if lazyEnvProviders[strings.ToLower(pc.Type)] {
+		return envDo(env, func() error {
+			p, err := build()
+			if err != nil {
+				return err
+			}
+			run(p)
+			return nil
+		})
+	}
+	p, err := withEnv(env, build)
+	if err != nil {
+		return err
+	}
+	run(p)
+	return nil
 }
 
 // acmeUser implements registration.User.

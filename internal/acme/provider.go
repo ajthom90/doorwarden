@@ -17,9 +17,35 @@ import (
 // under this lock. Nothing else in doorwarden may rely on these variables.
 var envMu sync.Mutex
 
+// lazyEnvProviders are the lego providers that read settings from the
+// environment after construction, while an order runs (audit of lego
+// v4.35.2 providers/dns, see the package report):
+//   - oraclecloud: the default (API key) auth reads OCI_PRIVATE_KEY(_PATH)
+//     and OCI_PRIVATE_KEY_PASSWORD each time a request is signed;
+//   - namecheap: NAMECHEAP_HTTP(S)_PROXY / NO_PROXY are read on the first
+//     request (and then cached for the whole process by lego).
+//
+// For these the settings stay in the environment, under envMu, for the
+// whole order (construction and Obtain).
+var lazyEnvProviders = map[string]bool{
+	"oraclecloud": true,
+	"namecheap":   true,
+}
+
 // withEnv sets env, runs fn and restores every variable to its previous
 // state (value, or unset) before returning, even if fn panics.
 func withEnv(env map[string]string, fn func() (challenge.Provider, error)) (challenge.Provider, error) {
+	var p challenge.Provider
+	err := envDo(env, func() error {
+		var err error
+		p, err = fn()
+		return err
+	})
+	return p, err
+}
+
+// envDo is withEnv for any function: env is set, under envMu, while fn runs.
+func envDo(env map[string]string, fn func() error) error {
 	envMu.Lock()
 	defer envMu.Unlock()
 	keys := make([]string, 0, len(env))
@@ -47,7 +73,7 @@ func withEnv(env map[string]string, fn func() (challenge.Provider, error)) (chal
 	}()
 	for _, k := range keys {
 		if err := os.Setenv(k, env[k]); err != nil {
-			return nil, fmt.Errorf("acme: set provider setting %s: %w", k, err)
+			return fmt.Errorf("acme: set provider setting %s: %w", k, err)
 		}
 	}
 	return fn()
