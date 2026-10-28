@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func rec(provider, zone, name, typ, val, owner string) DNSRecord {
@@ -127,5 +128,47 @@ func TestListActivityDefaultLimit(t *testing.T) {
 	got, err := s.ListActivity(ctx, 0)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("%v %v", got, err)
+	}
+}
+
+func TestSetOwnedRemovalOwnerGuarded(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	r := rec("cf", "example.test", "app.example.test", "A", "192.0.2.1", "docker:app")
+	r.ProviderRecordID = "r1"
+	if err := s.AddOwnedRecord(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	at := t0.Add(24 * time.Hour)
+	// another owner: nothing changes
+	if err := s.SetOwnedRemoval(ctx, "cf", "example.test", "app.example.test", "A", "docker:other", &at); !errors.Is(err, ErrOwnedRecordNotFound) {
+		t.Fatalf("other owner: err = %v", err)
+	}
+	if got, _ := s.ListOwnedRecords(ctx, "cf", "example.test"); got[0].RemovedAfter != nil {
+		t.Fatalf("other owner changed the row: %+v", got)
+	}
+	// no row at all
+	if err := s.SetOwnedRemoval(ctx, "cf", "example.test", "web.example.test", "A", "docker:app", &at); !errors.Is(err, ErrOwnedRecordNotFound) {
+		t.Fatalf("missing row: err = %v", err)
+	}
+	// the owner, spelled unnormalized: set
+	if err := s.SetOwnedRemoval(ctx, "cf", "example.test", "APP.example.test.", "a", "docker:app", &at); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.ListOwnedRecords(ctx, "cf", "example.test")
+	if len(got) != 1 || got[0].RemovedAfter == nil || !got[0].RemovedAfter.Equal(at) ||
+		got[0].Value != "192.0.2.1" || got[0].ProviderRecordID != "r1" || got[0].OwnerKey != "docker:app" {
+		t.Fatalf("after set: %+v", got)
+	}
+	// clear
+	if err := s.SetOwnedRemoval(ctx, "cf", "example.test", "app.example.test", "A", "docker:app", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.ListOwnedRecords(ctx, "cf", "example.test"); got[0].RemovedAfter != nil {
+		t.Fatalf("not cleared: %+v", got)
+	}
+	// other provider/zone never matched
+	if err := s.SetOwnedRemoval(ctx, "cf2", "example.test", "app.example.test", "A", "docker:app", &at); !errors.Is(err, ErrOwnedRecordNotFound) {
+		t.Fatalf("other provider: err = %v", err)
 	}
 }

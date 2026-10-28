@@ -12,6 +12,10 @@ import (
 // (provider, zone, name, type) already belongs to a different owner_key.
 var ErrOwnerConflict = errors.New("store: dns record already owned by a different owner")
 
+// ErrOwnedRecordNotFound is returned by SetOwnedRemoval when no row for the
+// (provider, zone, name, type) is owned by the given owner key.
+var ErrOwnedRecordNotFound = errors.New("store: no dns record owned by this owner")
+
 // normName lowercases a DNS name and strips trailing dots.
 func normName(n string) string { return strings.TrimRight(strings.ToLower(n), ".") }
 
@@ -82,4 +86,26 @@ func (s *Store) ListOwnedRecords(ctx context.Context, provider, zone string) ([]
 func (s *Store) DeleteOwnedRecord(ctx context.Context, provider, zone, name, typ string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ?`, provider, zone, normName(name), normType(typ))
 	return err
+}
+
+// SetOwnedRemoval sets (at non-nil) or clears (at nil) removed_after of the
+// ownership row for (provider, zone, normalized name, normalized type), only
+// if that row's owner_key equals owner. Nothing else in the row changes. When
+// no such row exists (absent, or owned by another key) it writes nothing and
+// returns ErrOwnedRecordNotFound.
+func (s *Store) SetOwnedRemoval(ctx context.Context, provider, zone, name, typ, owner string, at *time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE dns_records SET removed_after = ?
+		WHERE provider = ? AND zone = ? AND name = ? AND type = ? AND owner_key = ?`,
+		nullTime(at), provider, zone, normName(name), normType(typ), owner)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrOwnedRecordNotFound
+	}
+	return nil
 }
