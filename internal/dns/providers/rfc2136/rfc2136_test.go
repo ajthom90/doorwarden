@@ -30,6 +30,8 @@ type fakeServer struct {
 	noSign          bool   // reply without TSIG even to signed requests
 	dropUpdateReply bool   // apply an UPDATE, then close the connection without answering
 	beforeUpdate    func() // runs when an UPDATE arrives, before it is evaluated (simulates a racing writer)
+	updateRcode     int    // answer every UPDATE with this rcode (signed) without applying it
+	updateReply     string // apply the UPDATE, then reply "unsigned" (NOERROR without TSIG), "badsig" (a MAC that does not verify) or "garbled"
 	delay           time.Duration
 	unsigned        int // requests received without TSIG
 	srv             *mdns.Server
@@ -100,6 +102,10 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 		if f.beforeUpdate != nil {
 			f.beforeUpdate()
 			f.beforeUpdate = nil
+		}
+		if f.updateRcode != 0 {
+			m.Rcode = f.updateRcode
+			return
 		}
 		z := q.Name
 		recs, ok := f.zones[z]
@@ -179,6 +185,24 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 			}
 		}
 		f.zones[z] = recs
+		switch f.updateReply {
+		case "unsigned":
+			_ = w.WriteMsg(m)
+			m = nil
+			return
+		case "badsig":
+			m.SetTsig(keyName, mdns.HmacSHA256, 300, time.Now().Unix())
+			out, _, err := mdns.TsigGenerate(m, "d3Jvbmctc2VjcmV0LXdyb25n", "", false)
+			if err == nil {
+				_, _ = w.Write(out)
+			}
+			m = nil
+			return
+		case "garbled":
+			_, _ = w.Write([]byte{0xde, 0xad, 0xbe})
+			m = nil
+			return
+		}
 		if f.dropUpdateReply {
 			m = nil
 			_ = w.Close()
@@ -516,5 +540,73 @@ func TestAmbiguousUpdateIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
 	got, err = down.CreateRecord(ctx, "example.test", rec)
 	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
 		t.Fatalf("unreachable server: got %+v err %v", got, err)
+	}
+}
+
+// TestUpdateOutcomeClassification: after an UPDATE was sent, a reply that does
+// not prove it was refused leaves the outcome unknown (SERVFAIL: a journal
+// failure or a forwarded update whose primary timed out may still have been
+// applied; an unknown rcode; an unsigned NOERROR; a reply whose TSIG does not
+// verify; a garbled reply). The server saying no (REFUSED, NOTAUTH, NOTZONE,
+// FORMERR, NOTIMP, prerequisite failures) is a plain error.
+func TestUpdateOutcomeClassification(t *testing.T) {
+	ctx := context.Background()
+	rec := dns.Record{Name: "cls.example.test", Type: "A", Value: "192.0.2.1"}
+	type tc struct {
+		name      string
+		rcode     int
+		reply     string
+		ambiguous bool
+	}
+	cases := []tc{
+		{"SERVFAIL", mdns.RcodeServerFailure, "", true},
+		{"unknown rcode 15", 15, "", true},
+		{"unsigned NOERROR", 0, "unsigned", true},
+		{"TSIG verification failure", 0, "badsig", true},
+		{"garbled reply", 0, "garbled", true},
+		{"REFUSED", mdns.RcodeRefused, "", false},
+		{"NOTAUTH", mdns.RcodeNotAuth, "", false},
+		{"NOTZONE", mdns.RcodeNotZone, "", false},
+		{"FORMERR", mdns.RcodeFormatError, "", false},
+		{"NOTIMP", mdns.RcodeNotImplemented, "", false},
+		{"NXRRSET", mdns.RcodeNXRrset, "", false},
+		{"YXRRSET", mdns.RcodeYXRrset, "", false},
+		{"NXDOMAIN", mdns.RcodeNameError, "", false},
+		{"YXDOMAIN", mdns.RcodeYXDomain, "", false},
+	}
+	for _, c := range cases {
+		for _, op := range []string{"create", "update", "delete"} {
+			f := startServer(t)
+			if op != "create" {
+				rr, _ := mdns.NewRR("cls.example.test. 300 IN A 192.0.2.9")
+				f.zones["example.test."] = []mdns.RR{rr}
+			}
+			p := newProvider(t, f, nil)
+			f.mu.Lock()
+			f.updateRcode, f.updateReply = c.rcode, c.reply
+			f.mu.Unlock()
+			var got dns.Record
+			var err error
+			want := rec
+			switch op {
+			case "create":
+				got, err = p.CreateRecord(ctx, "example.test", rec)
+			case "update":
+				got, err = p.UpdateRecord(ctx, "example.test", rec)
+			case "delete":
+				want.Value = "192.0.2.9"
+				err = p.DeleteRecord(ctx, "example.test", want)
+			}
+			if err == nil || errors.Is(err, dns.ErrUnconfirmed) != c.ambiguous {
+				t.Errorf("%s %s: ambiguous=%v, got err %v", c.name, op, c.ambiguous, err)
+				continue
+			}
+			if op != "delete" && c.ambiguous && (got.Name != want.Name || got.Value != want.Value) {
+				t.Errorf("%s %s: ErrUnconfirmed must come with the record, got %+v", c.name, op, got)
+			}
+			if op != "delete" && !c.ambiguous && got != (dns.Record{}) {
+				t.Errorf("%s %s: a refusal must return an empty Record, got %+v", c.name, op, got)
+			}
+		}
 	}
 }

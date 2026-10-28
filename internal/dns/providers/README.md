@@ -158,3 +158,17 @@ remove the old one) whose second step fails in any way returns the new Record
 with `ErrUnconfirmed`, because the new value exists. API-level refusals inside a
 2xx (`success:false`, `status:error`) are definitive. Validation, zone mismatch
 and login failures happen before the write and stay plain.
+
+route53 sends each change exactly once (per-call `RetryMaxAttempts = 1`; the
+SDK retryer would resend a change whose answer was lost, and the resend would be
+refused although the first attempt applied it). An AWS API error with HTTP
+status >= 500, a transport failure, a deadline or an unparseable answer is
+ambiguous; a 4xx API error is a refusal, except an `InvalidChangeBatch` while the
+set already holds exactly the requested values: someone (possibly an earlier
+attempt of ours) made it, and since that cannot be proven either way the record
+is returned with `ErrUnconfirmed`. rfc2136: after the UPDATE was written,
+REFUSED, NOTAUTH, NOTZONE, FORMERR, NOTIMP, the prerequisite failures
+(NXRRSET/YXRRSET/NXDOMAIN/YXDOMAIN) and a TSIG error the server reports are
+refusals; SERVFAIL, an unknown rcode, a reply that is unsigned, signed by
+another key or fails TSIG verification, a garbled reply and any I/O failure are
+ambiguous.

@@ -172,21 +172,35 @@ func (p *Provider) exchangeRaw(ctx context.Context, op string, m *mdns.Msg) (*md
 	if err := r.Unpack(raw); err != nil {
 		return nil, &ioAfterSend{wrap(err)}
 	}
+	// From here on a parsed reply exists. A reply we cannot trust (unsigned,
+	// signed by another key, a MAC that does not verify) is refused, but it does
+	// not prove the server refused the request: for an UPDATE the outcome is
+	// unknown (ioAfterSend). Only an explicit rejection is definitive: an
+	// unsigned NOTAUTH/REFUSED/FORMERR/NOTIMP/NOTZONE (servers answer unsigned
+	// when they cannot verify the request), or a TSIG error the server reports.
 	t := r.IsTsig()
 	if t == nil {
-		if r.Rcode == mdns.RcodeNotAuth {
+		switch r.Rcode {
+		case mdns.RcodeNotAuth:
 			return nil, authErr(op, "unsigned NOTAUTH reply")
+		case mdns.RcodeRefused, mdns.RcodeFormatError, mdns.RcodeNotImplemented, mdns.RcodeNotZone:
+			return nil, fmt.Errorf("rfc2136: %s: server refused the request with an unsigned %s reply", op, mdns.RcodeToString[r.Rcode])
 		}
-		return nil, fmt.Errorf("rfc2136: %s: server response is not TSIG-signed; refusing it", op)
+		return nil, &ioAfterSend{fmt.Errorf("rfc2136: %s: server response (%s) is not TSIG-signed; refusing it", op, mdns.RcodeToString[r.Rcode])}
 	}
 	if e := tsigErrorFromCode(op, p.keyName, int(t.Error)); e != nil {
 		return nil, e
 	}
+	if r.Rcode == mdns.RcodeNotAuth {
+		// the TSIG library cannot verify a NOTAUTH message at all (it rejects
+		// the rcode before checking the MAC); the server said no either way
+		return nil, authErr(op, "signed NOTAUTH reply")
+	}
 	if !strings.EqualFold(t.Hdr.Name, p.keyName) {
-		return nil, fmt.Errorf("rfc2136: %s: response signed with an unexpected key %q; refusing it", op, t.Hdr.Name)
+		return nil, &ioAfterSend{fmt.Errorf("rfc2136: %s: response signed with an unexpected key %q; refusing it", op, t.Hdr.Name)}
 	}
 	if err := mdns.TsigVerify(raw, p.secret().Reveal(), reqMAC, false); err != nil {
-		return nil, tsigVerifyError(op, p.keyName, err)
+		return nil, &ioAfterSend{tsigVerifyError(op, p.keyName, err)}
 	}
 	return r, nil
 }
@@ -390,16 +404,48 @@ func (p *Provider) lookup(ctx context.Context, name, typ string) ([]dns.Record, 
 	return out, nil
 }
 
+// update sends one UPDATE. Errors before it was written (TSIG signing, dial)
+// are plain. After that, only an explicit refusal is definitive (REFUSED,
+// NOTAUTH, NOTZONE, FORMERR, NOTIMP, the prerequisite failures NXRRSET/YXRRSET
+// /NXDOMAIN/YXDOMAIN, or a TSIG error the server reports); SERVFAIL (a journal
+// failure, or a forwarded update whose primary timed out, may still have been
+// applied), an unknown rcode, an untrusted reply (unsigned, wrong key, MAC
+// that does not verify), a garbled reply and an I/O failure wrap
+// dns.ErrUnconfirmed.
 func (p *Provider) update(ctx context.Context, op, zone string, f func(*mdns.Msg)) error {
 	m := new(mdns.Msg)
 	m.SetUpdate(fqdn(zone))
 	f(m)
-	_, err := p.exchange(ctx, op, m)
+	r, err := p.exchangeRaw(ctx, op, m)
+	if err == nil {
+		err = updateRcodeErr(op, r)
+	}
 	var amb *ioAfterSend
 	if errors.As(err, &amb) {
-		return fmt.Errorf("rfc2136: %s: the update may have been applied but the outcome is unknown (%v): %w: %w", op, amb.err, dns.ErrUnconfirmed, amb.err)
+		return fmt.Errorf("rfc2136: %s: the update may have been applied but the outcome is unknown (%v): %w: %w", op, amb.err, dns.ErrUnconfirmed, amb.err) // amb.err text is already scrubbed
 	}
 	return err
+}
+
+// updateRcodeErr classifies the rcode of a trusted (TSIG-verified) UPDATE reply.
+func updateRcodeErr(op string, r *mdns.Msg) error {
+	switch r.Rcode {
+	case mdns.RcodeSuccess:
+		return nil
+	case mdns.RcodeNotAuth:
+		return authErr(op, "signed reply")
+	case mdns.RcodeRefused:
+		return fmt.Errorf("rfc2136: %s: refused by the server (REFUSED); the TSIG key may not be permitted to update this zone", op)
+	case mdns.RcodeYXRrset, mdns.RcodeNXRrset, mdns.RcodeYXDomain, mdns.RcodeNameError:
+		return fmt.Errorf("rfc2136: %s: the record set changed concurrently (prerequisite failed: %s); retry: %w", op, mdns.RcodeToString[r.Rcode], dns.ErrRecordExists)
+	case mdns.RcodeNotZone, mdns.RcodeFormatError, mdns.RcodeNotImplemented:
+		return fmt.Errorf("rfc2136: %s: server rejected the update (%s)", op, mdns.RcodeToString[r.Rcode])
+	}
+	name := mdns.RcodeToString[r.Rcode]
+	if name == "" {
+		name = fmt.Sprintf("rcode %d", r.Rcode)
+	}
+	return &ioAfterSend{fmt.Errorf("rfc2136: %s: server returned %s", op, name)}
 }
 
 func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) (dns.Record, error) {

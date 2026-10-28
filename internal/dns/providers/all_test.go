@@ -162,8 +162,8 @@ func TestProviderNeverFormatsCredentials(t *testing.T) {
 // any reachable string or byte slice contains a credential: the property must
 // hold structurally, not only for the formatting verbs above.
 //
-// The walk deliberately stops at the internals of the standard library's
-// network types (see walkSkipPkgs): net/http's transport legitimately holds
+// The walk deliberately stops at the standard library's connection-pool
+// plumbing (see skipType): net/http's transport legitimately holds
 // recently written request bytes, including the Authorization header, in its
 // keep-alive connection buffers. That is outside what fmt can reach through
 // the provider and is not something the provider can change without disabling
