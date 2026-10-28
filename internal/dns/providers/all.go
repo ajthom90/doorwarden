@@ -5,4 +5,6 @@ package providers
 import (
 	_ "github.com/ajthom90/doorwarden/internal/dns/providers/cloudflare"
 	_ "github.com/ajthom90/doorwarden/internal/dns/providers/fake"
+	_ "github.com/ajthom90/doorwarden/internal/dns/providers/rfc2136"
+	_ "github.com/ajthom90/doorwarden/internal/dns/providers/route53"
 )
