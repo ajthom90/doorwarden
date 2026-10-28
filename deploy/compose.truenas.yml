@@ -1,0 +1,92 @@
+# Doorwarden + Traefik + read-only Docker socket proxy.
+# Paste into a TrueNAS Custom App (YAML) or run with `docker compose`.
+# Paths are relative to this file; on TrueNAS replace them with dataset paths
+# (host path volumes), e.g. /mnt/<pool>/apps/doorwarden/...
+#
+# Layout expected next to this file:
+#   config/doorwarden.yaml   Doorwarden config
+#   data/                    SQLite state + certificates (data/certs/)
+#   traefik-dynamic/         file-provider output written by Doorwarden
+#   traefik/traefik.yml      static config (deploy/traefik/traefik.yml)
+
+name: doorwarden
+
+services:
+  doorwarden:
+    image: ghcr.io/ajthom90/doorwarden:${DOORWARDEN_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      DOORWARDEN_MASTER_KEY: ${DOORWARDEN_MASTER_KEY:?set DOORWARDEN_MASTER_KEY}
+      TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
+      DNS_API_TOKEN: ${DNS_API_TOKEN:-}
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+      - ./traefik-dynamic:/etc/traefik/dynamic:rw
+    networks:
+      - default   # outbound: DNS provider APIs, ACME, TrueNAS API
+      - socket    # internal-only path to the Docker socket proxy
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/doorwarden", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  traefik:
+    image: traefik:v3.5
+    restart: unless-stopped
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-80}:80"
+      - "${TRAEFIK_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik-dynamic:/etc/traefik/dynamic:ro
+      - ./data/certs:/certs:ro   # certificates written by Doorwarden
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"   # list/inspect containers (discovery)
+      POST: "0"         # no state-changing requests at all
+      # Everything else denied explicitly.
+      AUTH: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      DISTRIBUTION: "0"
+      EXEC: "0"
+      IMAGES: "0"
+      INFO: "0"
+      NETWORKS: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      VOLUMES: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket
+    # No ports: published to nothing, reachable only on the internal network.
+    # Doorwarden's docker source host: tcp://docker-socket-proxy:2375
+
+networks:
+  default: {}
+  socket:
+    internal: true
