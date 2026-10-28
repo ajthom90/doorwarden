@@ -3,6 +3,7 @@
 package providers
 
 import (
+	_ "github.com/ajthom90/doorwarden/internal/dns/providers/adguard"
 	_ "github.com/ajthom90/doorwarden/internal/dns/providers/cloudflare"
 	_ "github.com/ajthom90/doorwarden/internal/dns/providers/fake"
 	_ "github.com/ajthom90/doorwarden/internal/dns/providers/pihole"
