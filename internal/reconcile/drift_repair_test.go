@@ -508,8 +508,8 @@ func TestDNSE2ECrashBetweenDeleteAndRowDeleteOwnerReturns(t *testing.T) {
 	}
 }
 
-// Same crash, but past grace: the (missing) record's row is deleted later
-// without trouble, and a returning owner then creates it as new.
+// A record deleted out of band is re-created the next cycle (same row, new
+// provider ID), and the world then converges with no further writes.
 func TestDNSE2EManualDeletionRepairedNextCycle(t *testing.T) {
 	w := newWorld(t, "per-host")
 	app := pub("docker:app", "app", dz, 80)
