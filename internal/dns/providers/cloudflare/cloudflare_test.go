@@ -27,17 +27,18 @@ type rec struct {
 }
 
 type backend struct {
-	zeroPages bool   // report total_pages: 0
-	delFail   bool   // DELETE answers success:false
-	raw       string // when set, replaces the dns_records list response body (HTTP 200)
-	noInfo    bool   // omit result_info from list responses
-	perPage   int    // page size (default 3)
-	mu        sync.Mutex
-	n         int
-	recs      []rec
-	zones     map[string]string
-	status    int // when non-zero, every request fails with it
-	slow      time.Duration
+	getByID400 bool   // GET of a record by ID answers 400 (a malformed request, not "not found")
+	zeroPages  bool   // report total_pages: 0
+	delFail    bool   // DELETE answers success:false
+	raw        string // when set, replaces the dns_records list response body (HTTP 200)
+	noInfo     bool   // omit result_info from list responses
+	perPage    int    // page size (default 3)
+	mu         sync.Mutex
+	n          int
+	recs       []rec
+	zones      map[string]string
+	status     int // when non-zero, every request fails with it
+	slow       time.Duration
 }
 
 func newBackend() *backend {
@@ -167,6 +168,10 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case "GET":
+		if b.getByID400 {
+			fail(400, "Invalid request")
+			return
+		}
 		reply(200, map[string]any{"success": true, "result": toJSON(b.recs[i])})
 	case "PATCH":
 		var in struct {
@@ -399,5 +404,27 @@ func TestDeleteByIDVerifiesNameAndCheckSuccess(t *testing.T) {
 	b.delFail = false
 	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: "a1", Name: "a.example.test", Type: "A"}); err != nil || len(b.recs) != 0 {
 		t.Fatalf("err=%v recs=%d", err, len(b.recs))
+	}
+}
+
+func TestOnly404MeansNotFoundByID(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.recs = append(b.recs, rec{ID: "a1", Name: "a.example.test", Type: "A", Content: "192.0.2.1", TTL: 1, zone: "example.test"})
+	p := newProvider(t, b, fakeToken)
+	// unknown ID: 404 => ErrNotFound / no-op delete
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{ID: "nope", Name: "a.example.test", Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: "nope"}); err != nil {
+		t.Fatal(err)
+	}
+	// a 400 is NOT "not found": Delete must not silently succeed
+	b.getByID400 = true
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{ID: "a1"}); err == nil {
+		t.Fatal("400 on get-by-ID treated as not found")
+	}
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{ID: "a1", Name: "a.example.test", Type: "A", Value: "192.0.2.2"}); err == nil || errors.Is(err, dns.ErrNotFound) {
+		t.Fatalf("err = %v", err)
 	}
 }

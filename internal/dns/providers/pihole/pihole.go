@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -274,9 +275,14 @@ func parseCNAME(entry string) ([]dns.Record, error) {
 		}
 	}
 	ttl := 0
-	if len(f) >= 3 && isWholeNumber(f[len(f)-1]) {
-		n, err := strconv.Atoi(f[len(f)-1])
-		if err != nil || n < 0 {
+	last := f[len(f)-1]
+	if numberish.MatchString(last) && !isWholeNumber(last) {
+		// "-1", "+5", "30s": a malformed TTL, not a host name
+		return nil, fmt.Errorf("unparseable entry %q (bad TTL %q)", entry, last)
+	}
+	if len(f) >= 3 && isWholeNumber(last) {
+		n, err := strconv.Atoi(last)
+		if err != nil {
 			return nil, fmt.Errorf("unparseable entry %q (bad TTL)", entry)
 		}
 		ttl = n
@@ -292,6 +298,10 @@ func parseCNAME(entry string) ([]dns.Record, error) {
 	}
 	return out, nil
 }
+
+// numberish matches a final field that starts like a number (optional sign,
+// digits, optional letters) but is not all digits.
+var numberish = regexp.MustCompile(`^[+-]?[0-9]+[A-Za-z]*$|^[+-]$`)
 
 func isWholeNumber(s string) bool {
 	if s == "" {
@@ -413,12 +423,12 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if len(old) != 1 {
 		return dns.Record{}, fmt.Errorf("pihole: %s %s has %d entries; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(old), dns.ErrRecordExists)
 	}
-	if old[0].shared {
-		return dns.Record{}, fmt.Errorf("pihole: %s is on a hosts line naming several hosts; refusing to edit it: %w", r.Name, dns.ErrRecordExists)
-	}
 	if old[0].Value == r.Value {
 		r.TTL = 0
-		return r, nil // already the requested value
+		return r, nil // already the requested value: nothing to edit, even on a shared line
+	}
+	if old[0].shared {
+		return dns.Record{}, fmt.Errorf("pihole: %s is on a hosts line naming several hosts; refusing to edit it: %w", r.Name, dns.ErrRecordExists)
 	}
 	// add the new entry first so the name never disappears, then drop the old ones
 	if err := p.do(ctx, "update record "+r.Name, "PUT", entryPath(r), nil, nil); err != nil {

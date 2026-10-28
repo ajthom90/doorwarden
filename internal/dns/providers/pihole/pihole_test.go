@@ -319,7 +319,7 @@ func TestListingFailsClosedAndSIDScrubbed(t *testing.T) {
 func TestCNAMEParsingMultipleAliasesAndTTL(t *testing.T) {
 	ctx := context.Background()
 	b := newBackend()
-	b.cnames = []string{"a.example.test,b.example.test,target.example.test,300", "x.example.test,y.example.test,t2.example.test", "solo.example.test,t3.example.test,60", "p.example.test,t4.example.test"}
+	b.cnames = []string{"a.example.test,b.example.test,target.example.test,300", "x.example.test,y.example.test,t2.example.test", "solo.example.test,t3.example.test,60", "p.example.test,t4.example.test", "num.example.test,123"}
 	p := newProvider(t, b, password)
 	recs, err := p.ListRecords(ctx, "example.test")
 	if err != nil {
@@ -333,6 +333,7 @@ func TestCNAMEParsingMultipleAliasesAndTTL(t *testing.T) {
 		"a.example.test": {"target.example.test", "300"}, "b.example.test": {"target.example.test", "300"},
 		"x.example.test": {"t2.example.test", "0"}, "y.example.test": {"t2.example.test", "0"},
 		"solo.example.test": {"t3.example.test", "60"}, "p.example.test": {"t4.example.test", "0"},
+		"num.example.test": {"123", "0"}, // two fields: a numeric last field is the target, not a TTL
 	}
 	if len(got) != len(want) {
 		t.Fatalf("recs = %+v", recs)
@@ -347,7 +348,7 @@ func TestCNAMEParsingMultipleAliasesAndTTL(t *testing.T) {
 	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "b.example.test", Type: "A", Value: "192.0.2.1"}); !errors.Is(err, dns.ErrRecordExists) {
 		t.Fatalf("second alias did not block: %v", err)
 	}
-	for _, bad := range []string{"onlyone", "a,,b", ",a,b", "a,b,99999999999999999999"} {
+	for _, bad := range []string{"onlyone", "a,,b", ",a,b", "a,b,99999999999999999999", "a,b,-1", "a,b,+5", "a,b,30s", "a,-1", "a,b,5m"} {
 		b.cnames = []string{bad}
 		if _, err := p.ListRecords(ctx, "example.test"); err == nil {
 			t.Errorf("malformed %q accepted", bad)
@@ -380,5 +381,17 @@ func TestConcurrentFirstUseLogsInOnce(t *testing.T) {
 	wg.Wait()
 	if b.logins != 1 {
 		t.Fatalf("logins = %d, want 1 (session leak)", b.logins)
+	}
+}
+
+func TestSameValueUpdateOnSharedLineIsNoOp(t *testing.T) {
+	b := newBackend()
+	b.hosts = []string{"192.0.2.5 one.example.test two.example.test"}
+	p := newProvider(t, b, password)
+	if _, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "one.example.test", Type: "A", Value: "192.0.2.5"}); err != nil {
+		t.Fatalf("same-value update on a shared line: %v", err)
+	}
+	if b.puts != 0 || len(b.hosts) != 1 {
+		t.Fatalf("puts=%d hosts=%v", b.puts, b.hosts)
 	}
 }

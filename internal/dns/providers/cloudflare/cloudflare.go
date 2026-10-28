@@ -316,7 +316,7 @@ func (p *Provider) targets(ctx context.Context, zid string, r dns.Record) ([]api
 		}
 		_, err := p.c.Do(ctx, "GET", "/zones/"+zid+"/dns_records/"+url.PathEscape(r.ID), nil, p.hdr(), nil, &out)
 		var se *httpx.StatusError
-		if errors.As(err, &se) && (se.Status == 404 || se.Status == 400) {
+		if errors.As(err, &se) && se.Status == 404 { // only 404 means "no such record"; any other 4xx is a real error
 			return nil, nil
 		}
 		if err != nil {

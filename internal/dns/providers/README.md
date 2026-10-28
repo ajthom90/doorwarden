@@ -40,6 +40,22 @@ itself from `init()`.
    429), that a recognisable fake secret never appears in any error string,
    context cancellation, and the capabilities your instance reports.
 
+## Credentials in provider structs
+
+fmt prints struct fields by reflection, dereferencing pointers and ignoring
+`String`/`Format` methods behind unexported fields, so a secret stored anywhere
+reachable from a Provider can leak (`%s` of a dereferenced copy, a struct
+containing the provider, a log line). Therefore a Provider keeps **no
+secret-bearing value reachable by reflection**: tokens, passwords, TSIG
+secrets, session ids, derived `Authorization` strings, scrub lists and SDK
+clients that embed credentials live only inside closures (func-typed fields
+print as addresses). Use `dns.StaticSecret`, `dns.SecretCell`, `dns.Scrubber`
+and `httpx.Client.AddSecret`; mutexes are pointers (so `go vet` copylocks stays
+quiet when the struct is copied); give the Provider value-receiver `String`,
+`GoString` and `Format` that call `dns.RedactedFormat`. `all_test.go` formats
+every provider with every verb and walks it by reflection; add your type to
+`leakConfigs`.
+
 ## Security rules for provider URLs
 
 - Providers for a fixed public SaaS endpoint (cloudflare, route53) do **not**
@@ -75,8 +91,9 @@ substitution produces.
 `dns.New` rejects config keys that are not declared in the provider's schema
 (the error names the key and lists the valid ones), so a typo such as
 `wildcrd: true` can never silently change behaviour. Declare every key your
-factory reads in `ConfigSchema`; boolean options must be real bools
-(`httpx.BoolOption` returns an error otherwise).
+factory reads in `ConfigSchema`; read boolean options with `httpx.BoolOption`,
+which accepts bools and the strings `"true"`/`"false"` and errors on anything
+else.
 
 ## Network behaviour
 
@@ -98,8 +115,8 @@ foreign records of other types read-only where its API exposes them.
 | type | writable types | wildcard A | TTL | IDs | notes |
 |---|---|---|---|---|---|
 | cloudflare | all via API | yes | yes | yes | token needs Zone:Read + DNS:Edit; records never proxied; Update refuses when several records match (name, type) |
-| route53 | A, AAAA, CNAME | yes | yes | no | zone auto-discovery by longest suffix; public preferred; a private zone only with `hosted_zone_id`; empty keys use the default AWS credential chain; TXT is not writable (quoting not implemented); Update refuses multi-value and alias sets, is a single compare-and-swap change batch, and every response is validated and every write re-read |
-| rfc2136 | A, AAAA, CNAME, TXT | yes | yes | no | TSIG mandatory and every response must be signed; listing is AXFR, so the server needs `allow-transfer` for the key; Update refuses multi-value sets; A is refused where a CNAME exists |
+| route53 | A, AAAA, CNAME | yes | yes | no | zone auto-discovery by longest suffix; public preferred; a private zone only with `hosted_zone_id`, which binds the provider to that one zone (every other zone is refused); empty keys use the default AWS credential chain; TXT is not writable (quoting not implemented); Update refuses multi-value and alias sets, is a single compare-and-swap change batch, and every response is validated and every write re-read, polling for up to 60s because Route 53 reads may lag a change |
+| rfc2136 | A, AAAA, CNAME (TXT listed read-only) | yes | yes | no | TSIG mandatory and every response must be signed; listing is AXFR, so the server needs `allow-transfer` for the key; Update uses RFC 2136 prerequisites; refuses multi-value sets; A is refused where a CNAME exists; the key_secret must be valid base64 |
 | unifi | A | only with `wildcard: true` | yes | yes | Integration API DNS policies; other policy types are listed read-only (CNAME, AAAA, FORWARD_DOMAIN...); set `wildcard: true` only after confirming your controller accepts `*.zone` policies; a disabled policy or a CNAME/FORWARD_DOMAIN policy at the same name blocks Create; list pagination fails closed and retries once if totalCount drifts |
 | technitium | A, AAAA, CNAME, TXT | yes | yes | no | token or username+password; Update preserves ttl, disabled flag and comments |
 | pihole | A, AAAA | no (dnsmasq `address=/.zone/ip` is not manageable through the API) | no | no | v6 API; user CNAMEs (`dns.cnameRecords`, every alias of `alias[,alias],target[,ttl]`) are listed read-only and block an A at the same name; hosts lines naming several hosts are never edited; session re-auth; the provider implements `io.Closer` (ends the session), and since the registry has no lifecycle hook the owner of the Provider should close it |

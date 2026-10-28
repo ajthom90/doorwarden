@@ -310,3 +310,45 @@ func TestCNAMEBlocksARecord(t *testing.T) {
 		t.Fatal("conflicting rewrite created")
 	}
 }
+
+func TestUpdateBodyIsByteFaithful(t *testing.T) {
+	const stored = `{"zeta":1,"domain":"Mixed.Example.Test.","answer":"192.0.2.1","big":12345678901234567890,"enabled":false,"nested":{"b":2,"a":[1,2]}}`
+	var got struct{ Target, Update json.RawMessage }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/control/rewrite/list":
+			_, _ = w.Write([]byte("[" + stored + "]"))
+		case "/control/rewrite/update":
+			_ = json.NewDecoder(r.Body).Decode(&got)
+		}
+	}))
+	defer srv.Close()
+	p, err := adguard.New(adguard.Config{URL: srv.URL, Username: user, Password: password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "mixed.example.test", Type: "A", Value: "192.0.2.2"}); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Target) != stored {
+		t.Fatalf("target not sent unchanged:\n got %s\nwant %s", got.Target, stored)
+	}
+	want := strings.Replace(stored, `"answer":"192.0.2.1"`, `"answer":"192.0.2.2"`, 1)
+	if string(got.Update) != want {
+		t.Fatalf("update changed more than the answer:\n got %s\nwant %s", got.Update, want)
+	}
+}
+
+func TestKeepRewriteBlocksARecord(t *testing.T) {
+	b := &backend{rws: []rw{{Domain: "k.example.test", Answer: "A"}, {Domain: "k6.example.test", Answer: "AAAA"}}}
+	p := newProvider(t, b, password)
+	for _, n := range []string{"k.example.test", "k6.example.test"} {
+		_, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: n, Type: "A", Value: "192.0.2.1"})
+		if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "KEEP") {
+			t.Fatalf("%s: err = %v", n, err)
+		}
+	}
+	if len(b.rws) != 2 {
+		t.Fatal("rewrite created over a KEEP rewrite")
+	}
+}

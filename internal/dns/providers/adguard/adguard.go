@@ -238,7 +238,10 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 		if e.rec.Name != r.Name {
 			continue
 		}
-		if (r.Type == "CNAME" && (e.rec.Type == "A" || e.rec.Type == "AAAA")) || (r.Type != "CNAME" && e.rec.Type == "CNAME") {
+		// KEEP ("A"/"AAAA" answers) is the user's explicit pass-through-to-upstream
+		// choice for the name, so it conflicts like a CNAME does
+		if (r.Type == "CNAME" && (e.rec.Type == "A" || e.rec.Type == "AAAA" || e.rec.Type == "KEEP")) ||
+			(r.Type != "CNAME" && (e.rec.Type == "CNAME" || e.rec.Type == "KEEP")) {
 			return dns.Record{}, fmt.Errorf("adguard: %s already has a %s rewrite, which cannot coexist with %s: %w", r.Name, e.rec.Type, r.Type, dns.ErrRecordExists)
 		}
 	}
@@ -268,10 +271,11 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	default:
 		return dns.Record{}, fmt.Errorf("adguard: %s %s has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(old), dns.ErrRecordExists)
 	}
-	upd := map[string]any{}
-	_ = json.Unmarshal(old[0].raw, &upd) // keep fields we do not model (for example "enabled")
-	upd["domain"], upd["answer"] = r.Name, r.Value
-	body := map[string]any{"target": old[0].raw, "update": upd}
+	upd, err := withAnswer(old[0].raw, r.Value)
+	if err != nil {
+		return dns.Record{}, fmt.Errorf("adguard: update rewrite %s: %w", r.Name, err)
+	}
+	body := map[string]json.RawMessage{"target": old[0].raw, "update": upd}
 	_, err = p.c.Do(ctx, "PUT", "/control/rewrite/update", nil, p.hdr(), body, nil)
 	var se *httpx.StatusError
 	if errors.As(err, &se) && (se.Status == 404 || se.Status == 405) {
@@ -289,6 +293,49 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	r.TTL = 0
 	return r, nil
+}
+
+// withAnswer returns raw with only the value of "answer" replaced. Key order,
+// unknown fields, number text and the stored domain (including its case and
+// trailing dot) are kept byte for byte.
+func withAnswer(raw json.RawMessage, answer string) (json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, errors.New("rewrite is not a JSON object")
+	}
+	newAns, _ := json.Marshal(answer)
+	var out bytes.Buffer
+	out.WriteByte('{')
+	replaced := false
+	for first := true; dec.More(); first = false {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := kt.(string)
+		if !ok {
+			return nil, errors.New("rewrite has a non-string key")
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return nil, err
+		}
+		if key == "answer" {
+			val, replaced = newAns, true
+		}
+		if !first {
+			out.WriteByte(',')
+		}
+		kb, _ := json.Marshal(key)
+		out.Write(kb)
+		out.WriteByte(':')
+		out.Write(val)
+	}
+	if !replaced {
+		return nil, errors.New("rewrite has no answer field")
+	}
+	out.WriteByte('}')
+	return out.Bytes(), nil
 }
 
 func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) error {
