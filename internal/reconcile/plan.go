@@ -1,0 +1,435 @@
+package reconcile
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/ajthom90/doorwarden/internal/config"
+	"github.com/ajthom90/doorwarden/internal/dns"
+	"github.com/ajthom90/doorwarden/internal/model"
+	"github.com/ajthom90/doorwarden/internal/store"
+)
+
+const (
+	maxHostname  = 253
+	defaultGrace = 24 * time.Hour
+)
+
+type zoneInfo struct {
+	name, mode, strategy, provider, issuer string
+	recType, value                         string // desired record; recType "" if target_ip is unusable
+}
+
+// entry is one unique desired service with its resolved hostname.
+type entry struct {
+	svc        model.Service
+	zone, host string
+	err        error
+}
+
+type planner struct {
+	obs       Observed
+	now       time.Time
+	grace     time.Duration
+	zones     map[string]*zoneInfo
+	zoneNames []string // config order, normalized
+	foreign   map[string][]dns.Record
+	out       []Action
+}
+
+// Plan computes the actions that bring the world in line with desired. It is
+// pure: no I/O, no clock, inputs are not modified, output order is
+// deterministic. See the package documentation for the rules.
+func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Time) []Action {
+	if cfg == nil {
+		return nil // fail closed: no config, no changes
+	}
+	p := newPlanner(obs, cfg, now)
+
+	entries := p.dedupe(desired)
+	present := map[string]bool{}
+	var claims []claimant
+	for _, e := range entries {
+		present[e.svc.Key] = true
+		if e.err == nil {
+			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host})
+		}
+	}
+	for _, k := range sortedKnown(obs.Known) {
+		if !present[k.Key] && p.unavailable(k) && k.Hostname != "" {
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true})
+		}
+	}
+	winners, losers := resolveHostnames(claims)
+
+	routed := map[string][]string{} // zone -> hostnames that get a RouteWrite
+	for _, e := range entries {
+		if k, ok := obs.Known[e.svc.Key]; ok && k.RemovedAfter != nil {
+			p.emit(Action{Kind: CancelRemoval, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc),
+				Reason: "service is present again"})
+		}
+		if e.err != nil {
+			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()})
+			continue
+		}
+		if why, lost := losers[e.svc.Key]; lost {
+			p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: why})
+			continue
+		}
+		if p.planService(e) {
+			routed[e.zone] = append(routed[e.zone], e.host)
+		}
+	}
+	for _, zn := range p.zoneNames {
+		if hosts := routed[zn]; len(hosts) > 0 {
+			p.planZone(p.zones[zn], hosts)
+		}
+	}
+	p.planRemovals(present, winners)
+
+	sortActions(p.out)
+	return p.out
+}
+
+func newPlanner(obs Observed, cfg *config.Config, now time.Time) *planner {
+	p := &planner{obs: obs, now: now, grace: cfg.Settings.GracePeriod, zones: map[string]*zoneInfo{},
+		foreign: map[string][]dns.Record{}}
+	if p.grace <= 0 {
+		p.grace = defaultGrace
+	}
+	for _, z := range cfg.Zones {
+		n := normName(z.Name)
+		if n == "" || p.zones[n] != nil {
+			continue // first definition wins; validation rejects duplicates
+		}
+		zi := &zoneInfo{name: n, mode: z.Records.Mode, strategy: z.Certificate.Strategy,
+			provider: z.Records.Provider, issuer: z.Certificate.Issuer}
+		if zi.strategy == "" {
+			zi.strategy = "wildcard"
+		}
+		if ip, err := netip.ParseAddr(strings.TrimSpace(z.TargetIP)); err == nil {
+			zi.recType, zi.value = "A", ip.String()
+			if !ip.Unmap().Is4() {
+				zi.recType = "AAAA"
+			} else {
+				zi.value = ip.Unmap().String()
+			}
+		}
+		p.zones[n] = zi
+		p.zoneNames = append(p.zoneNames, n)
+	}
+	for k, recs := range obs.Foreign {
+		if i := strings.LastIndexByte(k, '/'); i >= 0 {
+			nk := k[:i] + "/" + normName(k[i+1:])
+			p.foreign[nk] = append(p.foreign[nk], recs...)
+		}
+	}
+	return p
+}
+
+func (p *planner) emit(a Action) { p.out = append(p.out, a) }
+
+// unavailable reports whether a known service's source state is unknown this
+// cycle. A known service without a recorded source is treated as unknown.
+func (p *planner) unavailable(k KnownService) bool {
+	return k.Source == "" || p.obs.Unavailable[k.Source]
+}
+
+// dedupe keeps the last occurrence of each key (matching the approval gate's
+// last-wins), reports earlier ones as Invalid, resolves hostnames and returns
+// the entries sorted by key.
+func (p *planner) dedupe(desired []model.Service) []entry {
+	last := map[string]int{}
+	for i, s := range desired {
+		last[s.Key] = i
+	}
+	var out []entry
+	for i, s := range desired {
+		e := p.resolve(s)
+		if last[s.Key] != i {
+			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
+				Reason: fmt.Sprintf("duplicate service key %q; the later entry wins", s.Key)})
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].svc.Key < out[j].svc.Key })
+	return out
+}
+
+func (p *planner) resolve(s model.Service) entry {
+	def := ""
+	if len(p.zoneNames) > 0 {
+		def = p.zoneNames[0]
+	}
+	e := entry{svc: s, zone: normName(s.Zone)}
+	if e.zone == "" {
+		e.zone = def
+	}
+	h, err := model.Hostname(s, p.zoneNames, def)
+	switch {
+	case err != nil:
+		e.err = err
+	case len(h) > maxHostname:
+		e.host, e.err = h, fmt.Errorf("hostname %s is %d characters; the limit is %d (253)", h, len(h), maxHostname)
+	default:
+		e.host = normName(h)
+	}
+	return e
+}
+
+// planService emits the per-service actions for a hostname winner and
+// reports whether a RouteWrite was emitted.
+func (p *planner) planService(e entry) bool {
+	s, z := e.svc, p.zones[e.zone]
+	lk, haveLK := p.obs.LastKnown[s.Key]
+	_, isKnown := p.obs.Known[s.Key]
+	switch s.State {
+	case model.StatePublished:
+		b := s.Backend
+		if !authoritative(b) {
+			if !haveLK {
+				p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
+					Reason: "published service has no backend (host/port) and no last-known backend"})
+				return false
+			}
+			b = lk
+		}
+		if z.mode == "per-host" {
+			p.ensureRecord(z, e.host, s.Key, &s)
+		}
+		if z.issuer != "" && z.strategy == "per-host" && !p.covered(e.host) {
+			p.emit(Action{Kind: CertEnsure, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
+				Names: []string{e.host}, Issuer: z.issuer})
+		}
+		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b})
+		return true
+	case model.StateStopped, model.StateError:
+		if !isKnown {
+			return false
+		}
+		if !haveLK || !authoritative(lk) {
+			p.emit(Action{Kind: Skip, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
+				Reason: "service is " + s.State + " and has no last-known backend; existing route left untouched"})
+			return false
+		}
+		b := lk
+		p.emit(Action{Kind: RouteWrite, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s), Backend: &b,
+			Reason: "service is " + s.State + "; rendering last-known backend"})
+		return true
+	}
+	return false // pending, discovered, ...: nothing is created and nothing removed
+}
+
+// planZone emits zone-level actions (wildcard record, wildcard/san certs)
+// for a zone with at least one routed hostname.
+func (p *planner) planZone(z *zoneInfo, hosts []string) {
+	if z.mode == "wildcard" {
+		p.ensureRecord(z, "*."+z.name, "", nil)
+	}
+	if z.issuer == "" {
+		return
+	}
+	switch z.strategy {
+	case "wildcard":
+		names := []string{"*." + z.name, z.name}
+		if !p.covered(names...) {
+			p.emit(Action{Kind: CertEnsure, Zone: z.name, Host: names[0], Names: names, Issuer: z.issuer})
+		}
+	case "san":
+		names := append([]string{}, hosts...)
+		sort.Strings(names)
+		if !p.covered(names...) {
+			p.emit(Action{Kind: CertEnsure, Zone: z.name, Host: names[0], Names: names, Issuer: z.issuer})
+		}
+	}
+}
+
+// ensureRecord emits DNSEnsure for name unless an owned record already has
+// the desired value, or Conflict if a foreign record holds the name. key is
+// the service key ("" for the wildcard record).
+func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) {
+	owner := key
+	if owner == "" {
+		owner = WildcardOwnerKey(z.name)
+	}
+	if z.recType == "" {
+		p.emit(Action{Kind: Skip, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Reason: "zone target_ip is not a valid IP; no DNS record planned"})
+		return
+	}
+	want := dns.Record{Name: name, Type: z.recType, Value: z.value}
+	if o := p.owned(z, name, z.recType); o != nil {
+		if sameValue(o.Value, z.value) {
+			return // idempotent; ownership transfer between keys is not the plan's job
+		}
+		want.ID = o.ProviderRecordID
+		p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Record: &want, Owner: owner, Reason: "owned record has a different value"})
+		return
+	}
+	for _, f := range p.foreign[z.provider+"/"+z.name] {
+		ft := normType(f.Type)
+		if normName(f.Name) != name || (ft != z.recType && ft != "CNAME") || p.owned(z, name, ft) != nil {
+			continue
+		}
+		fr := dns.Record{ID: f.ID, Name: normName(f.Name), Type: ft, Value: f.Value, TTL: f.TTL}
+		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Record: &fr, Owner: owner,
+			Reason: fmt.Sprintf("foreign record exists: %s %s %s (adopt or skip it)", fr.Name, fr.Type, fr.Value)})
+		return
+	}
+	p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+		Record: &want, Owner: owner})
+}
+
+// owned returns the ownership row for (provider, zone, name, type), if any.
+func (p *planner) owned(z *zoneInfo, name, typ string) *store.DNSRecord {
+	for i := range p.obs.Owned {
+		o := &p.obs.Owned[i]
+		if o.Provider == z.provider && normName(o.Zone) == z.name && normName(o.Name) == name && normType(o.Type) == typ {
+			return o
+		}
+	}
+	return nil
+}
+
+// covered reports whether every name is covered by some cert row that has not
+// expired. Status is ignored (its vocabulary belongs to the ACME manager);
+// renewal timing is the ACME manager's job, not the plan's.
+func (p *planner) covered(names ...string) bool {
+	for _, n := range names {
+		ok := false
+		for _, c := range p.obs.Certs {
+			if c.NotAfter.After(p.now) && certCovers(c, n) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func certCovers(c store.Cert, name string) bool {
+	var domains []string
+	if err := json.Unmarshal([]byte(c.DomainsJSON), &domains); err != nil {
+		return false
+	}
+	for _, d := range domains {
+		d = normName(d)
+		if d == name {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(d, "*."); ok && !strings.HasPrefix(name, "*.") {
+			if i := strings.IndexByte(name, '.'); i > 0 && name[i+1:] == rest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// planRemovals handles known services absent from desired.
+func (p *planner) planRemovals(present map[string]bool, winners map[string]claimant) {
+	for _, k := range sortedKnown(p.obs.Known) {
+		if present[k.Key] || p.unavailable(k) {
+			continue // present, or unknown state: never schedule or remove
+		}
+		zn, host := normName(k.Zone), normName(k.Hostname)
+		if k.RemovedAfter == nil {
+			ra := p.now.Add(p.grace)
+			p.emit(Action{Kind: ScheduleRemoval, Zone: zn, Host: host, Key: k.Key, RemovedAfter: &ra,
+				Reason: "service no longer discovered"})
+			continue
+		}
+		if !p.now.After(*k.RemovedAfter) {
+			continue // still within grace
+		}
+		p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key, Reason: "grace period expired"})
+		z := p.zones[zn]
+		if z == nil || z.mode != "per-host" || host == "" {
+			continue // wildcard record is never deleted automatically
+		}
+		if _, taken := winners[host]; taken {
+			continue // another service now uses this hostname; its record stays
+		}
+		for _, o := range p.obs.Owned {
+			if o.Provider != z.provider || normName(o.Zone) != zn || normName(o.Name) != host || o.OwnerKey != k.Key {
+				continue
+			}
+			rec := dns.Record{ID: o.ProviderRecordID, Name: normName(o.Name), Type: normType(o.Type), Value: o.Value}
+			p.emit(Action{Kind: DNSDelete, Zone: zn, Host: host, Key: k.Key, Provider: z.provider, Record: &rec,
+				Owner: o.OwnerKey, Reason: "grace period expired"})
+		}
+	}
+}
+
+func sortedKnown(m map[string]KnownService) []KnownService {
+	out := make([]KnownService, 0, len(m))
+	for key, k := range m {
+		if k.Key == "" {
+			k.Key = key
+		}
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+func authoritative(b model.Backend) bool { return b.Host != "" && b.Port > 0 }
+
+func sameValue(a, b string) bool {
+	if a == b {
+		return true
+	}
+	x, err1 := netip.ParseAddr(strings.TrimSpace(a))
+	y, err2 := netip.ParseAddr(strings.TrimSpace(b))
+	return err1 == nil && err2 == nil && x.Unmap() == y.Unmap()
+}
+
+func copySvc(s model.Service) *model.Service {
+	s.Options.Middlewares = append([]string(nil), s.Options.Middlewares...)
+	return &s
+}
+
+func copySvcPtr(s *model.Service) *model.Service {
+	if s == nil {
+		return nil
+	}
+	return copySvc(*s)
+}
+
+func sortActions(as []Action) {
+	rank := map[ActionKind]int{}
+	for i, k := range KindOrder {
+		rank[k] = i
+	}
+	key := func(a Action) []string {
+		r := []string{a.Zone, a.Host, a.Key, a.Provider}
+		if a.Record != nil {
+			r = append(r, a.Record.Name, a.Record.Type, a.Record.Value)
+		} else {
+			r = append(r, "", "", "")
+		}
+		return append(r, a.Reason)
+	}
+	sort.SliceStable(as, func(i, j int) bool {
+		if ri, rj := rank[as[i].Kind], rank[as[j].Kind]; ri != rj {
+			return ri < rj
+		}
+		ki, kj := key(as[i]), key(as[j])
+		for n := range ki {
+			if ki[n] != kj[n] {
+				return ki[n] < kj[n]
+			}
+		}
+		return false
+	})
+}
