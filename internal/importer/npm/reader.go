@@ -30,7 +30,17 @@ type Options struct {
 	// (false) snapshots the database, -wal and -shm into a 0700 temp dir
 	// named doorwarden-npm-* and reads that copy.
 	NoCopy bool
+	// Context, when set, aborts a snapshot copy in progress (the temp dir is
+	// removed before Open returns). The CLI wires SIGINT/SIGTERM to it.
+	Context context.Context
 }
+
+// Test seams.
+var (
+	copyFileFn  = copyFile
+	sleepFn     = time.Sleep
+	maxAttempts = 3
+)
 
 // TempPrefix is the name prefix of the temporary snapshot directory. The copy
 // contains NPM's data (including credentials); it is removed on Close and on
@@ -71,35 +81,27 @@ func Open(path string, opts ...Options) (*Reader, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("npm database: %w", err)
 	}
-	cleanup := func() {}
-	if o.NoCopy {
-		if err := checkInPlace(path); err != nil {
-			return nil, err
-		}
-	} else {
-		dir, err := os.MkdirTemp("", TempPrefix+"*")
-		if err != nil {
-			return nil, err
-		}
-		cleanup = func() { os.RemoveAll(dir) }
-		dst := filepath.Join(dir, "database.sqlite")
-		for _, suf := range []string{"", "-wal", "-shm"} {
-			if err := copyFile(path+suf, dst+suf, suf != ""); err != nil {
-				cleanup()
-				return nil, fmt.Errorf("copy npm database: %w", err)
-			}
-		}
-		path = dst
+	ctx := o.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	if !o.NoCopy {
+		return openSnapshot(ctx, path)
+	}
+	if err := checkInPlace(path); err != nil {
+		return nil, err
+	}
+	return openDB(path, true, func() {})
+}
+
+func openDB(path string, readOnlyMode bool, cleanup func()) (*Reader, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		cleanup()
 		return nil, err
 	}
-	q := url.Values{
-		"_pragma": {"query_only(1)", "busy_timeout(5000)"},
-	}
-	if o.NoCopy {
+	q := url.Values{"_pragma": {"query_only(1)", "busy_timeout(5000)"}}
+	if readOnlyMode {
 		q.Set("mode", "ro")
 	}
 	u := url.URL{Scheme: "file", Path: abs, RawQuery: q.Encode()}
@@ -110,6 +112,74 @@ func Open(path string, opts ...Options) (*Reader, error) {
 	}
 	db.SetMaxOpenConns(1)
 	return &Reader{db: db, cleanup: cleanup}, nil
+}
+
+type fileSig struct {
+	size, mtime int64
+}
+
+func sigOf(path string) fileSig {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileSig{-1, 0}
+	}
+	return fileSig{fi.Size(), fi.ModTime().UnixNano()}
+}
+
+// openSnapshot copies db/-wal/-shm into a private 0700 temp dir and opens the
+// copy. Because a live NPM can checkpoint between the sequential copies, the
+// source's size/mtime are compared before and after, and the copy must pass
+// PRAGMA quick_check; otherwise the copy is discarded and retried.
+func openSnapshot(ctx context.Context, path string) (*Reader, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			sleepFn(time.Duration(attempt-1) * 200 * time.Millisecond)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		dir, err := os.MkdirTemp("", TempPrefix+"*")
+		if err != nil {
+			return nil, err
+		}
+		cleanup := func() { os.RemoveAll(dir) }
+		dst := filepath.Join(dir, "database.sqlite")
+		beforeDB, beforeWAL := sigOf(path), sigOf(path+"-wal")
+		var cerr error
+		for _, suf := range []string{"", "-wal", "-shm"} {
+			if cerr = ctx.Err(); cerr != nil {
+				break
+			}
+			if cerr = copyFileFn(path+suf, dst+suf, suf != ""); cerr != nil {
+				break
+			}
+		}
+		if cerr != nil {
+			cleanup()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("copy npm database: %w", cerr)
+		}
+		if sigOf(path) != beforeDB || sigOf(path+"-wal") != beforeWAL {
+			cleanup()
+			lastErr = errors.New("source changed during the copy")
+			continue
+		}
+		r, err := openDB(dst, false, cleanup)
+		if err != nil {
+			return nil, err
+		}
+		var res string
+		if err := r.db.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&res); err != nil || res != "ok" {
+			r.Close()
+			lastErr = fmt.Errorf("snapshot failed quick_check (%q, %v)", res, err)
+			continue
+		}
+		return r, nil
+	}
+	return nil, fmt.Errorf("the NPM database kept changing or is corrupt (%v); stop NPM briefly or copy the data directory while it is stopped", lastErr)
 }
 
 // checkInPlace refuses unsafe in-place reads.

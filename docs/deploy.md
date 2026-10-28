@@ -16,7 +16,10 @@ traefik/traefik.yml        copy of deploy/traefik/traefik.yml
 
 Both `doorwarden` and `traefik` run as UID/GID `65532`, so Doorwarden's
 `0600` key files remain readable by Traefik without loosening permissions.
-One-time init (the paths are bind mounts you must own):
+One-time init (the paths are bind mounts you must own). Do it in this
+order, before the first start: `./certs` is mounted at `/data/certs`, nested
+inside `./data`, and if `./certs` does not exist Docker creates a root-owned
+empty stub for the mount, which Doorwarden (65532) then cannot write.
 
 ```
 mkdir -p data certs traefik-dynamic
@@ -53,6 +56,32 @@ only, no host ports). Point the docker source at
 `/var/run/docker.sock` on the host.
 
 ## Docker API access
+
+The socket proxy runs as `user: 65534:${DOCKER_GID}`. That has only been
+verified to start under Docker Desktop, not against a real Linux/TrueNAS
+socket group id. After the first start confirm the proxy can reach the socket
+and that Doorwarden's one allowed call works, from a container on the
+`socket` network (the proxy only answers the `doorwarden` hostname, so run it
+in that container's network namespace) or simply read the proxy logs for
+`permission denied` on the socket:
+
+```
+docker logs <project>-docker-socket-proxy-1 2>&1 | grep -i "socket not available"
+docker exec <project>-doorwarden-1 /doorwarden healthcheck   # control plane health
+```
+
+If the first command prints a permission error, fix `DOCKER_GID`
+(`stat -c %g /var/run/docker.sock`) and redeploy. A direct end-to-end check
+of the allowlist from the Docker host, using a throwaway client container on
+the same network under the allowed name, is:
+
+```
+docker run --rm --network <project>_socket --name doorwarden curlimages/curl:8.10.1 \
+    -s -o /dev/null -w '%{http_code}\n' 'http://docker-socket-proxy:2375/containers/json?all=1'
+```
+
+Expect `200` (and `403` for any other path). Stop the real `doorwarden`
+container first, since two containers cannot share the name.
 
 Doorwarden's Docker source calls exactly one Docker Engine endpoint:
 `GET /containers/json?all=1` (container list). The proxy

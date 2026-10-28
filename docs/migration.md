@@ -49,6 +49,13 @@ temp directory (`/tmp`); delete any `doorwarden-npm-*` directory you find.
 NPM's database); it is refused when `-wal`/`-shm` files exist or the
 directory is not writable.
 
+The importer is advisory and read-only: it never changes NPM or Doorwarden.
+Against a live NPM the copy is verified (source size/mtime compared before and
+after, then `PRAGMA quick_check`) and retried up to 3 times; the safest run is
+with NPM briefly stopped or quiesced, and a rerun is cheap. If it reports that
+the database kept changing or is corrupt, stop NPM briefly or copy its data
+directory while it is stopped and point `--db` at that copy.
+
 The image is distroless (no shell), so run the subcommand directly, mounting
 NPM's data volume read-only:
 

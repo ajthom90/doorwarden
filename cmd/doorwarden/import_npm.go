@@ -54,22 +54,16 @@ func runImportNPM(args []string, out io.Writer) int {
 		}
 		found = d
 	}
-	r, err := npm.Open(*dbPath, npm.Options{NoCopy: *noCopy})
+	// Install the signal handler before the snapshot copy starts so an
+	// interrupt removes the temp dir.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	r, err := npm.Open(*dbPath, npm.Options{NoCopy: *noCopy, Context: ctx})
 	if err != nil {
 		return fail(err)
 	}
 	defer r.Close()
-	// The snapshot copy holds NPM data; remove it if we are interrupted.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sig)
-	go func() {
-		if _, ok := <-sig; ok {
-			r.Close()
-			os.Exit(130)
-		}
-	}()
-	snap, err := r.Read(context.Background())
+	snap, err := r.Read(ctx)
 	if err != nil {
 		return fail(err)
 	}

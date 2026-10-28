@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/model"
@@ -39,12 +40,15 @@ type Mapping struct {
 	Skipped string
 }
 
-// clean replaces C0/C1 control characters (including ESC, newlines and tabs)
-// and Unicode line/paragraph separators with '?', so untrusted NPM text can
+// clean replaces control characters (C0/C1, ESC, newlines, tabs), Unicode
+// format/bidi characters (Cf, zero-width, RLO etc.) and line/paragraph
+// separators with '?', so untrusted NPM text can
 // neither break out of a YAML comment nor inject terminal escape sequences.
 func clean(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == 0x2028 || r == 0x2029 {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == 0x2028 || r == 0x2029 ||
+			(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) ||
+			(r >= 0x200b && r <= 0x200f) || r == 0xfeff {
 			return '?'
 		}
 		return r
