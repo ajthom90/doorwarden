@@ -2,14 +2,18 @@ package acme
 
 import (
 	"crypto/tls"
+	"database/sql"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-acme/lego/v4/challenge"
+
+	"github.com/ajthom90/doorwarden/internal/store"
 )
 
 // reopen builds a second Manager over h's store and certs dir, as after a
@@ -131,3 +135,34 @@ func TestFailedVersionWritePublishesNothing(t *testing.T) {
 }
 
 func itoa(n int) string { return fmtS("%d", n) }
+
+// When the row cannot be stored after a new version was written, that
+// version is removed at once (the row keeps pointing at the previous one).
+func TestRowWriteFailureRemovesNewVersion(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "d.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	h := newHarness(t, nil, func(mc *ManagerConfig) { mc.Store = st })
+	b, err := h.m.Issue(ctx, wildcardReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER fail_cert_update BEFORE UPDATE ON certs BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Add(time.Hour)
+	if r := h.m.RenewNow(ctx, b.ID); r.Err == nil {
+		t.Fatal("renewal stored despite the failing row write")
+	}
+	if got := dirNames(t, filepath.Join(h.dir, b.ID)); got != "v1" {
+		t.Fatalf("version dirs after failed row write: %s", got)
+	}
+}
