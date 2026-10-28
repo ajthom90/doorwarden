@@ -20,8 +20,12 @@ func (s *Store) AppendActivity(ctx context.Context, e ActivityEntry) error {
 	return err
 }
 
-// ListActivity returns up to limit entries, newest first.
+// ListActivity returns up to limit entries, newest first. limit <= 0 means the
+// default of 100.
 func (s *Store) ListActivity(ctx context.Context, limit int) ([]ActivityEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT ts, level, kind, message FROM activity ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err

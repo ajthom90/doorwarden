@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -130,15 +131,27 @@ func TestCertRoundtrip(t *testing.T) {
 	if err := s.UpsertCert(ctx, c); err != nil {
 		t.Fatal(err)
 	}
+	check := func(want Cert) {
+		t.Helper()
+		got, err := s.ListCerts(ctx)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("%v %v", got, err)
+		}
+		if !got[0].NotAfter.Equal(want.NotAfter) {
+			t.Fatalf("NotAfter %v != %v", got[0].NotAfter, want.NotAfter)
+		}
+		g := got[0]
+		g.NotAfter, want.NotAfter = time.Time{}, time.Time{}
+		if !reflect.DeepEqual(g, want) {
+			t.Fatalf("got %+v want %+v", g, want)
+		}
+	}
+	check(c)
 	c.Status, c.LastError, c.Staging = "error", "boom", false
-	s.UpsertCert(ctx, c)
-	got, err := s.ListCerts(ctx)
-	if err != nil || len(got) != 1 {
-		t.Fatalf("%v %v", got, err)
+	if err := s.UpsertCert(ctx, c); err != nil {
+		t.Fatal(err)
 	}
-	if got[0] != c && !(got[0].NotAfter.Equal(c.NotAfter) && got[0].Status == "error" && got[0].LastError == "boom" && !got[0].Staging && got[0].Managed && got[0].DomainsJSON == c.DomainsJSON) {
-		t.Fatalf("bad %+v", got[0])
-	}
+	check(c)
 }
 
 func TestActivityNewestFirstAndLimited(t *testing.T) {

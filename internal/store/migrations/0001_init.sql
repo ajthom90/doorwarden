@@ -10,7 +10,10 @@ CREATE TABLE services (
 );
 
 -- Ownership is per (provider, zone, name, type): at most one record of a given
--- type per name is managed by us; value is mutable and not part of the key.
+-- type per name is managed by us (round-robin/multi-value sets are out of
+-- scope); value is mutable and not part of the key. name is stored lowercase
+-- without trailing dot and type uppercase (normalized by the store). A row's
+-- owner_key cannot be taken over by another owner (enforced in AddOwnedRecord).
 CREATE TABLE dns_records (
     provider           TEXT NOT NULL,
     zone               TEXT NOT NULL,
