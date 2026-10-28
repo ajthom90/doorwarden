@@ -13,7 +13,16 @@ import (
 
 var version = "dev"
 
+// subcommands is the registration hook for subcommand files (see
+// import_npm.go, healthcheck.go): each init() adds its handler here.
+var subcommands = map[string]func(args []string, out io.Writer) int{}
+
 func run(args []string, out io.Writer) int {
+	if len(args) > 0 {
+		if h, ok := subcommands[args[0]]; ok {
+			return h(args[1:], out)
+		}
+	}
 	for _, a := range args {
 		if a == "--version" || a == "-version" {
 			fmt.Fprintf(out, "doorwarden %s\n", version)
