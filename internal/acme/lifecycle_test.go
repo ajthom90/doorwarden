@@ -330,3 +330,38 @@ func TestPruneKeepsInFlightAttempt(t *testing.T) {
 		t.Fatal("in-flight attempt pruned")
 	}
 }
+
+// RenewNow does not replace a production certificate with a staging one
+// unless AllowDowngrade is passed.
+func TestRenewNowRefusesDowngradeToStaging(t *testing.T) {
+	cfg := testConfig()
+	is := cfg.Issuers["le"]
+	is.Directory = "production"
+	cfg.Issuers["le"] = is
+	h := newHarness(t, cfg, nil)
+	b, err := h.m.Issue(ctx, wildcardReq())
+	if err != nil || b.Staging {
+		t.Fatalf("%v %+v", err, b)
+	}
+	is.Directory = "staging" // config edited back to staging
+	cfg.Issuers["le"] = is
+	h.clock.Add(time.Hour)
+	n := h.ca.count()
+	if r := h.m.RenewNow(ctx, b.ID); !errors.Is(r.Err, ErrDowngrade) || h.ca.count() != n {
+		t.Fatalf("downgrade not refused: %v (orders %d)", r.Err, h.ca.count()-n)
+	}
+	if r := h.m.RenewNow(ctx, b.ID, AllowDowngrade()); r.Err != nil {
+		t.Fatal(r.Err)
+	}
+	if o := h.ca.last(); o.Dir.URL != LEStagingURL || !h.row(t, b.ID).Staging {
+		t.Fatalf("AllowDowngrade did not re-issue from staging: %s", o.Dir.URL)
+	}
+}
+
+// The directory-change message does not assume Let's Encrypt.
+func TestNeedsSwitchMessageGeneric(t *testing.T) {
+	msg := ErrNeedsSwitch.Error()
+	if strings.Contains(msg, "other Let's Encrypt directory") || !strings.Contains(msg, "issuer directory changed") {
+		t.Fatalf("message: %s", msg)
+	}
+}

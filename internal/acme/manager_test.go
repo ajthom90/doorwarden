@@ -553,3 +553,20 @@ func TestIssueAllDropsInvalidNames(t *testing.T) {
 		t.Fatalf("no warning: %s", logs)
 	}
 }
+
+// Issue reports dropped names too: on the bundle, and in the error text.
+func TestIssueReportsDroppedNames(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	b, err := h.m.Issue(ctx, IssueRequest{Zone: "other.test", Names: []string{"a.other.test", "bad_name.other.test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(b.Dropped, ",") != "bad_name.other.test" {
+		t.Fatalf("bundle dropped %q", b.Dropped)
+	}
+	h.ca.setFail(errors.New("boom"))
+	_, err = h.m.Issue(ctx, IssueRequest{Zone: "other.test", Names: []string{"c.other.test", "bad_name.other.test"}})
+	if err == nil || !strings.Contains(err.Error(), "bad_name.other.test") {
+		t.Fatalf("error does not report the dropped name: %v", err)
+	}
+}

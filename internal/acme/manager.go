@@ -101,7 +101,11 @@ var (
 	ErrImported = errors.New("acme: imported certificate is not renewed: its zone has no certificate issuer")
 	// ErrNeedsSwitch: the certificate's staging flag differs from its issuer's
 	// current directory. Renew never re-issues across that change.
-	ErrNeedsSwitch = errors.New("acme: certificate was issued by the issuer's other Let's Encrypt directory (staging vs production); automatic renewal will not switch it, re-issue it with RenewNow or SwitchIssuer")
+	ErrNeedsSwitch = errors.New("acme: the issuer directory changed since this certificate was issued (staging vs production); automatic renewal will not switch it, re-issue it with RenewNow (or SwitchIssuer for Let's Encrypt staging to production)")
+	// ErrDowngrade: RenewNow would replace a production certificate with one
+	// from a staging directory (untrusted by browsers); pass AllowDowngrade
+	// to do it anyway.
+	ErrDowngrade = errors.New("acme: the issuer now uses a staging directory; re-issuing would replace this production certificate with an untrusted staging one (pass AllowDowngrade to do it anyway)")
 	// ErrUnwanted: the certificate's names are no longer wanted
 	// (ManagerConfig.Wanted); it is not renewed.
 	ErrUnwanted = errors.New("acme: certificate is no longer wanted; not renewed")
@@ -445,15 +449,26 @@ func (m *Manager) Issue(ctx context.Context, req IssueRequest) (*Bundle, error) 
 }
 
 func (m *Manager) issue(ctx context.Context, req IssueRequest) (*Bundle, error) {
-	z, sets, _, err := m.resolveRequest(req)
-	if err != nil {
-		return nil, err
+	z, sets, dropped, err := m.resolveRequest(req)
+	if err == nil && len(sets) != 1 {
+		err = fmt.Errorf("acme: request resolves to %d orders; use IssueAll", len(sets))
 	}
-	if len(sets) != 1 {
-		return nil, fmt.Errorf("acme: request resolves to %d orders; use IssueAll", len(sets))
+	if err != nil {
+		return nil, withDropped(err, dropped)
 	}
 	r := m.issueSet(ctx, z, sets[0], certID(z.Name, sets[0]), false)
-	return r.Bundle, r.Err
+	if r.Bundle != nil {
+		r.Bundle.Dropped = dropped
+	}
+	return r.Bundle, withDropped(r.Err, dropped)
+}
+
+// withDropped appends the dropped (invalid) request names to err's text.
+func withDropped(err error, dropped []string) error {
+	if err == nil || len(dropped) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (invalid names dropped from the request: %q)", err, dropped)
 }
 
 // IssueAll orders every certificate req resolves to, one after another.
@@ -1391,14 +1406,31 @@ func (m *Manager) notifyExpiry(ctx context.Context, r store.Cert, now time.Time)
 
 // RenewNow re-issues one certificate now, skipping the ordinary backoff
 // (never a rate-limit park), from the issuer's current directory (this is
-// how a certificate left on staging by a failed SwitchIssuer is retried). For an imported certificate this is the
-// explicit switch to managed: its zone must have an issuer, and on success
-// the row becomes managed=true with the same id.
-func (m *Manager) RenewNow(ctx context.Context, certID string) Result {
-	return m.safeResults([]Result{m.renewNow(ctx, certID)})[0]
+// how a certificate left on staging by a failed SwitchIssuer is retried),
+// but it refuses (ErrDowngrade) to replace a managed production
+// certificate with a staging one unless AllowDowngrade is passed. For an
+// imported certificate this is the explicit switch to managed: its zone
+// must have an issuer, and on success the row becomes managed=true with
+// the same id.
+func (m *Manager) RenewNow(ctx context.Context, certID string, opts ...RenewNowOption) Result {
+	var o renewNowOpts
+	for _, f := range opts {
+		f(&o)
+	}
+	return m.safeResults([]Result{m.renewNow(ctx, certID, o)})[0]
 }
 
-func (m *Manager) renewNow(ctx context.Context, certID string) Result {
+// RenewNowOption modifies RenewNow.
+type RenewNowOption func(*renewNowOpts)
+
+type renewNowOpts struct{ allowDowngrade bool }
+
+// AllowDowngrade lets RenewNow replace a production certificate with one
+// from the issuer's (now) staging directory; without it RenewNow refuses
+// with ErrDowngrade.
+func AllowDowngrade() RenewNowOption { return func(o *renewNowOpts) { o.allowDowngrade = true } }
+
+func (m *Manager) renewNow(ctx context.Context, certID string, o renewNowOpts) Result {
 	r, ok, err := m.certRow(ctx, certID)
 	if err != nil {
 		return Result{CertID: certID, Err: err}
@@ -1417,8 +1449,16 @@ func (m *Manager) renewNow(ctx context.Context, certID string) Result {
 		}
 		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: err}
 	}
-	// A certificate from the issuer's other Let's Encrypt directory
-	// (ErrNeedsSwitch in Renew) is re-issued from the current one here.
+	// A certificate from the issuer's other directory (ErrNeedsSwitch in
+	// Renew) is re-issued from the current one here, except that a
+	// production certificate is not replaced by a staging one unasked.
+	d, _, err := m.effectiveDirectory(ctx, z.Certificate.Issuer)
+	if err != nil {
+		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: err}
+	}
+	if r.Managed && !r.Staging && !r.NotAfter.IsZero() && d.Staging && !o.allowDowngrade {
+		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: ErrDowngrade}
+	}
 	return m.issueSet(ctx, z, names, certID, true)
 }
 

@@ -27,6 +27,9 @@ type Bundle struct {
 	ChainPEM []byte
 	// Key is the PEM private key. Read it only with Key.Reveal().
 	Key secrets.Secret
+	// Dropped lists names of the Issue request that were not valid host
+	// names and were left out (see Result.Dropped).
+	Dropped []string
 }
 
 // String describes the bundle without key material.
