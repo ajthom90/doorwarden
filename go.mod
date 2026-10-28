@@ -1,4 +1,4 @@
-module github.com/ajthom90/proxypilot
+module github.com/ajthom90/doorwarden
 
 go 1.26.5
 

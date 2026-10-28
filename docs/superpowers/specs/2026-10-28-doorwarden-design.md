@@ -1,11 +1,11 @@
-# proxypilot — design (draft for review)
+# doorwarden — design (draft for review)
 
 Status: DRAFT, awaiting approval. No product code exists yet.
 
 ## 1. Intent
 Self-hosted control plane that publishes Docker containers and TrueNAS SCALE apps at
 `https://<app>.<zone>` with Let's Encrypt certs (wildcards included) and managed DNS.
-Traefik v3 is the data plane (file provider only). proxypilot owns discovery, DNS, certs, and
+Traefik v3 is the data plane (file provider only). doorwarden owns discovery, DNS, certs, and
 all Traefik config. Traefik's own ACME is never used.
 
 Goals: "install an app, nothing else"; safe by default (staging CA, dry-run, ownership-tracked
@@ -49,7 +49,7 @@ so images are multi-arch with CGO off). Packages:
 - `internal/store`: SQLite, migrations via embedded SQL.
 - `internal/web`: REST+SSE JSON API, auth, UI. `internal/notify`: webhook/ntfy/SMTP.
 - `internal/importer/npm`: optional, reads NPM SQLite (read-only copy) → mapping table.
-- `internal/secrets`: AES-256-GCM envelope with master key from env (`PROXYPILOT_MASTER_KEY`),
+- `internal/secrets`: AES-256-GCM envelope with master key from env (`DOORWARDEN_MASTER_KEY`),
   per-secret nonce; secrets are a distinct Go type whose `String()/MarshalJSON` redact.
 
 Loop: sources polled every 30s (TrueNAS) / Docker events + resync; any change enqueues a
@@ -106,7 +106,7 @@ cert (`tls.stores.default` is single-valued in Traefik; per-zone defaults are do
 `tls.certificates` + SNI matching, and a documented limitation for the global default store,
 decided during implementation spike).
 Import: PEM files or NPM's `/etc/letsencrypt/live/npm-N` dirs → stored as `imported` certs,
-renewed through proxypilot only once an issuer is set for the zone (renewal switches them to
+renewed through doorwarden only once an issuer is set for the zone (renewal switches them to
 managed, never silently).
 "Switch staging → production" re-issues all certs for that issuer after confirmation.
 Notifications: renewal failure, expiry <14d, conflicts: webhook, ntfy, SMTP.
@@ -126,10 +126,10 @@ trusted-header / forward-auth (configurable header names + trusted proxy CIDRs).
 Endpoints: `/healthz`, `/metrics` (Prometheus), `/api/v1/...`, SSE `/api/v1/events`.
 
 ## 8. Deployment
-Compose for TrueNAS Custom Apps: `proxypilot`, `traefik:v3` (80/443, file provider on shared
+Compose for TrueNAS Custom Apps: `doorwarden`, `traefik:v3` (80/443, file provider on shared
 volume), `tecnativa/docker-socket-proxy` (CONTAINERS=1, read-only). Image: multi-arch
 (amd64/arm64) to GHCR via GitHub Actions (build, test, Pebble integration job, release).
-Traefik's own dashboard off; proxypilot's UI is itself published as a route.
+Traefik's own dashboard off; doorwarden's UI is itself published as a route.
 
 ## 9. Migration from NPM (optional tool + docs)
 1. Read-only import of proxy hosts/certs → mapping table classifying each: `auto` (TrueNAS

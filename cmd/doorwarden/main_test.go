@@ -11,7 +11,7 @@ func TestMainVersionFlag(t *testing.T) {
 	if code := run([]string{"--version"}, &out); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(out.String(), "proxypilot") {
-		t.Fatalf("output %q does not contain proxypilot", out.String())
+	if !strings.Contains(out.String(), "doorwarden") {
+		t.Fatalf("output %q does not contain doorwarden", out.String())
 	}
 }

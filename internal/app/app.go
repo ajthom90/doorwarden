@@ -1,4 +1,4 @@
-// Package app wires the proxypilot control plane together.
+// Package app wires the doorwarden control plane together.
 package app
 
 import "context"

@@ -1,4 +1,4 @@
-// Package config loads and validates the proxypilot YAML configuration.
+// Package config loads and validates the doorwarden YAML configuration.
 //
 // Note: in flow-style mappings placeholders must be quoted ({k: "${V}"}),
 // because braces are YAML syntax.

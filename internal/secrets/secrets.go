@@ -48,7 +48,7 @@ var ErrDecrypt = errors.New("secrets: decryption failed")
 const (
 	versionV1 byte = 1
 	minKeyLen      = 16
-	hkdfInfo       = "proxypilot/secrets/aes-256-gcm/v1"
+	hkdfInfo       = "doorwarden/secrets/aes-256-gcm/v1"
 	nonceSize      = 12
 	keySize        = 32
 )
@@ -62,7 +62,7 @@ type Box struct {
 // NewBox derives an AES-256 key from masterKey using HKDF-SHA256.
 func NewBox(masterKey string) (*Box, error) {
 	if masterKey == "" {
-		return nil, errors.New("secrets: master key is empty (set PROXYPILOT_MASTER_KEY)")
+		return nil, errors.New("secrets: master key is empty (set DOORWARDEN_MASTER_KEY)")
 	}
 	if len(masterKey) < minKeyLen {
 		return nil, fmt.Errorf("secrets: master key too short: need at least %d bytes", minKeyLen)
