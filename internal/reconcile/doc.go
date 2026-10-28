@@ -61,14 +61,14 @@
 // are absent from desired ("absent": removal scheduled or due, route not yet
 // removed, grace period not over; once now is after RemovedAfter it no longer
 // claims, so the past-grace removal and a newcomer's RouteWrite happen in the
-// same plan with no dark cycle). Source rank is compared FIRST, so an absent
+// same plan with no dark route cycle). Source rank is compared FIRST, so an absent
 // service keeps its hostname against every lower-ranked claimant until its
 // grace period ends (the newcomer gets a Conflict naming it): a lower-trust
 // source never takes a hostname from a higher-trust one, even a briefly
 // absent one. Within its own rank an absent claimant yields to every present
 // claimant; when the winner is a present Published, routable service of the
 // same or a higher rank, its route is removed at once (RouteRemove, no grace,
-// no ScheduleRemoval, no DNSDelete since the winner uses the name). Against a
+// no ScheduleRemoval; its DNS record follows the orphan rule). Against a
 // present but non-routable winner it keeps its route until its grace period
 // ends. The same takeover rule (planner.takesOver: winner Published,
 // routable, not a phantom, rank <= loser's; loser's source available)
@@ -156,8 +156,8 @@
 // takes the name over in this same plan: the winner is Published, gets a
 // RouteWrite now, is not a phantom, and ranks at least as high; and the
 // loser's source is available. Otherwise (the winner is pending, invalid,
-// backend-less, or a phantom) the loser keeps its working route. DNS is never
-// touched for losers. After the caller forgets the Known entry the loser gets
+// backend-less, or a phantom) the loser keeps its working route. A loser's
+// DNS record is governed only by the orphan rule (see Orphan DNS records). After the caller forgets the Known entry the loser gets
 // only Conflict; when the winner goes away the loser wins again and gets its
 // route back.
 //
@@ -200,7 +200,9 @@
 // route or cert. Owner keys: the service key for per-host records,
 // WildcardOwnerKey for the wildcard record. If an owned row with the right
 // value belongs to another owner key nothing is emitted (ownership transfer is
-// not the plan's job).
+// not the plan's job); with another value a Skip ("owned by <key> with another
+// value") is emitted instead of a DNSEnsure the executor would refuse
+// (ErrOwnerConflict), so the row's owner can still clean it up.
 //
 // HARD CONTRACT for Observed.Foreign (T14/T19): every cycle the caller must
 // set Foreign[provider+"/"+zone] for every provider/zone in use to that
@@ -229,23 +231,99 @@
 // means unknown, never "gone", and also suspends removals already due). With
 // no RemovedAfter, ScheduleRemoval carries now+grace (settings.grace_period,
 // 24h when unset) for the caller to persist; nothing is deleted. Once now is
-// strictly after RemovedAfter: RouteRemove, and in per-host zones that are
-// still configured DNSDelete for owned rows of that hostname whose owner key
-// is the service key, unless another service now claims the same hostname.
-// An absent service whose hostname is taken over by a present Published,
-// routable service of the same or a higher source rank is removed earlier
-// (see Hostname conflicts). Foreign records and the wildcard record are never
-// deleted automatically (a later UI action may). A present service with a
-// RemovedAfter gets CancelRemoval in any state.
+// strictly after RemovedAfter: RouteRemove. An absent service whose hostname
+// is taken over by a present Published, routable service of the same or a
+// higher source rank is removed earlier (see Hostname conflicts). A present
+// service with a RemovedAfter gets CancelRemoval in any state. Route removal
+// never deletes DNS: records have exactly one deletion path, the orphan rule.
 //
-// Known gaps, resolved conservatively: when a published service changes
-// hostname or zone, the old per-host record stays owned and is not deleted;
-// when a published service becomes Pending (fingerprint changed) its route is
-// left as last written, not removed; likewise a Stopped/Error service's route
-// is left as last written (its RouteWrite is a no-op in the route executor);
-// when a hostname loser's route is removed (or an absent service is evicted)
-// its owned per-host DNS record is kept for the winner, which uses the same
-// name, but it stays owned by the loser's key and is never re-owned.
+// # Orphan DNS records
+//
+// Every owned row in Observed.Owned is checked each cycle (planOrphans, after
+// all other planning). An owned per-host row (owner key not starting with
+// "zone:", name not starting with "*.") is an ORPHAN when no present
+// service with that owner key wants exactly its (provider, zone, normalized
+// name, type). A present service wants a row when it is Published, its
+// labels resolve (not Invalid, not a held-Invalid holder), its source is not
+// Unavailable, it has a route backend (its own or a last-known one), its
+// zone has records mode per-host, and the row is (zone provider, zone,
+// hostname, A/AAAA from target_ip): exactly the DNSEnsure set planService
+// computes. Hostname losers are included: a Conflict loser that still
+// declares the hostname wants its record (the winner meanwhile uses that
+// record silently); once it renames away or is gone the record is an orphan.
+//
+// Lifecycle (no provider call until the delete):
+//   - orphan, RemovedAfter nil: DNSScheduleRemoval{Record: stored row,
+//     Owner, RemovedAfter}. The deadline is now+grace; for an owner absent
+//     from desired whose Known route has a RemovedAfter, that same deadline,
+//     so route and record go together (an unscheduled route gets now+grace
+//     in the same plan, the same value). The executor persists it on the
+//     ownership row (store.SetOwnedRemoval, owner-guarded).
+//   - orphan, now not strictly after RemovedAfter: nothing.
+//   - orphan, now strictly after RemovedAfter: DNSDelete with the STORED row
+//     (provider, zone, name, type, value, provider ID, owner). The executor
+//     deletes by stored ID/value only (a foreign record that took the name is
+//     never hit) and forgets the row on success. On failure the row stays,
+//     past its deadline, so every following cycle emits the DNSDelete again
+//     until it succeeds, even after RouteRemove forgot the Known entry.
+//   - wanted again (the owner wants the row) with RemovedAfter set:
+//     DNSCancelRemoval (executor clears it). A wanted row is never scheduled
+//     or deleted, whatever its RemovedAfter.
+//
+// Exclusions (never scheduled, never deleted; an existing RemovedAfter is
+// left as it is, neither cancelled nor executed):
+//   - (a) the owner is present but does not cleanly want records: not
+//     Published (Pending, Stopped, Error, Discovered, ...), Invalid (labels or
+//     middlewares), a held-Invalid holder, Published without
+//     any backend, or its zone's target_ip does not parse (wanted type
+//     unknown). Stopped containers never lose DNS; a Pending service keeps
+//     what it had.
+//   - (b) the owner is absent and its source is unknown this cycle. With a
+//     Known entry, Known.Source decides (empty or Unavailable: unknown).
+//     Without one (route already removed) the key prefix must be "static:",
+//     "truenas:" or "docker:" (anything else, or an empty owner: never
+//     orphaned), and the source is unknown when any candidate name for that
+//     prefix is Unavailable (the prefix itself, case-insensitively, and every
+//     Source carried this cycle by a desired service or Known entry with
+//     that prefix) or when an Unavailable source name maps to no prefix at
+//     all (it might be this owner's renamed source).
+//   - (c) the wildcard record ("zone:" owner, or a "*." name): never removed
+//     automatically, as before; the executor refuses it too.
+//   - (d) a zone with records mode off (or unset): nothing is touched, and
+//     nothing is reported. In mode wildcard, per-host rows left from an
+//     earlier per-host mode ARE orphans (the wildcard record covers their
+//     names), on the same grace schedule, but only once the zone's own
+//     "*.zone" row (owner WildcardOwnerKey) is in Observed.Owned; until then
+//     they are left alone so no name goes dark.
+//   - (e) the row's zone is no longer configured, or the zone's records
+//     provider is not the row's provider: a Skip per row says so; nothing is
+//     changed (it cannot be verified). GatherObserved never returns such rows
+//     today, so this is a defensive rule.
+//   - a row for which the same plan emits a DNSEnsure (same provider, zone,
+//     name, type) is never scheduled or deleted.
+//
+// Absent owners (removed, or filtered out by approval "off"/Skip) are removal
+// by admin intent: their rows are scheduled like their routes. Rename and
+// zone move: the old row is an orphan of the still-present owner (scheduled
+// now+grace, deleted after it) while DNSEnsure creates the new one; renaming
+// back within the grace period cancels the removal. A records type change
+// (target_ip switched between IPv4 and IPv6) makes the old-type row an orphan
+// the same way.
+//
+// Hostname takeover delay: a winner never re-owns a loser's row (no ownership
+// transfer). While the loser's row exists the winner's ensure is a no-op (same
+// value) or a Skip (other value); after the loser's row is deleted (grace
+// expired) the winner's DNSEnsure creates its own record in the NEXT cycle
+// (the plan that deletes has the row in Observed, so it emits no create).
+// The name therefore has no record for one reconcile interval (plus
+// negative-caching TTLs).
+//
+// Known gaps, resolved conservatively: when a published service becomes
+// Pending (fingerprint changed) its route is left as last written, not
+// removed; likewise a Stopped/Error service's route is left as last written
+// (its RouteWrite is a no-op in the route executor). A row re-owned between
+// Plan and the executor's delete is protected only by the executor's
+// read-then-delete owner check (not atomic).
 //
 // # Execution
 //
@@ -255,8 +333,11 @@
 //
 // Caller duties (T19): pass desired for every available source in one call;
 // persist ScheduleRemoval/CancelRemoval; forget a service's Known entry once
-// its RouteRemove was applied (removal past grace, or a conflict loser) and
-// its ownership rows once their DNSDelete was applied; mark a source
+// its RouteRemove was applied (removal past grace, or a conflict loser);
+// pass Observed.Owned (with RemovedAfter) for every managed provider/zone
+// (GatherObserved) and register the DNS executor for DNSEnsure, DNSDelete,
+// DNSScheduleRemoval and DNSCancelRemoval (it persists and forgets
+// ownership rows itself); mark a source
 // Unavailable when it failed to construct, its List failed, its services
 // could not be resolved (a Resolve/merge error), or its approvals failed to
 // load (otherwise its services would look absent and be removed); key
