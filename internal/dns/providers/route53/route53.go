@@ -9,6 +9,12 @@
 // address records by (name, type[, value]). A non-empty ID on Update returns
 // dns.ErrNotFound and on Delete is a no-op, since this provider never issues
 // IDs. A record set holding several values is listed as one Record per value.
+//
+// Every response is validated: the SDK happily decodes an empty body, "{}" or
+// an HTML page (a proxy or captive portal) into zero-valued output, so list
+// calls require MaxItems, changes require ChangeInfo, a full zone listing must
+// contain the apex SOA and NS sets, and every write is followed by a read of
+// the single (name, type) set to confirm the post-state.
 package route53
 
 import (
@@ -81,13 +87,21 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	cl      *r53.Client
-	pinned  string
-	secrets []secrets.Secret
+	cl     *r53.Client
+	pinned string
+	cr     *creds
 
 	mu    sync.Mutex
-	cache map[string]string // zone -> hosted zone id
+	cache map[string]zoneRef // zone -> hosted zone
 }
+
+// creds keeps credential material off the Provider struct itself.
+type creds struct {
+	dns.Redacted
+	secrets []secrets.Secret
+}
+
+type zoneRef struct{ id, name string }
 
 // New builds a provider. With empty static credentials the default AWS
 // credential chain is used (resolved lazily by the SDK).
@@ -97,14 +111,14 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 		region = "us-east-1"
 	}
 	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	var sec []secrets.Secret
+	cr := &creds{}
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
 		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 			return nil, errors.New("route53: access key ID and secret access key must be set together")
 		}
 		opts = append(opts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(c.AccessKeyID.Reveal(), c.SecretAccessKey.Reveal(), "")))
-		sec = []secrets.Secret{c.AccessKeyID, c.SecretAccessKey}
+		cr.secrets = []secrets.Secret{c.AccessKeyID, c.SecretAccessKey}
 	}
 	if c.Endpoint != "" {
 		opts = append(opts, awsconfig.WithRetryMaxAttempts(1))
@@ -118,7 +132,7 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 			o.BaseEndpoint = aws.String(c.Endpoint)
 		}
 	})
-	return &Provider{cl: cl, pinned: strings.TrimPrefix(c.HostedZoneID, "/hostedzone/"), secrets: sec, cache: map[string]string{}}, nil
+	return &Provider{cl: cl, pinned: strings.TrimPrefix(c.HostedZoneID, "/hostedzone/"), cr: cr, cache: map[string]zoneRef{}}, nil
 }
 
 func (p *Provider) Type() string { return Type }
@@ -130,7 +144,7 @@ func (p *Provider) Capabilities() dns.Capabilities {
 }
 
 func (p *Provider) scrub(s string) string {
-	for _, x := range p.secrets {
+	for _, x := range p.cr.secrets {
 		if v := x.Reveal(); v != "" {
 			s = strings.ReplaceAll(s, v, "[redacted]")
 		}
@@ -158,11 +172,24 @@ func (p *Provider) mapErr(op string, err error) error {
 	return fmt.Errorf("route53: %s: %s", op, p.scrub(err.Error()))
 }
 
+func malformed(op, what string) error {
+	return fmt.Errorf("route53: %s: malformed response (%s); a proxy or captive portal may be answering instead of AWS", op, what)
+}
+
+func (p *Provider) wrapCtx(ctx context.Context, op string, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("route53: %s: %w", op, ctx.Err())
+	}
+	return p.mapErr(op, err)
+}
+
 type hostedZone struct {
 	id      string
 	name    string // lowercase, no trailing dot
 	private bool
 }
+
+func normZoneName(n string) string { return strings.ToLower(strings.TrimSuffix(n, ".")) }
 
 func (p *Provider) listZones(ctx context.Context) ([]hostedZone, error) {
 	var out []hostedZone
@@ -175,11 +202,14 @@ func (p *Provider) listZones(ctx context.Context) ([]hostedZone, error) {
 		if err != nil {
 			return nil, p.wrapCtx(ctx, "list hosted zones", err)
 		}
+		if resp.MaxItems == nil {
+			return nil, malformed("list hosted zones", "no MaxItems")
+		}
 		for _, z := range resp.HostedZones {
 			priv := z.Config != nil && z.Config.PrivateZone
 			out = append(out, hostedZone{
 				id:      strings.TrimPrefix(aws.ToString(z.Id), "/hostedzone/"),
-				name:    strings.ToLower(strings.TrimSuffix(aws.ToString(z.Name), ".")),
+				name:    normZoneName(aws.ToString(z.Name)),
 				private: priv,
 			})
 		}
@@ -193,17 +223,10 @@ func (p *Provider) listZones(ctx context.Context) ([]hostedZone, error) {
 	}
 }
 
-func (p *Provider) wrapCtx(ctx context.Context, op string, err error) error {
-	if ctx.Err() != nil {
-		return fmt.Errorf("route53: %s: %w", op, ctx.Err())
-	}
-	return p.mapErr(op, err)
-}
-
 // pick chooses the hosted zone for zone: the longest hosted-zone name that
 // equals zone or is a parent domain of it; a private zone is never chosen
 // implicitly (set hosted_zone_id).
-func pick(zone string, zones []hostedZone) (string, error) {
+func pick(zone string, zones []hostedZone) (hostedZone, error) {
 	var cands []hostedZone
 	for _, z := range zones {
 		if z.private {
@@ -216,58 +239,89 @@ func pick(zone string, zones []hostedZone) (string, error) {
 	if len(cands) == 0 {
 		for _, z := range zones {
 			if z.private && (zone == z.name || strings.HasSuffix(zone, "."+z.name)) {
-				return "", fmt.Errorf("route53: only a private hosted zone matches %q; set hosted_zone_id to use it", zone)
+				return hostedZone{}, fmt.Errorf("route53: only a private hosted zone matches %q; set hosted_zone_id to use it", zone)
 			}
 		}
-		return "", fmt.Errorf("route53: no hosted zone found for %q (check the credentials can list hosted zones)", zone)
+		return hostedZone{}, fmt.Errorf("route53: no hosted zone found for %q (check the credentials can list hosted zones)", zone)
 	}
 	sort.SliceStable(cands, func(i, j int) bool { return len(cands[i].name) > len(cands[j].name) })
 	if len(cands) > 1 && len(cands[0].name) == len(cands[1].name) {
-		return "", fmt.Errorf("route53: several public hosted zones named %q; set hosted_zone_id", cands[0].name)
+		return hostedZone{}, fmt.Errorf("route53: several public hosted zones named %q; set hosted_zone_id", cands[0].name)
 	}
-	return cands[0].id, nil
+	return cands[0], nil
 }
 
-func (p *Provider) zoneID(ctx context.Context, zone string) (string, error) {
-	if p.pinned != "" {
-		return p.pinned, nil
+// getZone fetches a hosted zone by ID and validates the answer.
+func (p *Provider) getZone(ctx context.Context, op, id string) (zoneRef, error) {
+	resp, err := p.cl.GetHostedZone(ctx, &r53.GetHostedZoneInput{Id: aws.String(id)})
+	if err != nil {
+		return zoneRef{}, p.wrapCtx(ctx, op, err)
 	}
+	if resp.HostedZone == nil || aws.ToString(resp.HostedZone.Id) == "" || aws.ToString(resp.HostedZone.Name) == "" {
+		return zoneRef{}, malformed(op, "no hosted zone")
+	}
+	got := strings.TrimPrefix(aws.ToString(resp.HostedZone.Id), "/hostedzone/")
+	if got != strings.TrimPrefix(id, "/hostedzone/") {
+		return zoneRef{}, malformed(op, "hosted zone id mismatch")
+	}
+	return zoneRef{id: got, name: normZoneName(aws.ToString(resp.HostedZone.Name))}, nil
+}
+
+func (p *Provider) zoneFor(ctx context.Context, zone string) (zoneRef, error) {
 	p.mu.Lock()
-	id, ok := p.cache[zone]
+	ref, ok := p.cache[zone]
 	p.mu.Unlock()
 	if ok {
-		return id, nil
+		return ref, nil
 	}
-	zs, err := p.listZones(ctx)
-	if err != nil {
-		return "", err
+	var err error
+	if p.pinned != "" {
+		ref, err = p.getZone(ctx, "look up hosted zone", p.pinned)
+	} else {
+		var zs []hostedZone
+		if zs, err = p.listZones(ctx); err == nil {
+			var z hostedZone
+			if z, err = pick(zone, zs); err == nil {
+				ref = zoneRef{id: z.id, name: z.name}
+			}
+		}
 	}
-	id, err = pick(zone, zs)
 	if err != nil {
-		return "", err
+		return zoneRef{}, err
 	}
 	p.mu.Lock()
-	p.cache[zone] = id
+	p.cache[zone] = ref
 	p.mu.Unlock()
-	return id, nil
+	return ref, nil
 }
 
-// Test verifies credentials with a one-item hosted-zone listing (and the
-// pinned zone when configured).
+// Test verifies the credentials and that a hosted zone really resolves: the
+// pinned zone, or else the first listed zone, is fetched and validated.
 func (p *Provider) Test(ctx context.Context) error {
 	if p.pinned != "" {
-		if _, err := p.cl.GetHostedZone(ctx, &r53.GetHostedZoneInput{Id: aws.String(p.pinned)}); err != nil {
-			return p.wrapCtx(ctx, "verify credentials", err)
-		}
-		return nil
+		_, err := p.getZone(ctx, "verify credentials", p.pinned)
+		return err
 	}
-	if _, err := p.cl.ListHostedZones(ctx, &r53.ListHostedZonesInput{MaxItems: aws.Int32(1)}); err != nil {
+	resp, err := p.cl.ListHostedZones(ctx, &r53.ListHostedZonesInput{MaxItems: aws.Int32(1)})
+	if err != nil {
 		return p.wrapCtx(ctx, "verify credentials", err)
+	}
+	if resp.MaxItems == nil {
+		return malformed("verify credentials", "no MaxItems")
+	}
+	if len(resp.HostedZones) > 0 {
+		id := strings.TrimPrefix(aws.ToString(resp.HostedZones[0].Id), "/hostedzone/")
+		if id == "" {
+			return malformed("verify credentials", "hosted zone without id")
+		}
+		if _, err := p.getZone(ctx, "verify credentials", id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func escName(n string) string { return strings.ReplaceAll(n, "*", `\052`) }
+func escName(n string) string { return strings.ReplaceAll(strings.ToLower(n), "*", `\052`) }
 
 func unescName(n string) string {
 	n = strings.ReplaceAll(n, `\052`, "*")
@@ -285,6 +339,9 @@ func (p *Provider) allSets(ctx context.Context, zid string) ([]types.ResourceRec
 		if err != nil {
 			return nil, p.wrapCtx(ctx, "list records", err)
 		}
+		if resp.MaxItems == nil {
+			return nil, malformed("list records", "no MaxItems")
+		}
 		out = append(out, resp.ResourceRecordSets...)
 		if !resp.IsTruncated {
 			return out, nil
@@ -299,18 +356,30 @@ func (p *Provider) allSets(ctx context.Context, zid string) ([]types.ResourceRec
 func inZone(name, zone string) bool { return name == zone || strings.HasSuffix(name, "."+zone) }
 
 func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, error) {
-	zid, err := p.zoneID(ctx, zone)
+	ref, err := p.zoneFor(ctx, zone)
 	if err != nil {
 		return nil, err
 	}
-	sets, err := p.allSets(ctx, zid)
+	sets, err := p.allSets(ctx, ref.id)
 	if err != nil {
 		return nil, err
+	}
+	// a real hosted zone always has apex SOA and NS sets; their absence means
+	// the listing is not the zone's
+	var soa, ns bool
+	for _, s := range sets {
+		if unescName(aws.ToString(s.Name)) == ref.name {
+			soa = soa || s.Type == types.RRTypeSoa
+			ns = ns || s.Type == types.RRTypeNs
+		}
+	}
+	if !soa || !ns {
+		return nil, fmt.Errorf("route53: list records: listing incomplete (apex SOA/NS sets of %q missing)", ref.name)
 	}
 	var out []dns.Record
 	for _, s := range sets {
 		name := unescName(aws.ToString(s.Name))
-		if !inZone(name, zone) || s.AliasTarget != nil {
+		if !inZone(name, zone) || s.AliasTarget != nil || s.Type == types.RRTypeSoa {
 			continue
 		}
 		for _, rr := range s.ResourceRecords {
@@ -320,14 +389,18 @@ func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, 
 	return out, nil
 }
 
-// getSet fetches the record set for (name, type), if any.
+// getSet fetches the plain (non-routing-policy) record set for (name, type).
 func (p *Provider) getSet(ctx context.Context, zid, name, typ string) (*types.ResourceRecordSet, error) {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
 	resp, err := p.cl.ListResourceRecordSets(ctx, &r53.ListResourceRecordSetsInput{
 		HostedZoneId: aws.String(zid), StartRecordName: aws.String(escName(name)),
 		StartRecordType: types.RRType(typ), MaxItems: aws.Int32(1),
 	})
 	if err != nil {
 		return nil, p.wrapCtx(ctx, "get record", err)
+	}
+	if resp.MaxItems == nil {
+		return nil, malformed("get record", "no MaxItems")
 	}
 	for i := range resp.ResourceRecordSets {
 		s := resp.ResourceRecordSets[i]
@@ -338,13 +411,55 @@ func (p *Provider) getSet(ctx context.Context, zid, name, typ string) (*types.Re
 	return nil, nil
 }
 
-func (p *Provider) change(ctx context.Context, zid string, action types.ChangeAction, set types.ResourceRecordSet, op string) error {
-	_, err := p.cl.ChangeResourceRecordSets(ctx, &r53.ChangeResourceRecordSetsInput{
+// change submits one atomic change batch.
+func (p *Provider) change(ctx context.Context, zid, op string, changes ...types.Change) error {
+	resp, err := p.cl.ChangeResourceRecordSets(ctx, &r53.ChangeResourceRecordSetsInput{
 		HostedZoneId: aws.String(zid),
-		ChangeBatch:  &types.ChangeBatch{Changes: []types.Change{{Action: action, ResourceRecordSet: &set}}},
+		ChangeBatch:  &types.ChangeBatch{Changes: changes},
 	})
 	if err != nil {
 		return p.wrapCtx(ctx, op, err)
+	}
+	if resp.ChangeInfo == nil || aws.ToString(resp.ChangeInfo.Id) == "" {
+		return malformed(op, "no ChangeInfo")
+	}
+	return nil
+}
+
+func valuesOf(s *types.ResourceRecordSet) []string {
+	if s == nil {
+		return nil
+	}
+	var v []string
+	for _, rr := range s.ResourceRecords {
+		v = append(v, aws.ToString(rr.Value))
+	}
+	sort.Strings(v)
+	return v
+}
+
+func sameValues(s *types.ResourceRecordSet, want ...string) bool {
+	sort.Strings(want)
+	got := valuesOf(s)
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// verify re-reads the single (name, type) set and requires the expected state.
+func (p *Provider) verify(ctx context.Context, zid, op, name, typ string, want ...string) error {
+	got, err := p.getSet(ctx, zid, name, typ)
+	if err != nil {
+		return fmt.Errorf("%w (change submitted but not confirmed)", err)
+	}
+	if !sameValues(got, want...) {
+		return fmt.Errorf("route53: %s: change was accepted but the record set does not show the expected values; refusing to report success", op)
 	}
 	return nil
 }
@@ -374,27 +489,52 @@ func checkType(r dns.Record) error {
 	return fmt.Errorf("route53: record type %q is not supported for writes (A, AAAA, CNAME)", r.Type)
 }
 
+// conflicts reports another-type record set that cannot coexist with r.
+func (p *Provider) cnameConflict(ctx context.Context, zid string, r dns.Record) error {
+	others := []string{"CNAME"}
+	if r.Type == "CNAME" {
+		others = []string{"A", "AAAA"}
+	}
+	for _, t := range others {
+		o, err := p.getSet(ctx, zid, r.Name, t)
+		if err != nil {
+			return err
+		}
+		if o != nil {
+			return fmt.Errorf("route53: %s already has a %s record set, which cannot coexist with %s: %w", r.Name, t, r.Type, dns.ErrRecordExists)
+		}
+	}
+	return nil
+}
+
 func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) (dns.Record, error) {
 	if err := checkType(r); err != nil {
 		return dns.Record{}, err
 	}
-	zid, err := p.zoneID(ctx, zone)
+	ref, err := p.zoneFor(ctx, zone)
 	if err != nil {
 		return dns.Record{}, err
 	}
-	cur, err := p.getSet(ctx, zid, r.Name, r.Type)
+	cur, err := p.getSet(ctx, ref.id, r.Name, r.Type)
 	if err != nil {
 		return dns.Record{}, err
 	}
 	if cur != nil {
-		if len(cur.ResourceRecords) == 1 && aws.ToString(cur.ResourceRecords[0].Value) == r.Value {
+		if cur.AliasTarget == nil && len(cur.ResourceRecords) == 1 && aws.ToString(cur.ResourceRecords[0].Value) == r.Value {
 			r.TTL = int(aws.ToInt64(cur.TTL))
 			return r, nil
 		}
 		return dns.Record{}, dns.ErrRecordExists
 	}
+	if err := p.cnameConflict(ctx, ref.id, r); err != nil {
+		return dns.Record{}, err
+	}
 	r.TTL = int(ttlOf(r))
-	if err := p.change(ctx, zid, types.ChangeActionCreate, newSet(r, int64(r.TTL)), "create record "+r.Name); err != nil {
+	set := newSet(r, int64(r.TTL))
+	if err := p.change(ctx, ref.id, "create record "+r.Name, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
+		return dns.Record{}, err
+	}
+	if err := p.verify(ctx, ref.id, "create record "+r.Name, r.Name, r.Type, r.Value); err != nil {
 		return dns.Record{}, err
 	}
 	return r, nil
@@ -407,11 +547,11 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err := checkType(r); err != nil {
 		return dns.Record{}, err
 	}
-	zid, err := p.zoneID(ctx, zone)
+	ref, err := p.zoneFor(ctx, zone)
 	if err != nil {
 		return dns.Record{}, err
 	}
-	cur, err := p.getSet(ctx, zid, r.Name, r.Type)
+	cur, err := p.getSet(ctx, ref.id, r.Name, r.Type)
 	if err != nil {
 		return dns.Record{}, err
 	}
@@ -425,7 +565,15 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		return dns.Record{}, fmt.Errorf("route53: %s %s set has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, n, dns.ErrRecordExists)
 	}
 	r.TTL = int(ttlOf(r))
-	if err := p.change(ctx, zid, types.ChangeActionUpsert, newSet(r, int64(r.TTL)), "update record "+r.Name); err != nil {
+	set := newSet(r, int64(r.TTL))
+	// compare-and-swap: DELETE only succeeds if the set is still exactly what
+	// was read, so a concurrent change fails the batch instead of being lost
+	if err := p.change(ctx, ref.id, "update record "+r.Name,
+		types.Change{Action: types.ChangeActionDelete, ResourceRecordSet: cur},
+		types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
+		return dns.Record{}, err
+	}
+	if err := p.verify(ctx, ref.id, "update record "+r.Name, r.Name, r.Type, r.Value); err != nil {
 		return dns.Record{}, err
 	}
 	return r, nil
@@ -438,15 +586,16 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	if err := checkType(r); err != nil {
 		return err
 	}
-	zid, err := p.zoneID(ctx, zone)
+	ref, err := p.zoneFor(ctx, zone)
 	if err != nil {
 		return err
 	}
-	cur, err := p.getSet(ctx, zid, r.Name, r.Type)
-	if err != nil || cur == nil {
+	cur, err := p.getSet(ctx, ref.id, r.Name, r.Type)
+	if err != nil || cur == nil || cur.AliasTarget != nil {
 		return err
 	}
 	var rest []types.ResourceRecord
+	var restVals []string
 	found := false
 	for _, rr := range cur.ResourceRecords {
 		if aws.ToString(rr.Value) == r.Value {
@@ -454,20 +603,25 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 			continue
 		}
 		rest = append(rest, rr)
+		restVals = append(restVals, aws.ToString(rr.Value))
 	}
 	if !found {
 		return nil // never delete a record with a different value
 	}
-	if len(rest) == 0 {
-		return p.change(ctx, zid, types.ChangeActionDelete, *cur, "delete record "+r.Name)
+	op := "delete record " + r.Name
+	changes := []types.Change{{Action: types.ChangeActionDelete, ResourceRecordSet: cur}}
+	if len(rest) > 0 {
+		keep := *cur
+		keep.ResourceRecords = rest
+		changes = append(changes, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &keep})
 	}
-	upd := *cur
-	upd.ResourceRecords = rest
-	return p.change(ctx, zid, types.ChangeActionUpsert, upd, "delete record value "+r.Name)
+	if err := p.change(ctx, ref.id, op, changes...); err != nil {
+		return err
+	}
+	return p.verify(ctx, ref.id, op, r.Name, r.Type, restVals...)
 }
 
 // String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
+// provider.
 func (p *Provider) String() string   { return "route53.Provider" }
 func (p *Provider) GoString() string { return "route53.Provider" }

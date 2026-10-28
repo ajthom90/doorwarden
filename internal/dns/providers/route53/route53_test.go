@@ -40,21 +40,31 @@ type set struct {
 }
 
 type backend struct {
-	mu                  sync.Mutex
-	zones               []*zone
-	failCode            string // when set, every call fails with this error code
-	slow                time.Duration
-	listed              []string // hosted zone ids whose rrsets were listed
-	zonePages, setPages int
-	brokenTrunc         bool // truncated pages without a continuation marker
+	mu                       sync.Mutex
+	zones                    []*zone
+	failCode                 string // when set, every call fails with this error code
+	slow                     time.Duration
+	listed                   []string // hosted zone ids whose rrsets were listed
+	zonePages, setPages      int
+	badAll, badSets, badPost string // serve a malformed HTTP 200 body for all / rrset / change requests
+	dropChange               bool   // acknowledge changes without applying them
+	brokenTrunc              bool   // truncated pages without a continuation marker
+}
+
+// mkzone builds a hosted zone with the apex SOA and NS sets every real zone has.
+func mkzone(id, name string, private bool) *zone {
+	z := &zone{id: id, name: name, private: private, sets: map[string]*set{}}
+	z.sets[name+"|SOA"] = &set{name: name, typ: "SOA", ttl: 900, vals: []string{"ns-1.example.net. hostmaster.example.net. 1 7200 900 1209600 86400"}}
+	z.sets[name+"|NS"] = &set{name: name, typ: "NS", ttl: 172800, vals: []string{"ns-1.example.net."}}
+	return z
 }
 
 func newBackend() *backend {
 	return &backend{zones: []*zone{
-		{id: "ZTEST", name: "test.", sets: map[string]*set{}},
-		{id: "ZEXAMPLE", name: "example.test.", sets: map[string]*set{}},
-		{id: "ZPRIV", name: "example.test.", private: true, sets: map[string]*set{}},
-		{id: "ZOTHER", name: "other.test.", sets: map[string]*set{}},
+		mkzone("ZTEST", "test.", false),
+		mkzone("ZEXAMPLE", "example.test.", false),
+		mkzone("ZPRIV", "example.test.", true),
+		mkzone("ZOTHER", "other.test.", false),
 	}}
 }
 
@@ -70,6 +80,24 @@ func (b *backend) zone(id string) *zone {
 // norm mirrors Route 53 name handling: case-insensitive, always stored with a
 // trailing dot.
 func norm(n string) string { return strings.TrimSuffix(strings.ToLower(n), ".") + "." }
+
+func (b *backend) writeBad(w http.ResponseWriter, mode string) {
+	switch mode {
+	case "empty":
+	case "json":
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	case "emptyxml":
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(`<ListResourceRecordSetsResponse/>`))
+	case "html":
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>Please log in to the network</body></html>`))
+	case "trunc":
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(`<ListResourceRecordSetsResponse xmlns="https://route53.amazonaws.com/doc/2013-04-01/"><ResourceRecordSets><ResourceRecordSet><Name>a.exa`))
+	}
+}
 
 func xmlErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "text/xml")
@@ -103,6 +131,14 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			code = 403
 		}
 		xmlErr(w, code, b.failCode, "failed; credential "+fakeSecret)
+		return
+	}
+	if b.badAll != "" || (b.badSets != "" && strings.Contains(r.URL.Path, "/rrset") && r.Method == "GET") {
+		mode := b.badAll
+		if mode == "" {
+			mode = b.badSets
+		}
+		b.writeBad(w, mode)
 		return
 	}
 	if !strings.Contains(r.Header.Get("Authorization"), "Credential="+fakeKeyID+"/") {
@@ -210,6 +246,14 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			xmlErr(w, 400, "MalformedXML", err.Error())
 			return
 		}
+		if b.badPost != "" {
+			b.writeBad(w, b.badPost)
+			return
+		}
+		next := map[string]*set{}
+		for k, v := range z.sets {
+			next[k] = v
+		}
 		for _, c := range cb.Changes {
 			c.Set.Name = norm(c.Set.Name)
 			key := c.Set.Name + "|" + c.Set.Type
@@ -219,20 +263,25 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			switch c.Action {
 			case "CREATE":
-				if _, ok := z.sets[key]; ok {
+				if _, ok := next[key]; ok {
 					xmlErr(w, 400, "InvalidChangeBatch", "Tried to create resource record set but it already exists")
 					return
 				}
-				z.sets[key] = &set{name: c.Set.Name, typ: c.Set.Type, ttl: c.Set.TTL, vals: vals}
+				next[key] = &set{name: c.Set.Name, typ: c.Set.Type, ttl: c.Set.TTL, vals: vals}
 			case "UPSERT":
-				z.sets[key] = &set{name: c.Set.Name, typ: c.Set.Type, ttl: c.Set.TTL, vals: vals}
+				next[key] = &set{name: c.Set.Name, typ: c.Set.Type, ttl: c.Set.TTL, vals: vals}
 			case "DELETE":
-				if _, ok := z.sets[key]; !ok {
-					xmlErr(w, 400, "InvalidChangeBatch", "not found")
+				cur, ok := next[key]
+				// like the real service, DELETE must match the stored set exactly
+				if !ok || cur.ttl != c.Set.TTL || strings.Join(cur.vals, ",") != strings.Join(vals, ",") {
+					xmlErr(w, 400, "InvalidChangeBatch", "Tried to delete resource record set but it was not found or its values do not match")
 					return
 				}
-				delete(z.sets, key)
+				delete(next, key)
 			}
+		}
+		if !b.dropChange {
+			z.sets = next // the batch is atomic
 		}
 		fmt.Fprintf(w, `<ChangeResourceRecordSetsResponse %s><ChangeInfo><Id>/change/C1</Id><Status>PENDING</Status><SubmittedAt>2024-01-01T00:00:00Z</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>`, ns)
 	default:
@@ -285,14 +334,14 @@ func TestZoneAutoDiscoveryLongestSuffix(t *testing.T) {
 	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.zone("ZEXAMPLE").sets) != 1 || len(b.zone("ZTEST").sets) != 0 || len(b.zone("ZPRIV").sets) != 0 {
+	if len(b.zone("ZEXAMPLE").sets) != 3 || len(b.zone("ZTEST").sets) != 2 || len(b.zone("ZPRIV").sets) != 2 {
 		t.Fatalf("record landed in wrong zone: example=%d test=%d priv=%d", len(b.zone("ZEXAMPLE").sets), len(b.zone("ZTEST").sets), len(b.zone("ZPRIV").sets))
 	}
 	// a sub-zone with no own hosted zone falls back to the parent
 	if _, err := p.CreateRecord(ctx, "lab.example.test", dns.Record{Name: "x.lab.example.test", Type: "A", Value: "192.0.2.2"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.zone("ZEXAMPLE").sets) != 2 {
+	if len(b.zone("ZEXAMPLE").sets) != 4 {
 		t.Fatal("sub-zone record not in parent zone")
 	}
 	// a zone with no matching hosted zone
@@ -304,7 +353,7 @@ func TestZoneAutoDiscoveryLongestSuffix(t *testing.T) {
 func TestPrivateZoneOnlyWithHostedZoneID(t *testing.T) {
 	ctx := context.Background()
 	b := newBackend()
-	b.zones = []*zone{{id: "ZPRIV", name: "internal.test.", private: true, sets: map[string]*set{}}}
+	b.zones = []*zone{mkzone("ZPRIV", "internal.test.", true)}
 	p := newProvider(t, b, nil)
 	if _, err := p.ListRecords(ctx, "internal.test"); err == nil || !strings.Contains(err.Error(), "hosted_zone_id") {
 		t.Fatalf("private zone chosen implicitly: %v", err)
@@ -313,7 +362,7 @@ func TestPrivateZoneOnlyWithHostedZoneID(t *testing.T) {
 	if _, err := pinned.CreateRecord(ctx, "internal.test", dns.Record{Name: "a.internal.test", Type: "A", Value: "192.0.2.5"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.zone("ZPRIV").sets) != 1 {
+	if len(b.zone("ZPRIV").sets) != 3 {
 		t.Fatal("pinned private zone not used")
 	}
 	if pinned.Capabilities().MultiZone {
@@ -370,7 +419,7 @@ func TestMultiValueSetAndWildcardEscaping(t *testing.T) {
 	b.zone("ZEXAMPLE").sets[`foreign.example.test.|A`] = &set{name: `foreign.example.test.`, typ: "A", ttl: 60, vals: []string{"192.0.2.7", "192.0.2.8"}}
 	p := newProvider(t, b, nil)
 	recs, _ := p.ListRecords(ctx, "example.test")
-	if len(recs) != 2 {
+	if len(recs) != 3 { // two A values + the apex NS
 		t.Fatalf("recs = %+v", recs)
 	}
 	// deleting one value of a multi-value set keeps the other
@@ -378,7 +427,7 @@ func TestMultiValueSetAndWildcardEscaping(t *testing.T) {
 		t.Fatal(err)
 	}
 	recs, _ = p.ListRecords(ctx, "example.test")
-	if len(recs) != 1 || recs[0].Value != "192.0.2.8" {
+	if len(recs) != 2 || recs[1].Value != "192.0.2.8" {
 		t.Fatalf("recs = %+v", recs)
 	}
 	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "*.example.test", Type: "A", Value: "192.0.2.9"}); err != nil {
@@ -424,7 +473,7 @@ func TestPaginationCoversAllPages(t *testing.T) {
 	}
 	p := newProvider(t, b, nil)
 	recs, err := p.ListRecords(ctx, "example.test")
-	if err != nil || len(recs) != 8 {
+	if err != nil || len(recs) != 9 {
 		t.Fatalf("recs=%d err=%v", len(recs), err)
 	}
 	if b.zonePages < 3 || b.setPages < 3 {
@@ -476,5 +525,134 @@ func TestTXTNotSupportedAndBrokenPagination(t *testing.T) {
 	b.brokenTrunc = true
 	if _, err := p.ListRecords(ctx, "example.test"); err == nil || !strings.Contains(err.Error(), "next") {
 		t.Fatalf("truncated page without marker accepted: %v", err)
+	}
+}
+
+func TestMalformedResponsesFailClosed(t *testing.T) {
+	ctx := context.Background()
+	rec := dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}
+	ops := map[string]func(p *route53.Provider) error{
+		"list":   func(p *route53.Provider) error { _, err := p.ListRecords(ctx, "example.test"); return err },
+		"test":   func(p *route53.Provider) error { return p.Test(ctx) },
+		"create": func(p *route53.Provider) error { _, err := p.CreateRecord(ctx, "example.test", rec); return err },
+		"update": func(p *route53.Provider) error { _, err := p.UpdateRecord(ctx, "example.test", rec); return err },
+		"delete": func(p *route53.Provider) error { return p.DeleteRecord(ctx, "example.test", rec) },
+	}
+	for _, mode := range []string{"empty", "json", "emptyxml", "html", "trunc"} {
+		// every request is malformed (hosted zones included)
+		for name, op := range ops {
+			b := newBackend()
+			b.badAll = mode
+			if err := op(newProvider(t, b, nil)); err == nil {
+				t.Errorf("badAll=%s %s: malformed 200 accepted", mode, name)
+			}
+		}
+		// zones are fine, record-set reads are malformed
+		for name, op := range ops {
+			if name == "test" {
+				continue
+			}
+			b := newBackend()
+			b.seed("ZEXAMPLE", "a.example.test", "192.0.2.1")
+			b.badSets = mode
+			if err := op(newProvider(t, b, nil)); err == nil {
+				t.Errorf("badSets=%s %s: malformed 200 accepted", mode, name)
+			}
+		}
+		// a malformed answer to the change itself
+		for _, name := range []string{"create", "update", "delete"} {
+			b := newBackend()
+			b.seed("ZEXAMPLE", "a.example.test", "192.0.2.9")
+			if name == "create" {
+				delete(b.zone("ZEXAMPLE").sets, "a.example.test.|A")
+			}
+			b.badPost = mode
+			if err := ops[name](newProvider(t, b, nil)); err == nil && name != "delete" {
+				t.Errorf("badPost=%s %s: accepted", mode, name)
+			}
+		}
+	}
+}
+
+func TestDeleteWithMalformedChangeStillDetected(t *testing.T) {
+	// delete of the exact value with a malformed change answer must error
+	b := newBackend()
+	b.seed("ZEXAMPLE", "a.example.test", "192.0.2.1")
+	b.badPost = "json"
+	err := newProvider(t, b, nil).DeleteRecord(context.Background(), "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"})
+	if err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSilentlyDroppedChangesDetected(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.dropChange = true
+	p := newProvider(t, b, nil)
+	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"})
+	if err == nil || !strings.Contains(err.Error(), "refusing to report success") {
+		t.Fatalf("create: err = %v", err)
+	}
+	b.dropChange = false
+	b.seed("ZEXAMPLE", "d.example.test", "192.0.2.5")
+	b.dropChange = true
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.5"}); err == nil {
+		t.Fatal("dropped delete reported success")
+	}
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.6"}); err == nil {
+		t.Fatal("dropped update reported success")
+	}
+}
+
+func TestListingWithoutApexSOAandNSIsIncomplete(t *testing.T) {
+	b := newBackend()
+	delete(b.zone("ZEXAMPLE").sets, "example.test.|SOA")
+	if _, err := newProvider(t, b, nil).ListRecords(context.Background(), "example.test"); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("err = %v", err)
+	}
+	b = newBackend()
+	delete(b.zone("ZEXAMPLE").sets, "example.test.|NS")
+	if _, err := newProvider(t, b, nil).ListRecords(context.Background(), "example.test"); err == nil {
+		t.Fatal("missing NS accepted")
+	}
+}
+
+func TestUpdateIsCompareAndSwap(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.seed("ZEXAMPLE", "c.example.test", "192.0.2.1")
+	p := newProvider(t, b, nil)
+	// a competing writer changes the set between our read and our batch
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			b.mu.Lock()
+			b.zone("ZEXAMPLE").sets["c.example.test.|A"].vals = []string{"192.0.2.77"}
+			b.mu.Unlock()
+		}
+		b.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	cas, err := route53.New(ctx, route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = p
+	if _, err := cas.UpdateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.2"}); err == nil {
+		t.Fatal("update overwrote a concurrent change")
+	}
+	if got := b.zone("ZEXAMPLE").sets["c.example.test.|A"].vals; len(got) != 1 || got[0] != "192.0.2.77" {
+		t.Fatalf("concurrent change lost: %v", got)
+	}
+}
+
+func TestTestResolvesAZone(t *testing.T) {
+	b := newBackend()
+	if err := newProvider(t, b, nil).Test(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.badAll = "json"
+	if err := newProvider(t, b, nil).Test(context.Background()); err == nil {
+		t.Fatal("malformed Test accepted")
 	}
 }
