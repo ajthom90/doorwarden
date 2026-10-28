@@ -270,6 +270,30 @@ func TestConcurrentUpdatesRaceClean(t *testing.T) {
 	}
 }
 
+func TestClearCertExpiryUnregisteredIsNoop(t *testing.T) {
+	m := New("dev")
+	m.SetCertExpiry("unregistered.example.test", time.Now().Add(time.Hour)) // shared "other" series
+	m.ClearCertExpiry("another-unregistered.example.test")
+	m.ClearCertExpiry("other")
+	if body, _ := scrape(t, m); !strings.Contains(body, `doorwarden_cert_expiry_seconds{zone="other"}`) {
+		t.Fatal("shared other series was cleared by an unregistered zone")
+	}
+}
+
+func TestNotificationResultsClosedSet(t *testing.T) {
+	m := New("dev")
+	for _, r := range []string{"rate_limited", "filtered_severity", "dropped_queue_full", "suppressed_dedupe"} {
+		m.Notification("dispatcher", r)
+		if v := value(t, m, "doorwarden_notifications_total", map[string]string{"sender": "dispatcher", "result": r}); v != 1 {
+			t.Errorf("%s = %v", r, v)
+		}
+	}
+	m.Notification("dispatcher", "dropped") // retired value
+	if v := value(t, m, "doorwarden_notifications_total", map[string]string{"sender": "dispatcher", "result": "other"}); v != 1 {
+		t.Errorf("unknown result not mapped to other: %v", v)
+	}
+}
+
 func TestClearCertExpiry(t *testing.T) {
 	m := New("dev")
 	m.AllowZones("example.test")

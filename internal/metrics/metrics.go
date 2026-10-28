@@ -28,8 +28,8 @@ var (
 	dnsOps        = []string{"ensure", "delete", "list"}
 	opResults     = []string{"ok", "error"}
 	renewResults  = []string{"ok", "error"}
-	senderTypes   = []string{"webhook", "ntfy", "smtp"}
-	notifyResults = []string{"ok", "error", "dropped"}
+	senderTypes   = []string{"webhook", "ntfy", "smtp", "dispatcher"}
+	notifyResults = []string{"ok", "error", "rate_limited", "filtered_severity", "dropped_queue_full", "suppressed_dedupe"}
 )
 
 // maxAllowed caps each admin-registered allowlist.
@@ -68,6 +68,13 @@ func (s *set) add(vs ...string) {
 			s.m[v] = struct{}{}
 		}
 	}
+}
+
+func (s *set) has(v string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.m[v]
+	return ok
 }
 
 // norm returns v if allowed, else "other".
@@ -234,8 +241,9 @@ func (m *Metrics) DNSOperation(providerType, op, result string) {
 	m.dnsOps.WithLabelValues(m.providerTypes.norm(providerType), m.ops.norm(op), m.opRes.norm(result)).Inc()
 }
 
-// SetCertExpiry records the earliest certificate expiry for a configured
-// zone; the exposed value counts down at scrape time.
+// SetCertExpiry records the earliest certificate expiry for a zone
+// registered with AllowZones (unregistered zones collapse into one "other"
+// series, so T19 must register every configured zone); the exposed value counts down at scrape time.
 func (m *Metrics) SetCertExpiry(zone string, notAfter time.Time) {
 	if m == nil {
 		return
@@ -243,13 +251,22 @@ func (m *Metrics) SetCertExpiry(zone string, notAfter time.Time) {
 	m.certs.set(m.zones.norm(zone), notAfter)
 }
 
-// ClearCertExpiry removes a zone's expiry series.
+// ClearCertExpiry removes a registered zone's expiry series. Unregistered
+// zones share the "other" series, so clearing one is a no-op.
 func (m *Metrics) ClearCertExpiry(zone string) {
-	if m == nil {
+	if m == nil || !m.zones.has(zone) {
 		return
 	}
-	m.certs.clear(m.zones.norm(zone))
+	m.certs.clear(zone)
 }
+
+// ActionKinds returns the closed set of doorwarden_reconcile_actions_total
+// kind values (the reconcile.ActionKind names).
+func ActionKinds() []string { return append([]string(nil), actionKinds...) }
+
+// ServiceStates returns the closed set of doorwarden_services state values
+// (the model.State* constants).
+func ServiceStates() []string { return append([]string(nil), serviceStates...) }
 
 // CertRenewal counts one issuance/renewal attempt (result: ok|error).
 func (m *Metrics) CertRenewal(result string) {
