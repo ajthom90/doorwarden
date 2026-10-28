@@ -5,16 +5,30 @@
 #
 # Layout expected next to this file:
 #   config/doorwarden.yaml   Doorwarden config
-#   data/                    SQLite state + certificates (data/certs/)
+#   data/                    SQLite state
+#   certs/                   certificates (Doorwarden rw, Traefik ro)
 #   traefik-dynamic/         file-provider output written by Doorwarden
 #   traefik/traefik.yml      static config (deploy/traefik/traefik.yml)
+#
+# One-time init (doorwarden and traefik both run as UID/GID 65532 so
+# Doorwarden's 0600 key files stay readable by Traefik without loosening
+# their permissions):
+#   mkdir -p data certs traefik-dynamic
+#   chown -R 65532:65532 ./data ./traefik-dynamic ./certs
 
 name: doorwarden
 
 services:
   doorwarden:
-    image: ghcr.io/ajthom90/doorwarden:${DOORWARDEN_TAG:-latest}
+    image: ghcr.io/ajthom90/doorwarden:${DOORWARDEN_TAG:?set DOORWARDEN_TAG to a release version, e.g. 1.0.0}
     restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
     environment:
       DOORWARDEN_MASTER_KEY: ${DOORWARDEN_MASTER_KEY:?set DOORWARDEN_MASTER_KEY}
       TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
@@ -22,6 +36,7 @@ services:
     volumes:
       - ./config:/config:ro
       - ./data:/data
+      - ./certs:/data/certs
       - ./traefik-dynamic:/etc/traefik/dynamic:rw
     networks:
       - default   # outbound: DNS provider APIs, ACME, TrueNAS API
@@ -40,13 +55,23 @@ services:
     image: traefik:v3.5
     restart: unless-stopped
     command: ["--configFile=/etc/traefik/traefik.yml"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    # If the host's net.ipv4.ip_unprivileged_port_start is not 0, binding
+    # :80/:443 as non-root fails: uncomment (see docs/deploy.md).
+    # cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
     ports:
       - "${TRAEFIK_HTTP_PORT:-80}:80"
       - "${TRAEFIK_HTTPS_PORT:-443}:443"
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik-dynamic:/etc/traefik/dynamic:ro
-      - ./data/certs:/certs:ro   # certificates written by Doorwarden
+      - ./certs:/certs:ro   # certificates written by Doorwarden
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
       interval: 30s

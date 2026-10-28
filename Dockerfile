@@ -15,12 +15,17 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/doorwarden ./cmd/doorwarden
+# Pre-create the state directories (distroless has no shell to mkdir/chown).
+RUN mkdir -p /out/rootfs/data /out/rootfs/config
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/doorwarden /doorwarden
-# /data holds SQLite state and certificates, /config the config file. Mount
-# volumes owned by uid 65532 (the distroless nonroot user).
-VOLUME ["/data", "/config"]
+# /data holds SQLite state and certificates, /config the config file; both
+# are pre-created owned by 65532 (the distroless nonroot user). No VOLUME
+# directive: it would create root-owned anonymous volumes; bind mount your
+# own (chown 65532:65532).
+COPY --from=build --chown=65532:65532 /out/rootfs/data /data
+COPY --from=build --chown=65532:65532 /out/rootfs/config /config
 EXPOSE 8080
 USER 65532:65532
 # The /healthz endpoint is served by the control plane; DOORWARDEN_HEALTH_URL

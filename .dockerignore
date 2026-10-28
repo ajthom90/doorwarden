@@ -6,3 +6,7 @@ deploy
 *.md
 **/*_test.go
 .env
+.superpowers
+*.key
+*.pem
+**/.env*

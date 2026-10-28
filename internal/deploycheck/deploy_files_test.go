@@ -135,6 +135,37 @@ func TestComposeSafety(t *testing.T) {
 	if !dynRW {
 		t.Error("doorwarden needs rw dynamic dir")
 	}
+	// Hardening on all three services, and only traefik publishes ports.
+	var users []any
+	for _, n := range []string{"doorwarden", "traefik", "docker-socket-proxy"} {
+		sv := sub(t, svcs, n)
+		if caps, _ := sv["cap_drop"].([]any); len(caps) != 1 || caps[0] != "ALL" {
+			t.Errorf("%s: cap_drop %v", n, sv["cap_drop"])
+		}
+		if sec, _ := sv["security_opt"].([]any); len(sec) != 1 || sec[0] != "no-new-privileges:true" {
+			t.Errorf("%s: security_opt %v", n, sv["security_opt"])
+		}
+		if sv["read_only"] != true {
+			t.Errorf("%s: read_only %v", n, sv["read_only"])
+		}
+		_, hasPorts := sv["ports"]
+		if hasPorts != (n == "traefik") {
+			t.Errorf("%s: ports published=%v (only traefik may publish)", n, hasPorts)
+		}
+		if n != "docker-socket-proxy" {
+			users = append(users, sv["user"])
+		}
+	}
+	if users[0] != "65532:65532" || users[0] != users[1] {
+		t.Errorf("doorwarden and traefik must share user 65532:65532, got %v", users)
+	}
+	var tports []string
+	for _, p := range sub(t, svcs, "traefik")["ports"].([]any) {
+		tports = append(tports, p.(string))
+	}
+	if len(tports) != 2 || !strings.HasSuffix(tports[0], ":80") || !strings.HasSuffix(tports[1], ":443") {
+		t.Errorf("traefik ports %v", tports)
+	}
 	raw, _ := os.ReadFile("../../deploy/compose.truenas.yml")
 	if strings.Contains(strings.ToLower(string(raw)), "certificatesresolvers") {
 		t.Error("compose must not configure ACME in Traefik")
@@ -178,7 +209,7 @@ func TestComposeConfigWithDocker(t *testing.T) {
 		t.Skip("docker compose unavailable")
 	}
 	env := filepath.Join(t.TempDir(), "dummy.env")
-	os.WriteFile(env, []byte("DOORWARDEN_MASTER_KEY=dummy\n"), 0o600)
+	os.WriteFile(env, []byte("DOORWARDEN_MASTER_KEY=dummy\nDOORWARDEN_TAG=1.0.0\n"), 0o600)
 	out, err := exec.Command("docker", "compose", "--env-file", env, "-f", "../../deploy/compose.truenas.yml", "config", "-q").CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker compose config: %v\n%s", err, out)
@@ -198,5 +229,62 @@ func TestDockerSourceSingleEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(src, "ContainersListPath") {
 		t.Error("docker source must build its URL from ContainersListPath")
+	}
+}
+
+func TestReleaseWorkflowLatestOnlyForStable(t *testing.T) {
+	b, err := os.ReadFile("../../.github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf map[string]any
+	if err := yaml.Unmarshal(b, &wf); err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	cond := "enable=${{ !contains(github.ref_name, '-') }}"
+	for _, line := range strings.Split(src, "\n") {
+		if strings.Contains(line, "value=latest") && !strings.Contains(line, cond) {
+			t.Errorf("latest tag lacks stable-only condition: %q", line)
+		}
+	}
+	if !strings.Contains(src, "value=latest,"+cond) {
+		t.Error("latest tag rule missing")
+	}
+	perms := sub(t, wf, "permissions")
+	if perms["contents"] != "read" {
+		t.Error("top-level permissions")
+	}
+	ci := loadYAML(t, ".github/workflows/ci.yml")
+	if sub(t, ci, "permissions")["contents"] != "read" {
+		t.Error("ci.yml needs top-level permissions: contents: read")
+	}
+}
+
+func TestEnvExampleHasNoUsableSecrets(t *testing.T) {
+	b, _ := os.ReadFile("../../deploy/.env.example")
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(l, "DOORWARDEN_MASTER_KEY=") && strings.TrimPrefix(l, "DOORWARDEN_MASTER_KEY=") != "" {
+			t.Errorf("master key must be empty in the example: %q", l)
+		}
+		if strings.Contains(l, "change-me") && !strings.HasPrefix(l, "#") {
+			t.Errorf("placeholder secret: %q", l)
+		}
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		return
+	}
+	if exec.Command("docker", "compose", "version").Run() != nil {
+		return
+	}
+	cmd := exec.Command("docker", "compose", "--env-file", "../../deploy/.env.example", "-f", "../../deploy/compose.truenas.yml", "config", "-q")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Errorf("compose accepted the unmodified .env.example: %s", out)
+	}
+	cmd = exec.Command("docker", "compose", "--env-file", "../../deploy/.env.example", "-f", "../../deploy/compose.truenas.yml", "config", "-q")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "DOORWARDEN_MASTER_KEY=x", "DOORWARDEN_TAG=1.0.0"}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("compose config with required vars set: %v\n%s", err, out)
 	}
 }

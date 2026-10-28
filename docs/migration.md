@@ -38,13 +38,32 @@ Keep `settings.dry_run: true` and the staging issuer (the default) for now.
 
 ## 2. Run the importer
 
-The importer opens NPM's database read-only. Use `--copy` while NPM is
-running (it works on a temporary copy and removes it afterwards):
+The importer never reads NPM's database in place: by default it takes a
+snapshot copy (database plus any `-wal`/`-shm` files) into a private `0700`
+temp directory named `doorwarden-npm-*`, reads the copy, and removes it on
+exit or on SIGINT/SIGTERM. The original directory is not touched, so a
+read-only mount is fine. The copy contains NPM's data, including credentials:
+if the process is killed with `-9` the directory can be left behind in the
+temp directory (`/tmp`); delete any `doorwarden-npm-*` directory you find.
+`--no-copy` exists but is unsafe (SQLite may create sidecar files next to
+NPM's database); it is refused when `-wal`/`-shm` files exist or the
+directory is not writable.
+
+The image is distroless (no shell), so run the subcommand directly, mounting
+NPM's data volume read-only:
 
 ```
-doorwarden import-npm --db /path/to/npm-data/database.sqlite --copy \
-    --config /config/doorwarden.yaml --discovered discovered.json
+docker run --rm \
+    -v <npm-data>:/npm:ro \
+    -v <config-dir>:/config:ro \
+    ghcr.io/ajthom90/doorwarden:<tag> \
+    import-npm --db /npm/database.sqlite \
+    --config /config/doorwarden.yaml --discovered /config/discovered.json
 ```
+
+Add `--yaml` for the paste-ready entries. Hosts with an access list, hosts
+disabled in NPM and hosts with custom nginx config are never emitted as live
+YAML; they appear as `# SKIPPED <domain>: <reason>` comments.
 
 `discovered.json` (optional; live discovery wiring is part of the control
 plane itself) is a JSON array of what Doorwarden already discovers:
@@ -97,7 +116,11 @@ scripts/verify.sh hosts.txt --resolve 192.0.2.10 --port 8443 --insecure
 ```
 
 `hosts.txt` is one hostname per line (`#` comments allowed). Expect the
-summary to flag `STAGING` issuers. Fix every FAIL before continuing.
+summary to flag `STAGING` issuers. Note that Traefik's HTTP-to-HTTPS redirect
+targets the `websecure` entry point (port 443), not the trial's published
+8443: during the trial a redirect from :8080 points at :443, which is still
+NPM. Test the trial with `https://` and `--port 8443` directly, as above, not
+by following redirects. Fix every FAIL before continuing.
 
 When satisfied, switch the issuer to production, let certificates issue, and
 re-run `verify.sh` without `--insecure`: the issuer should no longer be

@@ -14,8 +14,28 @@ traefik-dynamic/           written by Doorwarden, read by Traefik
 traefik/traefik.yml        copy of deploy/traefik/traefik.yml
 ```
 
-The image runs as the non-root user `65532`; give it ownership of `data/`
-and `traefik-dynamic/`.
+Both `doorwarden` and `traefik` run as UID/GID `65532`, so Doorwarden's
+`0600` key files remain readable by Traefik without loosening permissions.
+One-time init (the paths are bind mounts you must own):
+
+```
+mkdir -p data certs traefik-dynamic
+chown -R 65532:65532 ./data ./traefik-dynamic ./certs
+```
+
+All three containers run with `read_only: true`, `cap_drop: [ALL]` and
+`no-new-privileges`; only `traefik` publishes host ports (80/443), and
+`doorwarden` publishes none. The image pre-creates `/data` and `/config`
+owned by 65532 but declares no `VOLUME`.
+
+**Binding :80/:443 as non-root.** Docker sets
+`net.ipv4.ip_unprivileged_port_start=0` inside containers, so Traefik (65532)
+can normally bind them. If Traefik logs `permission denied` binding `:80`,
+check the value the container sees:
+`docker run --rm alpine cat /proc/sys/net/ipv4/ip_unprivileged_port_start`
+(or `sysctl net.ipv4.ip_unprivileged_port_start` on a host-network setup).
+If it is not 0, uncomment `cap_add: [NET_BIND_SERVICE]` on the `traefik`
+service (it is the only capability to add back).
 
 ## Deploy
 
@@ -57,8 +77,9 @@ request.
 
 | Variable | Purpose |
 | --- | --- |
-| `DOORWARDEN_TAG` | image tag |
-| `DOORWARDEN_MASTER_KEY` | encrypts secrets at rest (required) |
+| `DOORWARDEN_TAG` | image tag (required; a release version such as `1.0.0`; `latest` only tracks stable releases) |
+| `DOORWARDEN_MASTER_KEY` | encrypts secrets at rest (required, no default; generate with `openssl rand -base64 32`) |
+| `DOCKER_GID` | group owning `/var/run/docker.sock` (`stat -c %g /var/run/docker.sock`) |
 | `TRAEFIK_HTTP_PORT`, `TRAEFIK_HTTPS_PORT` | published ports (use 8080/8443 for a trial) |
 | `TRUENAS_API_KEY`, `DNS_API_TOKEN` | referenced from the config as `${NAME}` |
 
