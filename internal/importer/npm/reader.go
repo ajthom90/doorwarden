@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver
@@ -22,11 +23,19 @@ import (
 
 // Options configure Open.
 type Options struct {
-	// CopyFirst copies the database (and its -wal/-shm siblings) to a private
-	// temp directory and reads the copy. Use it when NPM is running, since it
-	// keeps the original open in WAL mode.
-	CopyFirst bool
+	// NoCopy reads the original file in place instead of a private snapshot
+	// copy. Unsafe: SQLite may create -wal/-shm files next to NPM's database
+	// (root-owned leftovers can break NPM). It is refused when WAL sidecars
+	// exist or the directory is not writable by this process. The default
+	// (false) snapshots the database, -wal and -shm into a 0700 temp dir
+	// named doorwarden-npm-* and reads that copy.
+	NoCopy bool
 }
+
+// TempPrefix is the name prefix of the temporary snapshot directory. The copy
+// contains NPM's data (including credentials); it is removed on Close and on
+// SIGINT/SIGTERM, but a kill -9 can leave it behind.
+const TempPrefix = "doorwarden-npm-"
 
 // Reader is a read-only handle on an NPM database.
 type Reader struct {
@@ -63,8 +72,12 @@ func Open(path string, opts ...Options) (*Reader, error) {
 		return nil, fmt.Errorf("npm database: %w", err)
 	}
 	cleanup := func() {}
-	if o.CopyFirst {
-		dir, err := os.MkdirTemp("", "doorwarden-npm-*")
+	if o.NoCopy {
+		if err := checkInPlace(path); err != nil {
+			return nil, err
+		}
+	} else {
+		dir, err := os.MkdirTemp("", TempPrefix+"*")
 		if err != nil {
 			return nil, err
 		}
@@ -83,10 +96,13 @@ func Open(path string, opts ...Options) (*Reader, error) {
 		cleanup()
 		return nil, err
 	}
-	u := url.URL{Scheme: "file", Path: abs, RawQuery: url.Values{
-		"mode":    {"ro"},
+	q := url.Values{
 		"_pragma": {"query_only(1)", "busy_timeout(5000)"},
-	}.Encode()}
+	}
+	if o.NoCopy {
+		q.Set("mode", "ro")
+	}
+	u := url.URL{Scheme: "file", Path: abs, RawQuery: q.Encode()}
 	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		cleanup()
@@ -94,6 +110,19 @@ func Open(path string, opts ...Options) (*Reader, error) {
 	}
 	db.SetMaxOpenConns(1)
 	return &Reader{db: db, cleanup: cleanup}, nil
+}
+
+// checkInPlace refuses unsafe in-place reads.
+func checkInPlace(path string) error {
+	for _, suf := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(path + suf); err == nil {
+			return fmt.Errorf("refusing --no-copy: %s exists next to the database (NPM is running or was not shut down cleanly); use the default snapshot copy", filepath.Base(path+suf))
+		}
+	}
+	if err := syscall.Access(filepath.Dir(path), 2); err != nil {
+		return fmt.Errorf("refusing --no-copy: directory %s is not writable by this user, so SQLite could not create its sidecar files safely; use the default snapshot copy", filepath.Dir(path))
+	}
+	return nil
 }
 
 func copyFile(src, dst string, optional bool) error {

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/importer/npm"
@@ -20,7 +22,8 @@ func runImportNPM(args []string, out io.Writer) int {
 	fs := flag.NewFlagSet("import-npm", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	dbPath := fs.String("db", "", "path to NPM database.sqlite (required)")
-	cp := fs.Bool("copy", false, "copy the database to a temp dir first (use while NPM is running)")
+	_ = fs.Bool("copy", true, "snapshot-copy the database to a private temp dir (default; flag kept for compatibility)")
+	noCopy := fs.Bool("no-copy", false, "UNSAFE: read the database in place; SQLite may create -wal/-shm next to NPM's files. Refused when sidecars exist or the directory is not writable")
 	cfgPath := fs.String("config", "", "doorwarden config file (for zones)")
 	disc := fs.String("discovered", "", `JSON file of discovered services: [{"key":"truenas:app","name":"app","host":"192.0.2.10","port":8080}]`)
 	asYAML := fs.Bool("yaml", false, "emit only suggested static: entries")
@@ -51,11 +54,21 @@ func runImportNPM(args []string, out io.Writer) int {
 		}
 		found = d
 	}
-	r, err := npm.Open(*dbPath, npm.Options{CopyFirst: *cp})
+	r, err := npm.Open(*dbPath, npm.Options{NoCopy: *noCopy})
 	if err != nil {
 		return fail(err)
 	}
 	defer r.Close()
+	// The snapshot copy holds NPM data; remove it if we are interrupted.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	go func() {
+		if _, ok := <-sig; ok {
+			r.Close()
+			os.Exit(130)
+		}
+	}()
 	snap, err := r.Read(context.Background())
 	if err != nil {
 		return fail(err)

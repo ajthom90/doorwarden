@@ -68,7 +68,7 @@ func discovered() []model.Service {
 
 func readSnap(t *testing.T, path string, copyFirst bool) *Snapshot {
 	t.Helper()
-	r, err := Open(path, Options{CopyFirst: copyFirst})
+	r, err := Open(path, Options{NoCopy: !copyFirst})
 	if err != nil {
 		t.Fatal(err)
 	}

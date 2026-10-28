@@ -34,6 +34,21 @@ type Mapping struct {
 	Flags           []string
 	SuggestedStatic *config.StaticService
 	MatchedService  string
+	// Skipped is non-empty when no paste-ready entry may be emitted for this
+	// static host; --yaml prints it as a comment instead.
+	Skipped string
+}
+
+// clean replaces C0/C1 control characters (including ESC, newlines and tabs)
+// and Unicode line/paragraph separators with '?', so untrusted NPM text can
+// neither break out of a YAML comment nor inject terminal escape sequences.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == 0x2028 || r == 0x2029 {
+			return '?'
+		}
+		return r
+	}, s)
 }
 
 // DiscoveredService is one entry of the --discovered JSON file: a JSON array
@@ -123,11 +138,12 @@ func planOne(h ProxyHost, dom string, certs map[int]Certificate, discovered []mo
 
 	for _, s := range discovered {
 		if s.Backend.Port == h.Port && sameHost(s.Backend.Host, h.Host) {
-			m.MatchedService = s.Key
 			switch {
 			case strings.HasPrefix(s.Key, "truenas:"):
+				m.MatchedService = s.Key
 				m.Class, m.Reason = ClassAuto, "forward target matches discovered TrueNAS app "+s.Name
 			case strings.HasPrefix(s.Key, "docker:"):
+				m.MatchedService = s.Key
 				m.Class, m.Reason = ClassLabel, "forward target matches discovered Docker container "+s.Name+"; add doorwarden.* labels"
 			default:
 				continue
@@ -136,6 +152,11 @@ func planOne(h ProxyHost, dom string, certs map[int]Certificate, discovered []mo
 		}
 	}
 
+	if h.AdvancedConfigLen > 0 {
+		// Refused: never auto/label, never a suggestion.
+		m.Class, m.MatchedService = ClassStatic, ""
+		m.Reason = "custom nginx config present: refused, review manually"
+	}
 	host := model.UnbracketHost(h.Host)
 	ip := net.ParseIP(host)
 	if ip == nil {
@@ -151,7 +172,7 @@ func planOne(h ProxyHost, dom string, certs map[int]Certificate, discovered []mo
 		flag("disabled in NPM")
 	}
 	if h.AdvancedConfigLen > 0 {
-		flag("custom nginx config present (%d bytes): NOT translated, review manually", h.AdvancedConfigLen)
+		flag("custom nginx config present (%d bytes): REFUSED, not translated, review manually", h.AdvancedConfigLen)
 	}
 	if h.AccessListID != 0 {
 		flag("access list attached (id %d): re-create as a Doorwarden middleware", h.AccessListID)
@@ -180,7 +201,17 @@ func planOne(h ProxyHost, dom string, certs map[int]Certificate, discovered []mo
 	if !inZone {
 		flag("domain outside configured zones - no zone")
 	}
-	if m.Class == ClassStatic && inZone && h.AdvancedConfigLen == 0 {
+	if m.Class == ClassStatic {
+		switch {
+		case h.AdvancedConfigLen > 0:
+			m.Skipped = "custom nginx config present - refused, review manually"
+		case h.AccessListID != 0:
+			m.Skipped = "NPM access list attached - recreate the restriction (middleware) first"
+		case !h.Enabled:
+			m.Skipped = "disabled in NPM"
+		}
+	}
+	if m.Class == ClassStatic && inZone && m.Skipped == "" {
 		m.SuggestedStatic = suggest(&m, h, dom, zone, scheme, host)
 	}
 	return m
@@ -226,7 +257,7 @@ func Render(w io.Writer, ms []Mapping) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "DOMAIN\tCLASS\tTARGET\tFLAGS")
 	for _, m := range ms {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", m.Domain, m.Class, m.ForwardTo, strings.Join(m.Flags, "; "))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", clean(m.Domain), m.Class, clean(m.ForwardTo), clean(strings.Join(m.Flags, "; ")))
 	}
 	tw.Flush()
 }
@@ -256,6 +287,13 @@ func RenderYAML(w io.Writer, ms []Mapping) error {
 		entries = append(entries, yamlEntry{s.ID, s.Name, s.Host, s.Port, s.Scheme, s.Zone, s.SkipVerify, s.Websockets})
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	for _, m := range ms {
+		if m.Skipped != "" && m.Class == ClassStatic {
+			if _, err := fmt.Fprintf(w, "# SKIPPED %s: %s\n", clean(m.Domain), clean(m.Skipped)); err != nil {
+				return err
+			}
+		}
+	}
 	if len(entries) == 0 {
 		_, err := fmt.Fprintln(w, "# no static entries suggested")
 		return err
@@ -278,7 +316,7 @@ func CertGuidance(snap *Snapshot) string {
 			continue
 		}
 		fmt.Fprintf(&b, "wildcard certificate %q (%s), expires %s\n  files: /etc/letsencrypt/live/npm-%d/ (inside the NPM data volume)\n  planned import (TODO, not yet available): doorwarden certs import-npm <npm-data>/letsencrypt/live/npm-%d/\n",
-			c.NiceName, strings.Join(c.Domains, ", "), c.ExpiresOn, c.ID, c.ID)
+			clean(c.NiceName), clean(strings.Join(c.Domains, ", ")), clean(c.ExpiresOn), c.ID, c.ID)
 	}
 	if b.Len() == 0 {
 		return "no wildcard certificates in NPM\n"
