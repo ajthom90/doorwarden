@@ -1,10 +1,11 @@
 // Package acme issues, renews and imports TLS certificates with lego.
 //
-// Certificates live on disk as <certs dir>/<id>/{fullchain,privkey}.pem
-// (directories 0700, files 0600, replaced atomically) and as rows in the
-// store's certs table (no key material). A managed certificate's id is
-// derived from its zone and names, so renewals and re-issues overwrite the
-// same files. Imported certificates (ImportPEM, ImportNPMDir) are rows with
+// Certificates live on disk as <certs dir>/<id>/v<N>/{fullchain,privkey}.pem
+// (directories 0700, files 0600, each version published atomically; see
+// writeCertVersion) and as rows in the store's certs table (no key
+// material) whose Path is "<id>/v<N>". A managed certificate's id is
+// derived from its zone and names, so renewals and re-issues of the same
+// set keep the id and add a version. Imported certificates (ImportPEM, ImportNPMDir) are rows with
 // managed=false and are never renewed automatically; RenewNow turns one into
 // a managed certificate on explicit request once its zone has an issuer.
 //
@@ -40,6 +41,8 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -288,6 +291,7 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 	legoLogOnce.Do(func() {
 		legolog.Logger = slog.NewLogLogger(redactHandler{inner: slog.Default().Handler(), r: globalRedactor}, slog.LevelDebug)
 	})
+	m.cleanupCertDirs(context.Background())
 	return m, nil
 }
 
@@ -830,17 +834,15 @@ func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer strin
 	if err == nil {
 		err = coversAll(leaf, names)
 	}
+	dj, _ := json.Marshal(names)
+	row := store.Cert{ID: id, Zone: normName(z.Name), DomainsJSON: string(dj), Issuer: issuer, Staging: dir.Staging,
+		Status: StatusValid, LastResult: "ok", Managed: true}
 	if err == nil {
-		err = writeCertFiles(m.certsDir, id, ob.ChainPEM, ob.KeyPEM)
+		row.NotAfter = leaf.NotAfter
+		row, err = m.storeVersion(ctx, row, ob.ChainPEM, ob.KeyPEM)
 	}
 	if err != nil {
 		return m.recordFailure(ctx, z, issuer, dir, id, names, err)
-	}
-	dj, _ := json.Marshal(names)
-	row := store.Cert{ID: id, Zone: normName(z.Name), DomainsJSON: string(dj), Issuer: issuer, Staging: dir.Staging,
-		NotAfter: leaf.NotAfter, Status: StatusValid, LastResult: "ok", Path: id, Managed: true}
-	if err := m.st.UpsertCert(ctx, row); err != nil {
-		m.log.Error("acme: certificate written but its row was not stored", "cert", id, "err", err)
 	}
 	m.stateMu.Lock()
 	if err := m.kv.putJSON(ctx, attemptKey(id), attemptState{}); err != nil {
@@ -852,8 +854,72 @@ func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer strin
 	m.changed()
 	return Result{CertID: id, Zone: row.Zone, Names: append([]string(nil), names...), Bundle: &Bundle{
 		ID: id, Zone: row.Zone, Names: append([]string(nil), names...), Issuer: issuer, Staging: dir.Staging, Managed: true,
-		NotAfter: leaf.NotAfter, Dir: id, ChainPEM: append([]byte(nil), ob.ChainPEM...), Key: secrets.Secret(ob.KeyPEM),
+		NotAfter: leaf.NotAfter, Dir: row.Path, ChainPEM: append([]byte(nil), ob.ChainPEM...), Key: secrets.Secret(ob.KeyPEM),
 	}}
+}
+
+// storeVersion writes chain and key as a new version of row.ID, points
+// row.Path at it and stores the row. If the row cannot be stored the new
+// version is removed again (the previous version and row stay in effect);
+// after the row is stored, versions older than the previous one are pruned.
+func (m *Manager) storeVersion(ctx context.Context, row store.Cert, chainPEM, keyPEM []byte) (store.Cert, error) {
+	p, err := writeCertVersion(m.certsDir, row.ID, chainPEM, keyPEM)
+	if err != nil {
+		return row, err
+	}
+	n, _ := pathVersion(row.ID, p)
+	row.Path = p
+	if err := m.st.UpsertCert(ctx, row); err != nil {
+		if rerr := removeVersionsAbove(m.certsDir, row.ID, n-1); rerr != nil {
+			m.log.Warn("acme: remove unrecorded certificate version", "cert", row.ID, "err", rerr)
+		}
+		return row, fmt.Errorf("acme: store certificate row: %w", err)
+	}
+	if err := pruneCertVersions(m.certsDir, row.ID, n); err != nil {
+		m.log.Warn("acme: prune old certificate versions", "cert", row.ID, "err", err)
+	}
+	return row, nil
+}
+
+// cleanupCertDirs removes certificate versions the store does not know
+// about: versions newer than a row's Path (written, then the process died
+// before the row was updated), every version of an id without a row or
+// without a path, and staging leftovers. Rows whose Path is not "<id>/v<N>"
+// are left alone.
+func (m *Manager) cleanupCertDirs(ctx context.Context) {
+	rows, err := m.st.ListCerts(ctx)
+	if err != nil {
+		m.log.Warn("acme: certificate directory cleanup skipped", "err", err)
+		return
+	}
+	known := map[string]bool{}
+	for _, r := range rows {
+		known[r.ID] = true
+		cur := 0
+		if r.Path != "" {
+			n, ok := pathVersion(r.ID, r.Path)
+			if !ok {
+				continue
+			}
+			cur = n
+		}
+		if err := removeVersionsAbove(m.certsDir, r.ID, cur); err != nil {
+			m.log.Warn("acme: certificate directory cleanup", "cert", r.ID, "err", err)
+		}
+	}
+	ents, err := os.ReadDir(m.certsDir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !e.IsDir() || known[e.Name()] || !validID(e.Name()) {
+			continue
+		}
+		if err := removeVersionsAbove(m.certsDir, e.Name(), 0); err != nil {
+			m.log.Warn("acme: certificate directory cleanup", "cert", e.Name(), "err", err)
+		}
+		_ = os.Remove(filepath.Join(m.certsDir, e.Name())) // only if now empty
+	}
 }
 
 func (m *Manager) changed() {

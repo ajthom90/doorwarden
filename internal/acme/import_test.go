@@ -29,10 +29,10 @@ func TestImportPEM(t *testing.T) {
 		t.Fatalf("%+v", ir)
 	}
 	r := h.row(t, ir.Bundle.ID)
-	if r.DomainsJSON != `["*.example.test","example.test"]` || !r.NotAfter.Equal(t0.Add(60*24*time.Hour)) || r.Path != ir.Bundle.ID || r.Zone != "example.test" {
+	if r.DomainsJSON != `["*.example.test","example.test"]` || !r.NotAfter.Equal(t0.Add(60*24*time.Hour)) || r.Path != ir.Bundle.ID+"/v1" || r.Zone != "example.test" {
 		t.Fatalf("row %+v", r)
 	}
-	st, _ := os.Stat(filepath.Join(h.dir, ir.Bundle.ID, PrivkeyFile))
+	st, _ := os.Stat(filepath.Join(h.dir, ir.Bundle.ID, "v1", PrivkeyFile))
 	if st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %o", st.Mode().Perm())
 	}

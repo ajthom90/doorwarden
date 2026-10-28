@@ -72,24 +72,22 @@ func (m *Manager) importPEM(ctx context.Context, zone string, fullchainPEM, keyP
 	}
 	sum := sha256.Sum256(leaf.Raw)
 	id := "imported-" + safeLabel(z) + "-" + hex.EncodeToString(sum[:6])
-	if err := writeCertFiles(m.certsDir, id, fullchainPEM, keyPEM); err != nil {
-		return nil, err
-	}
 	now := m.now()
 	expired := !leaf.NotAfter.After(now)
 	dj, _ := json.Marshal(names)
 	row := store.Cert{ID: id, Zone: z, DomainsJSON: string(dj), NotAfter: leaf.NotAfter, Status: StatusImported,
-		LastResult: "imported", Path: id, Managed: false}
+		LastResult: "imported", Managed: false}
 	if expired {
 		row.LastError = "imported certificate is expired"
 	}
-	if err := m.st.UpsertCert(ctx, row); err != nil {
-		return nil, fmt.Errorf("acme: import: store: %w", err)
+	row, err = m.storeVersion(ctx, row, fullchainPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("acme: import: %w", err)
 	}
 	m.log.Info("acme: certificate imported", "cert", id, "zone", z, "names", strings.Join(names, ","), "not_after", leaf.NotAfter, "expired", expired)
 	m.changed()
 	return &ImportResult{Expired: expired, Bundle: &Bundle{ID: id, Zone: z, Names: names, NotAfter: leaf.NotAfter,
-		Dir: id, ChainPEM: append([]byte(nil), fullchainPEM...), Key: secrets.Secret(keyPEM)}}, nil
+		Dir: row.Path, ChainPEM: append([]byte(nil), fullchainPEM...), Key: secrets.Secret(keyPEM)}}, nil
 }
 
 // certNames returns the leaf's DNS names (or its CN when it has none),

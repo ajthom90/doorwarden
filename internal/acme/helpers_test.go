@@ -226,6 +226,13 @@ func (h *harness) row(t *testing.T, id string) store.Cert {
 	return r
 }
 
+// certFile is the current file (FullchainFile or PrivkeyFile) of id, read
+// through the row's Path.
+func (h *harness) certFile(t *testing.T, id, name string) string {
+	t.Helper()
+	return filepath.Join(h.dir, filepath.FromSlash(h.row(t, id).Path), name)
+}
+
 func openStore(t *testing.T) (*store.Store, error) {
 	t.Helper()
 	st, err := store.Open(":memory:")

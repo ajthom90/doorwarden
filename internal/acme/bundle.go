@@ -19,8 +19,9 @@ type Bundle struct {
 	Staging  bool
 	Managed  bool
 	NotAfter time.Time
-	// Dir is the certificate directory relative to the certs root ("<id>");
-	// the files are Dir/fullchain.pem and Dir/privkey.pem.
+	// Dir is the certificate version directory relative to the certs root
+	// ("<id>/v<N>", the row's Path); the files are Dir/fullchain.pem and
+	// Dir/privkey.pem. Each issuance gets a new N (see writeCertVersion).
 	Dir string
 	// ChainPEM is the leaf followed by its intermediates.
 	ChainPEM []byte

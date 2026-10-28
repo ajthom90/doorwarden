@@ -36,11 +36,11 @@ func TestIssueWildcardWritesFilesAndRow(t *testing.T) {
 		t.Fatalf("order %+v", o)
 	}
 	r := h.row(t, b.ID)
-	if r.Status != StatusValid || !r.Managed || !r.Staging || r.Issuer != "le" || r.Path != b.ID || r.Zone != "example.test" ||
+	if r.Status != StatusValid || !r.Managed || !r.Staging || r.Issuer != "le" || r.Path != b.ID+"/v1" || b.Dir != r.Path || r.Zone != "example.test" ||
 		!r.NotAfter.Equal(t0.Add(90*24*time.Hour)) || r.DomainsJSON != `["*.example.test","example.test"]` {
 		t.Fatalf("row %+v", r)
 	}
-	key, _ := os.ReadFile(filepath.Join(h.dir, b.ID, PrivkeyFile))
+	key, _ := os.ReadFile(filepath.Join(h.dir, b.ID, "v1", PrivkeyFile))
 	if !bytes.Equal(key, []byte(b.Key.Reveal())) {
 		t.Fatal("key file differs from bundle key")
 	}
@@ -68,17 +68,28 @@ func TestCertFileModes(t *testing.T) {
 	}
 	check(h.dir, 0o700)
 	check(filepath.Join(h.dir, b.ID), 0o700)
-	check(filepath.Join(h.dir, b.ID, FullchainFile), 0o600)
-	check(filepath.Join(h.dir, b.ID, PrivkeyFile), 0o600)
-	// Renewal keeps the modes and leaves no temp files.
-	h.clock.Add(70 * 24 * time.Hour)
-	if res := h.m.RenewNow(ctx, b.ID); res.Err != nil {
-		t.Fatal(res.Err)
+	// Every version directory and file is private; renewals leave no temp
+	// files and keep exactly the current and the previous version.
+	for v := 1; v <= 4; v++ {
+		vd := filepath.Join(h.dir, b.ID, fmtS("v%d", v))
+		check(vd, 0o700)
+		check(filepath.Join(vd, FullchainFile), 0o600)
+		check(filepath.Join(vd, PrivkeyFile), 0o600)
+		if ents, _ := os.ReadDir(vd); len(ents) != 2 {
+			t.Fatalf("v%d files %v", v, ents)
+		}
+		h.clock.Add(70 * 24 * time.Hour)
+		if res := h.m.RenewNow(ctx, b.ID); res.Err != nil {
+			t.Fatal(res.Err)
+		}
 	}
-	check(filepath.Join(h.dir, b.ID, PrivkeyFile), 0o600)
 	ents, _ := os.ReadDir(filepath.Join(h.dir, b.ID))
-	if len(ents) != 2 {
-		t.Fatalf("files %v", ents)
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != "v4,v5" || h.row(t, b.ID).Path != b.ID+"/v5" {
+		t.Fatalf("versions %v, row %s", names, h.row(t, b.ID).Path)
 	}
 }
 
@@ -89,8 +100,8 @@ func TestFailureKeepsPreviousCert(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := h.row(t, b.ID)
-	chain0, _ := os.ReadFile(filepath.Join(h.dir, b.ID, FullchainFile))
-	key0, _ := os.ReadFile(filepath.Join(h.dir, b.ID, PrivkeyFile))
+	chain0, _ := os.ReadFile(h.certFile(t, b.ID, FullchainFile))
+	key0, _ := os.ReadFile(h.certFile(t, b.ID, PrivkeyFile))
 
 	h.clock.Add(65 * 24 * time.Hour)
 	h.ca.setFail(errors.New("challenge provider exploded"))
@@ -98,8 +109,11 @@ func TestFailureKeepsPreviousCert(t *testing.T) {
 	if res.Err == nil || res.NextAttempt.IsZero() {
 		t.Fatalf("want failure, got %+v", res)
 	}
-	chain1, _ := os.ReadFile(filepath.Join(h.dir, b.ID, FullchainFile))
-	key1, _ := os.ReadFile(filepath.Join(h.dir, b.ID, PrivkeyFile))
+	chain1, _ := os.ReadFile(h.certFile(t, b.ID, FullchainFile))
+	key1, _ := os.ReadFile(h.certFile(t, b.ID, PrivkeyFile))
+	if vs := certVersions(h.dir, b.ID); len(vs) != 1 {
+		t.Fatalf("failed renewal left versions %v", vs)
+	}
 	if !bytes.Equal(chain0, chain1) || !bytes.Equal(key0, key1) {
 		t.Fatal("failed renewal touched the certificate files")
 	}
@@ -433,7 +447,7 @@ func TestSwitchIssuerStagingToProduction(t *testing.T) {
 	if o := h.ca.last(); o.Dir.URL != LEProductionURL {
 		t.Fatalf("switch used %s", o.Dir.URL)
 	}
-	if r := h.row(t, b.ID); r.Staging || r.Path != b.ID {
+	if r := h.row(t, b.ID); r.Staging || !strings.HasPrefix(r.Path, b.ID+"/v") {
 		t.Fatalf("row %+v", r)
 	}
 	// New issuance now goes to production.

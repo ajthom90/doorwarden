@@ -162,14 +162,15 @@ func ictx(t *testing.T) context.Context {
 	return c
 }
 
-// leafOf reads certs/<id>/fullchain.pem and checks that privkey.pem matches.
+// leafOf reads the row's current fullchain.pem and checks that privkey.pem
+// matches.
 func leafOf(t *testing.T, h *harness, id string) *x509.Certificate {
 	t.Helper()
-	chain, err := os.ReadFile(filepath.Join(h.dir, id, FullchainFile))
+	chain, err := os.ReadFile(h.certFile(t, id, FullchainFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := os.ReadFile(filepath.Join(h.dir, id, PrivkeyFile))
+	key, err := os.ReadFile(h.certFile(t, id, PrivkeyFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,8 +196,8 @@ func sameNames(c *x509.Certificate, want ...string) bool {
 func checkModes(t *testing.T, h *harness, id string) {
 	t.Helper()
 	for p, want := range map[string]os.FileMode{
-		h.dir: 0o700, filepath.Join(h.dir, id): 0o700,
-		filepath.Join(h.dir, id, FullchainFile): 0o600, filepath.Join(h.dir, id, PrivkeyFile): 0o600,
+		h.dir: 0o700, filepath.Join(h.dir, id): 0o700, filepath.Dir(h.certFile(t, id, FullchainFile)): 0o700,
+		h.certFile(t, id, FullchainFile): 0o600, h.certFile(t, id, PrivkeyFile): 0o600,
 	} {
 		st, err := os.Stat(p)
 		if err != nil {
@@ -302,8 +303,8 @@ func TestPebbleFailureKeepsOldCertAndBacksOff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadFile(filepath.Join(e.dir, b.ID, FullchainFile))
-	keyBefore, _ := os.ReadFile(filepath.Join(e.dir, b.ID, PrivkeyFile))
+	before, _ := os.ReadFile(e.certFile(t, b.ID, FullchainFile))
+	keyBefore, _ := os.ReadFile(e.certFile(t, b.ID, PrivkeyFile))
 	rowBefore := e.row(t, b.ID)
 
 	e.broken.Store(true)
@@ -312,8 +313,8 @@ func TestPebbleFailureKeepsOldCertAndBacksOff(t *testing.T) {
 		t.Fatal("renewal with wrong TXT value succeeded")
 	}
 	t.Logf("CA rejected as expected: %v", r.Err)
-	after, _ := os.ReadFile(filepath.Join(e.dir, b.ID, FullchainFile))
-	keyAfter, _ := os.ReadFile(filepath.Join(e.dir, b.ID, PrivkeyFile))
+	after, _ := os.ReadFile(e.certFile(t, b.ID, FullchainFile))
+	keyAfter, _ := os.ReadFile(e.certFile(t, b.ID, PrivkeyFile))
 	if !bytes.Equal(before, after) || !bytes.Equal(keyBefore, keyAfter) {
 		t.Fatal("failure replaced the previous certificate files")
 	}
@@ -333,7 +334,7 @@ func TestPebbleFailureKeepsOldCertAndBacksOff(t *testing.T) {
 	if _, err := e.m.Issue(ictx(t), IssueRequest{Zone: "fail.example.test"}); err != nil {
 		t.Fatal(err)
 	}
-	if final, _ := os.ReadFile(filepath.Join(e.dir, b.ID, FullchainFile)); bytes.Equal(final, before) {
+	if final, _ := os.ReadFile(e.certFile(t, b.ID, FullchainFile)); bytes.Equal(final, before) {
 		t.Fatal("certificate not replaced after recovery")
 	}
 }
