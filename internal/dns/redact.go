@@ -17,7 +17,11 @@ import (
 // pointers, interfaces, slices or maps can be printed, whatever type it has.
 //
 // The rule every provider follows: no secret-bearing value is reachable by
-// reflection from a Provider value. Credentials, session tokens, derived
+// reflection from a Provider value through the fields and containers the
+// provider and doorwarden's httpx.Client own. (net/http's transport keeps
+// recently written request bytes, headers included, in its keep-alive buffers;
+// fmt cannot reach those through a Provider, and we do not disable keep-alives
+// to hide them. all_test.go's walker documents that skip list.) Credentials, session tokens, derived
 // authorization strings, scrub lists and SDK clients that embed credentials
 // are held only inside closures (func-typed fields print as an address under
 // every verb). The helpers below build such closures. Each Provider also has

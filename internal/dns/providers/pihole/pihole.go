@@ -27,7 +27,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -276,10 +275,9 @@ func parseCNAME(entry string) ([]dns.Record, error) {
 	}
 	ttl := 0
 	last := f[len(f)-1]
-	if numberish.MatchString(last) && !isWholeNumber(last) {
-		// "-1", "+5", "30s": a malformed TTL, not a host name
-		return nil, fmt.Errorf("unparseable entry %q (bad TTL %q)", entry, last)
-	}
+	// a final field is a TTL only when it is a plain non-negative integer and
+	// something precedes the alias and target; "30s", "5m" and "3com" are valid
+	// single-label host names, so they are targets
 	if len(f) >= 3 && isWholeNumber(last) {
 		n, err := strconv.Atoi(last)
 		if err != nil {
@@ -292,6 +290,9 @@ func parseCNAME(entry string) ([]dns.Record, error) {
 		return nil, fmt.Errorf("unparseable entry %q (need alias and target)", entry)
 	}
 	target := f[len(f)-1]
+	if !validHostname(target) {
+		return nil, fmt.Errorf("unparseable entry %q (target %q is not a host name; a TTL must be a plain non-negative integer)", entry, target)
+	}
 	var out []dns.Record
 	for _, alias := range f[:len(f)-1] {
 		out = append(out, dns.Record{Name: alias, Type: "CNAME", Value: target, TTL: ttl})
@@ -299,9 +300,22 @@ func parseCNAME(entry string) ([]dns.Record, error) {
 	return out, nil
 }
 
-// numberish matches a final field that starts like a number (optional sign,
-// digits, optional letters) but is not all digits.
-var numberish = regexp.MustCompile(`^[+-]?[0-9]+[A-Za-z]*$|^[+-]$`)
+// validHostname reports whether s can be a DNS host name: letters, digits,
+// '.', '_' and '-', not starting with '-' or '.'. Signed numbers such as "-1"
+// or "+5" are therefore not host names.
+func validHostname(s string) bool {
+	if s == "" || s[0] == '-' || s[0] == '.' {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 func isWholeNumber(s string) bool {
 	if s == "" {

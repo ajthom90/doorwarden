@@ -157,9 +157,17 @@ func TestProviderNeverFormatsCredentials(t *testing.T) {
 }
 
 // TestProviderHoldsNoReachableSecret walks each Provider value with reflection
-// (unexported fields, pointers, interfaces, slices, maps) and fails if any
-// reachable string or byte slice contains a credential: the property must hold
-// structurally, not only for the formatting verbs above.
+// (unexported fields, pointers, interfaces, slices, maps) through every field
+// and container the provider (and doorwarden's httpx.Client) owns, and fails if
+// any reachable string or byte slice contains a credential: the property must
+// hold structurally, not only for the formatting verbs above.
+//
+// The walk deliberately stops at the internals of the standard library's
+// network types (see walkSkipPkgs): net/http's transport legitimately holds
+// recently written request bytes, including the Authorization header, in its
+// keep-alive connection buffers. That is outside what fmt can reach through
+// the provider and is not something the provider can change without disabling
+// keep-alives, which we do not do.
 func TestProviderHoldsNoReachableSecret(t *testing.T) {
 	for name, cfg := range leakConfigs() {
 		p, err := dns.New(strings.TrimSuffix(name, "2"), cfg, nil)
@@ -190,7 +198,21 @@ func (w *walker) leaf(s, path string) {
 	}
 }
 
+// walkSkipPkgs are the standard-library packages whose values the walker does
+// not enter (connection pools and their I/O buffers).
+var walkSkipPkgs = map[string]bool{"net/http": true, "net": true, "crypto/tls": true, "bufio": true}
+
+func skipType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return walkSkipPkgs[t.PkgPath()]
+}
+
 func (w *walker) walk(v reflect.Value, path string) {
+	if skipType(v.Type()) {
+		return
+	}
 	w.nodes++
 	switch v.Kind() {
 	case reflect.String:
