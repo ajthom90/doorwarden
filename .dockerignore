@@ -1,0 +1,12 @@
+.git
+.github
+bin
+docs
+deploy
+*.md
+**/*_test.go
+.env
+.superpowers
+*.key
+*.pem
+**/.env*

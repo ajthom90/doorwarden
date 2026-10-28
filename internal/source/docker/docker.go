@@ -129,7 +129,7 @@ func (s *Source) List(ctx context.Context) ([]model.Service, error) {
 	s.warnings = nil
 	s.mu.Unlock()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.base+"/containers/json?all=1", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.base+ContainersListPath+"?all=1", nil)
 	if err != nil {
 		return nil, unavailable(err)
 	}
