@@ -512,3 +512,58 @@ func TestDeleteByIDRefusesNameMismatch(t *testing.T) {
 		t.Fatalf("plain delete by ID: err=%v pols=%d", err, len(b.pols))
 	}
 }
+
+// applyThenDrop serves mutating requests (selected by match) by applying them to
+// the backend and then cutting the connection without answering: the write
+// happened but the client cannot know.
+func applyThenDrop(inner http.Handler, match func(*http.Request) bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !match(r) {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		inner.ServeHTTP(httptest.NewRecorder(), r)
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	})
+}
+
+func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
+	ctx := context.Background()
+	rec := dns.Record{Name: "amb.example.test", Type: "A", Value: "192.0.2.1"}
+	b := newBackend(t)
+	srv := httptest.NewServer(applyThenDrop(b, func(r *http.Request) bool { return r.Method != "GET" }))
+	defer srv.Close()
+	p, _ := unifi.New(unifi.Config{URL: srv.URL, APIKey: fakeKey})
+	got, err := p.CreateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value || got.ID != "" {
+		t.Fatalf("create: got %+v err %v", got, err)
+	}
+	if got, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) || got.Value != "192.0.2.2" || got.ID == "" {
+		t.Fatalf("update: got %+v err %v", got, err)
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("delete: %v", err)
+	}
+	b2 := newBackend(t)
+	p2 := newProvider(t, b2, nil)
+	if _, err := p2.Test(ctx), error(nil); err != nil {
+		t.Fatal(err)
+	}
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			w.WriteHeader(500)
+			return
+		}
+		b2.ServeHTTP(w, r)
+	}))
+	defer srv2.Close()
+	p3, _ := unifi.New(unifi.Config{URL: srv2.URL, APIKey: fakeKey})
+	got, err = p3.CreateRecord(ctx, "example.test", rec)
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("500: got %+v err %v", got, err)
+	}
+}

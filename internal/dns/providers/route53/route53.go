@@ -454,10 +454,20 @@ func (p *Provider) change(ctx context.Context, zid, op string, changes ...types.
 		ChangeBatch:  &types.ChangeBatch{Changes: changes},
 	})
 	if err != nil {
-		return p.wrapCtx(ctx, op, err)
+		var ae smithy.APIError
+		if ctx.Err() == nil && errors.As(err, &ae) {
+			return p.mapErr(op, err) // the service answered with an API error: definitively refused
+		}
+		// cancellation, deadline, transport failure, unparseable answer: the
+		// service may have applied the change
+		cause := err
+		if ctx.Err() != nil {
+			cause = ctx.Err()
+		}
+		return fmt.Errorf("route53: %s: the request may have been applied but the outcome is unknown (%s): %w: %w", op, p.scrub(cause.Error()), dns.ErrUnconfirmed, cause)
 	}
 	if resp.ChangeInfo == nil || aws.ToString(resp.ChangeInfo.Id) == "" {
-		return malformed(op, "no ChangeInfo")
+		return fmt.Errorf("%w: %w", malformed(op, "no ChangeInfo"), dns.ErrUnconfirmed)
 	}
 	return nil
 }
@@ -510,9 +520,13 @@ func (p *Provider) verify(ctx context.Context, zid, op, name, typ string, pre, w
 		}
 	}
 	deadline := start.Add(limit) // limit <= 0 still allows the first read
+	window := limit
+	if window < 0 {
+		window = 0
+	}
 	unconfirmed := func(cause error) error {
 		return fmt.Errorf("route53: %s: change for %s %s was accepted but could not be confirmed within %s (%s): %w",
-			op, name, typ, p.verifyTimeout, p.scrub(cause.Error()), dns.ErrUnconfirmed)
+			op, name, typ, window.Round(time.Millisecond), p.scrub(cause.Error()), dns.ErrUnconfirmed)
 	}
 	for {
 		got, err := p.getSet(ctx, zid, name, typ)
@@ -631,6 +645,9 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	r.TTL = int(ttlOf(r))
 	set := newSet(r, int64(r.TTL))
 	if err := p.change(ctx, ref.id, "create record "+r.Name, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err // may exist: the caller must record ownership
+		}
 		return dns.Record{}, err
 	}
 	if err := p.verify(ctx, ref.id, "create record "+r.Name, r.Name, r.Type, nil, []string{r.Value}); err != nil {
@@ -673,6 +690,9 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err := p.change(ctx, ref.id, "update record "+r.Name,
 		types.Change{Action: types.ChangeActionDelete, ResourceRecordSet: cur},
 		types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err
+		}
 		return dns.Record{}, err
 	}
 	if err := p.verify(ctx, ref.id, "update record "+r.Name, r.Name, r.Type, valuesOf(cur), []string{r.Value}); err != nil {

@@ -405,3 +405,46 @@ func TestDeleteBodyIsTheStoredTextVerbatim(t *testing.T) {
 		t.Fatalf("delete body re-encoded:\n got %s\nwant %s", body, stored)
 	}
 }
+
+// applyThenDrop serves mutating requests (selected by match) by applying them to
+// the backend and then cutting the connection without answering: the write
+// happened but the client cannot know.
+func applyThenDrop(inner http.Handler, match func(*http.Request) bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !match(r) {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		inner.ServeHTTP(httptest.NewRecorder(), r)
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	})
+}
+
+func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
+	ctx := context.Background()
+	rec := dns.Record{Name: "amb.example.test", Type: "A", Value: "192.0.2.1"}
+	b := &backend{}
+	srv := httptest.NewServer(applyThenDrop(b, func(r *http.Request) bool { return r.Method != "GET" }))
+	defer srv.Close()
+	p, _ := adguard.New(adguard.Config{URL: srv.URL, Username: user, Password: password})
+	got, err := p.CreateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value {
+		t.Fatalf("create: got %+v err %v", got, err)
+	}
+	if got, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) || got.Value != "192.0.2.2" {
+		t.Fatalf("update: got %+v err %v", got, err)
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("delete: %v", err)
+	}
+	b2 := &backend{status: 500}
+	p2 := newProvider(t, b2, password)
+	got, err = p2.CreateRecord(ctx, "example.test", rec)
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("500: got %+v err %v", got, err)
+	}
+}

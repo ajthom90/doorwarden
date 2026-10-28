@@ -117,6 +117,10 @@ type envelope struct {
 
 var errInvalidToken = errors.New("invalid token")
 
+// errAmbiguous marks a failure that does not show whether the call was applied.
+// Writes turn it into dns.ErrUnconfirmed; reads just report it.
+var errAmbiguous = errors.New("outcome unknown")
+
 func (p *Provider) post(ctx context.Context, path string, form url.Values) (*envelope, error) {
 	var env envelope
 	if _, err := p.c.Do(ctx, "POST", path, nil, nil, form, &env); err != nil {
@@ -127,6 +131,10 @@ func (p *Provider) post(ctx context.Context, path string, form url.Values) (*env
 		if errors.As(err, &se) && se.Status == 429 {
 			return nil, errors.New("technitium: rate limited by the server (status 429); retry later")
 		}
+		if !httpx.IsDefinitiveRejection(err) {
+			// timeout, cancellation, reset, unparseable body: the call may have been applied
+			return nil, fmt.Errorf("technitium: %w: %w", errAmbiguous, err)
+		}
 		return nil, fmt.Errorf("technitium: %w", err)
 	}
 	switch env.Status {
@@ -135,7 +143,7 @@ func (p *Provider) post(ctx context.Context, path string, form url.Values) (*env
 	case "invalid-token":
 		return nil, errInvalidToken
 	case "":
-		return nil, errors.New("technitium: malformed response (no status)")
+		return nil, fmt.Errorf("technitium: %w: malformed response (no status)", errAmbiguous)
 	}
 	msg := p.c.Scrub(env.ErrorMessage)
 	if strings.Contains(strings.ToLower(msg), "no such zone") {
@@ -157,7 +165,7 @@ func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
 		return errors.New("technitium: login failed: invalid credentials")
 	}
 	if err != nil {
-		return fmt.Errorf("technitium: login failed: %w", err)
+		return fmt.Errorf("technitium: login failed: %v", err) // not %w: a failed login never reached the write
 	}
 	if env.Token == "" {
 		return errors.New("technitium: login response carried no token")
@@ -339,6 +347,9 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	ttlForm(r, f)
 	if _, err := p.call(ctx, "/api/zones/records/add", f); err != nil {
+		if errors.Is(err, errAmbiguous) {
+			return r, p.c.Ambiguous("technitium: create record "+r.Name, err)
+		}
 		return dns.Record{}, err
 	}
 	return r, nil
@@ -388,10 +399,13 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if old.Comments != "" {
 		f.Set("comments", old.Comments)
 	}
+	r.TTL = ttl
 	if _, err := p.call(ctx, "/api/zones/records/update", f); err != nil {
+		if errors.Is(err, errAmbiguous) {
+			return r, p.c.Ambiguous("technitium: update record "+r.Name, err)
+		}
 		return dns.Record{}, err
 	}
-	r.TTL = ttl
 	return r, nil
 }
 
@@ -421,6 +435,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 		f[k] = v
 	}
 	_, err = p.call(ctx, "/api/zones/records/delete", f)
+	if errors.Is(err, errAmbiguous) {
+		return p.c.Ambiguous("technitium: delete record "+r.Name, err) // keep the ownership row
+	}
 	return err
 }
 

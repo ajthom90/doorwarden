@@ -23,15 +23,16 @@ const (
 )
 
 type fakeServer struct {
-	addr         string
-	mu           sync.Mutex
-	zones        map[string][]mdns.RR // zone fqdn -> records (without SOA)
-	noAXFR       bool
-	noSign       bool   // reply without TSIG even to signed requests
-	beforeUpdate func() // runs when an UPDATE arrives, before it is evaluated (simulates a racing writer)
-	delay        time.Duration
-	unsigned     int // requests received without TSIG
-	srv          *mdns.Server
+	addr            string
+	mu              sync.Mutex
+	zones           map[string][]mdns.RR // zone fqdn -> records (without SOA)
+	noAXFR          bool
+	noSign          bool   // reply without TSIG even to signed requests
+	dropUpdateReply bool   // apply an UPDATE, then close the connection without answering
+	beforeUpdate    func() // runs when an UPDATE arrives, before it is evaluated (simulates a racing writer)
+	delay           time.Duration
+	unsigned        int // requests received without TSIG
+	srv             *mdns.Server
 }
 
 func startServer(t *testing.T) *fakeServer {
@@ -178,6 +179,11 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 			}
 		}
 		f.zones[z] = recs
+		if f.dropUpdateReply {
+			m = nil
+			_ = w.Close()
+			return
+		}
 	case mdns.OpcodeQuery:
 		z := f.zoneOf(q.Name)
 		if z == "" {
@@ -477,5 +483,38 @@ func TestTXTIsReadOnly(t *testing.T) {
 		if err := op(); err == nil || !strings.Contains(err.Error(), "not supported") {
 			t.Fatalf("err = %v", err)
 		}
+	}
+}
+
+func TestAmbiguousUpdateIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
+	ctx := context.Background()
+	f := startServer(t)
+	f.mu.Lock()
+	f.dropUpdateReply = true
+	f.mu.Unlock()
+	p := newProvider(t, f, nil)
+	rec := dns.Record{Name: "amb.example.test", Type: "A", Value: "192.0.2.1"}
+	got, err := p.CreateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value {
+		t.Fatalf("create: got %+v err %v", got, err)
+	}
+	if got, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) || got.Value != "192.0.2.2" {
+		t.Fatalf("update: got %+v err %v", got, err)
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("delete: %v", err)
+	}
+	// a definitive REFUSED (unknown zone) is a plain error, and so is a failure before sending
+	f.mu.Lock()
+	f.dropUpdateReply = false
+	f.mu.Unlock()
+	got, err = p.CreateRecord(ctx, "example.test", dns.Record{Name: "x.nozone.test", Type: "A", Value: "192.0.2.1"})
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("refused: got %+v err %v", got, err)
+	}
+	down := newProvider(t, f, func(c *rfc2136.Config) { c.Server = "127.0.0.1:1" })
+	got, err = down.CreateRecord(ctx, "example.test", rec)
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("unreachable server: got %+v err %v", got, err)
 	}
 }

@@ -46,6 +46,23 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("http status %d: %s", e.Status, e.Msg)
 }
 
+// IsDefinitiveRejection reports whether err shows that the server ANSWERED
+// the request with an error status (4xx/5xx): the write was refused, so a plain
+// error is right. Every other failure (timeout, cancellation, connection reset,
+// truncated or unparseable response, an otherwise-successful answer without the
+// expected data) is ambiguous: the request may have been applied.
+func IsDefinitiveRejection(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se)
+}
+
+// Ambiguous builds the error for a write whose outcome is unknown: it wraps
+// dns.ErrUnconfirmed (the caller still gets the Record that was attempted) and
+// its text is scrubbed of this client's secrets.
+func (c *Client) Ambiguous(op string, cause error) error {
+	return fmt.Errorf("%s: the request may have been applied but the outcome is unknown (%s): %w", op, c.Scrub(cause.Error()), dns.ErrUnconfirmed)
+}
+
 // IsAuth reports 401/403.
 func (e *StatusError) IsAuth() bool { return e.Status == 401 || e.Status == 403 }
 

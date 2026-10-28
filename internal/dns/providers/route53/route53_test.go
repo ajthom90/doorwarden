@@ -41,17 +41,18 @@ type set struct {
 }
 
 type backend struct {
-	afterChange              func(z *zone) // runs after a change was applied (simulates another writer)
-	lag, lagLeft             int           // reads that still show the old state after a change
-	mu                       sync.Mutex
-	zones                    []*zone
-	failCode                 string // when set, every call fails with this error code
-	slow                     time.Duration
-	listed                   []string // hosted zone ids whose rrsets were listed
-	zonePages, setPages      int
-	badAll, badSets, badPost string // serve a malformed HTTP 200 body for all / rrset / change requests
-	dropChange               bool   // acknowledge changes without applying them
-	brokenTrunc              bool   // truncated pages without a continuation marker
+	rejectChange, dropAfterApply, stallChange bool          // change-call failure modes
+	afterChange                               func(z *zone) // runs after a change was applied (simulates another writer)
+	lag, lagLeft                              int           // reads that still show the old state after a change
+	mu                                        sync.Mutex
+	zones                                     []*zone
+	failCode                                  string // when set, every call fails with this error code
+	slow                                      time.Duration
+	listed                                    []string // hosted zone ids whose rrsets were listed
+	zonePages, setPages                       int
+	badAll, badSets, badPost                  string // serve a malformed HTTP 200 body for all / rrset / change requests
+	dropChange                                bool   // acknowledge changes without applying them
+	brokenTrunc                               bool   // truncated pages without a continuation marker
 }
 
 // mkzone builds a hosted zone with the apex SOA and NS sets every real zone has.
@@ -260,6 +261,16 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			b.writeBad(w, b.badPost)
 			return
 		}
+		if b.rejectChange {
+			xmlErr(w, 400, "InvalidChangeBatch", "refused")
+			return
+		}
+		if b.stallChange { // times out on the client before anything is applied
+			b.mu.Unlock()
+			time.Sleep(700 * time.Millisecond)
+			b.mu.Lock()
+			return
+		}
 		next := map[string]*set{}
 		for k, v := range z.sets {
 			next[k] = v
@@ -294,6 +305,15 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			z.sets = next
 			b.afterChange(z)
 			next = z.sets
+		}
+		if b.dropAfterApply { // apply, then cut the connection before answering
+			z.sets = next
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+				}
+			}
+			return
 		}
 		if !b.dropChange && b.lag > 0 {
 			z.pending, b.lagLeft = next, b.lag
@@ -890,4 +910,74 @@ func (h *lagHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.inner.ServeHTTP(w, r)
+}
+
+func TestAmbiguousChangeCallIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
+	rec := dns.Record{Name: "amb.example.test", Type: "A", Value: "192.0.2.1"}
+	cases := map[string]struct {
+		mod         func(*backend)
+		unconfirmed bool
+		applied     bool
+	}{
+		"response dropped after the change was applied": {func(b *backend) { b.dropAfterApply = true }, true, true},
+		"client times out before the change is applied": {func(b *backend) { b.stallChange = true }, true, false},
+		"unparseable answer to the change":              {func(b *backend) { b.badPost = "html" }, true, false},
+		"definitive InvalidChangeBatch rejection":       {func(b *backend) { b.rejectChange = true }, false, false},
+	}
+	for name, tc := range cases {
+		// create
+		b := newBackend()
+		tc.mod(b)
+		p := newProvider(t, b, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		got, err := p.CreateRecord(ctx, "example.test", rec)
+		cancel()
+		if tc.unconfirmed {
+			if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value {
+				t.Errorf("%s: create got %+v err %v", name, got, err)
+			}
+		} else if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+			t.Errorf("%s: create must be a plain error with no record, got %+v err %v", name, got, err)
+		}
+		b.mu.Lock()
+		_, ok := b.zone("ZEXAMPLE").sets["amb.example.test.|A"]
+		b.mu.Unlock()
+		if ok != tc.applied && name != "unparseable answer to the change" {
+			t.Errorf("%s: applied = %v, want %v", name, ok, tc.applied)
+		}
+		// update
+		b = newBackend()
+		b.seed("ZEXAMPLE", "amb.example.test", "192.0.2.9")
+		tc.mod(b)
+		p = newProvider(t, b, nil)
+		ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
+		got, err = p.UpdateRecord(ctx, "example.test", rec)
+		cancel()
+		if tc.unconfirmed != errors.Is(err, dns.ErrUnconfirmed) || (tc.unconfirmed && got.Value != rec.Value) || (!tc.unconfirmed && got.Name != "") {
+			t.Errorf("%s: update got %+v err %v", name, got, err)
+		}
+		// delete
+		b = newBackend()
+		b.seed("ZEXAMPLE", "amb.example.test", "192.0.2.1")
+		tc.mod(b)
+		p = newProvider(t, b, nil)
+		ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
+		err = p.DeleteRecord(ctx, "example.test", rec)
+		cancel()
+		if err == nil || tc.unconfirmed != errors.Is(err, dns.ErrUnconfirmed) {
+			t.Errorf("%s: delete err %v", name, err)
+		}
+	}
+}
+
+func TestErrorsBeforeTheRequestIsSentArePlain(t *testing.T) {
+	b := newBackend()
+	p := newProvider(t, b, func(c *route53.Config) { c.HostedZoneID = "ZEXAMPLE" })
+	got, err := p.CreateRecord(context.Background(), "other.test", dns.Record{Name: "x.other.test", Type: "A", Value: "192.0.2.1"})
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("zone mismatch: got %+v err %v", got, err)
+	}
+	if _, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: "x.example.test", Type: "MX", Value: "v"}); err == nil || errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("validation: %v", err)
+	}
 }

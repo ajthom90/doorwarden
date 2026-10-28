@@ -397,3 +397,56 @@ func TestSameValueUpdateOnSharedLineIsNoOp(t *testing.T) {
 		t.Fatalf("puts=%d hosts=%v", b.puts, b.hosts)
 	}
 }
+
+// applyThenDrop serves mutating requests (selected by match) by applying them to
+// the backend and then cutting the connection without answering: the write
+// happened but the client cannot know.
+func applyThenDrop(inner http.Handler, match func(*http.Request) bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !match(r) {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		inner.ServeHTTP(httptest.NewRecorder(), r)
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	})
+}
+
+func TestAmbiguousWriteIsUnconfirmedDefinitiveIsPlain(t *testing.T) {
+	ctx := context.Background()
+	rec := dns.Record{Name: "amb.example.test", Type: "A", Value: "192.0.2.1"}
+	b := newBackend()
+	srv := httptest.NewServer(applyThenDrop(b, func(r *http.Request) bool {
+		return strings.HasPrefix(r.URL.Path, "/api/config/dns/hosts/") && (r.Method == "PUT" || r.Method == "DELETE")
+	}))
+	defer srv.Close()
+	p, _ := pihole.New(pihole.Config{URL: srv.URL, Password: secretOf(password)})
+	got, err := p.CreateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value {
+		t.Fatalf("create: got %+v err %v", got, err)
+	}
+	if got, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) || got.Value != "192.0.2.2" {
+		t.Fatalf("update: got %+v err %v", got, err)
+	}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: rec.Name, Type: "A", Value: "192.0.2.2"}); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("delete: %v", err)
+	}
+	// a definitive error status is plain
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" {
+			w.WriteHeader(500)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	defer srv2.Close()
+	p2, _ := pihole.New(pihole.Config{URL: srv2.URL, Password: secretOf(password)})
+	got, err = p2.CreateRecord(ctx, "example.test", dns.Record{Name: "z.example.test", Type: "A", Value: "192.0.2.7"})
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("500: got %+v err %v", got, err)
+	}
+}

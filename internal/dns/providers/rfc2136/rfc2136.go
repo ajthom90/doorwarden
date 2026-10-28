@@ -160,16 +160,17 @@ func (p *Provider) exchangeRaw(ctx context.Context, op string, m *mdns.Msg) (*md
 	defer stop()
 	_ = nc.SetDeadline(time.Now().Add(p.timeout))
 	co := &mdns.Conn{Conn: nc}
+	// from here on the request may have reached the server
 	if _, err := co.Write(out); err != nil {
-		return nil, wrap(err)
+		return nil, &ioAfterSend{wrap(err)}
 	}
 	raw, err := co.ReadMsgHeader(nil)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, &ioAfterSend{wrap(err)}
 	}
 	r := new(mdns.Msg)
 	if err := r.Unpack(raw); err != nil {
-		return nil, wrap(err)
+		return nil, &ioAfterSend{wrap(err)}
 	}
 	t := r.IsTsig()
 	if t == nil {
@@ -217,6 +218,13 @@ func tsigVerifyError(op, keyName string, err error) error {
 	}
 	return fmt.Errorf("rfc2136: %s: TSIG verification failed: %v", op, err)
 }
+
+// ioAfterSend marks an I/O failure that happened after the request was written:
+// the server may have applied it.
+type ioAfterSend struct{ err error }
+
+func (e *ioAfterSend) Error() string { return e.err.Error() }
+func (e *ioAfterSend) Unwrap() error { return e.err }
 
 func (p *Provider) exchange(ctx context.Context, op string, m *mdns.Msg) (*mdns.Msg, error) {
 	r, err := p.exchangeRaw(ctx, op, m)
@@ -387,6 +395,10 @@ func (p *Provider) update(ctx context.Context, op, zone string, f func(*mdns.Msg
 	m.SetUpdate(fqdn(zone))
 	f(m)
 	_, err := p.exchange(ctx, op, m)
+	var amb *ioAfterSend
+	if errors.As(err, &amb) {
+		return fmt.Errorf("rfc2136: %s: the update may have been applied but the outcome is unknown (%v): %w: %w", op, amb.err, dns.ErrUnconfirmed, amb.err)
+	}
 	return err
 }
 
@@ -427,6 +439,10 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 		m.RRsetNotUsed([]mdns.RR{rr})
 		m.Insert([]mdns.RR{rr})
 	}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			out, _ := fromRR(rr)
+			return out, err // may exist: the caller must record it
+		}
 		return dns.Record{}, err
 	}
 	out, _ := fromRR(rr)
@@ -462,6 +478,10 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		m.RemoveRRset([]mdns.RR{rr})
 		m.Insert([]mdns.RR{rr})
 	}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			out, _ := fromRR(rr)
+			return out, err
+		}
 		return dns.Record{}, err
 	}
 	out, _ := fromRR(rr)

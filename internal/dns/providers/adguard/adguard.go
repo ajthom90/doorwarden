@@ -201,6 +201,9 @@ func check(r dns.Record) error {
 
 func (p *Provider) post(ctx context.Context, op, path string, body any) error {
 	if _, err := p.c.Do(ctx, "POST", path, nil, p.hdr(), body, nil); err != nil {
+		if !httpx.IsDefinitiveRejection(err) {
+			return p.c.Ambiguous("adguard: "+op, err)
+		}
 		return p.mapErr(op, err)
 	}
 	return nil
@@ -245,10 +248,13 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 			return dns.Record{}, fmt.Errorf("adguard: %s already has a %s rewrite, which cannot coexist with %s: %w", r.Name, e.rec.Type, r.Type, dns.ErrRecordExists)
 		}
 	}
+	r.TTL = 0
 	if err := p.post(ctx, "create rewrite "+r.Name, "/control/rewrite/add", rewrite{r.Name, r.Value}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err // may exist: the caller must record it
+		}
 		return dns.Record{}, err
 	}
-	r.TTL = 0
 	return r, nil
 }
 
@@ -280,18 +286,28 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	var se *httpx.StatusError
 	if errors.As(err, &se) && (se.Status == 404 || se.Status == 405) {
 		// older server without /update: add the new answer first, then drop the old
+		r.TTL = 0
 		if err := p.post(ctx, "update rewrite "+r.Name, "/control/rewrite/add", httpx.RawJSON(upd)); err != nil {
+			if errors.Is(err, dns.ErrUnconfirmed) {
+				return r, err
+			}
 			return dns.Record{}, err
 		}
 		if err := p.post(ctx, "update rewrite "+r.Name+" (remove old)", "/control/rewrite/delete", httpx.RawJSON(old[0].raw)); err != nil {
+			if errors.Is(err, dns.ErrUnconfirmed) {
+				return r, err
+			}
 			return dns.Record{}, err
 		}
-		err = nil
-	}
-	if err != nil {
-		return dns.Record{}, p.mapErr("update rewrite "+r.Name, err)
+		return r, nil
 	}
 	r.TTL = 0
+	if err != nil {
+		if !httpx.IsDefinitiveRejection(err) {
+			return r, p.c.Ambiguous("adguard: update rewrite "+r.Name, err)
+		}
+		return dns.Record{}, p.mapErr("update rewrite "+r.Name, err)
+	}
 	return r, nil
 }
 

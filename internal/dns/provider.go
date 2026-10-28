@@ -19,7 +19,11 @@ var (
 	ErrRecordExists = errors.New("dns: record already exists with a different value")
 	// ErrUnconfirmed is returned (wrapped) when a write was ACCEPTED by the
 	// service but could not be confirmed within the provider's verification
-	// window. The Record returned alongside it describes what was written, so
+	// window, and also when the request MAY have been applied but its outcome is
+	// unknown (a timeout, cancellation, dropped connection or unparseable answer
+	// while the write was in flight). A definitive rejection (the service
+	// answered with an error status or API error) is an ordinary error with an
+	// empty Record. The Record returned alongside it describes what was written, so
 	// callers MUST treat a Create/Update that returns errors.Is(err,
 	// ErrUnconfirmed) with a non-empty Record.Name as done (create the ownership
 	// row, warn, verify on a later cycle): ignoring it would leave a record the

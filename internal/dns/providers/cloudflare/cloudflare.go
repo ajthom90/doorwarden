@@ -298,10 +298,16 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 		Result apiRecord `json:"result"`
 	}
 	if _, err := p.c.Do(ctx, "POST", "/zones/"+zid+"/dns_records", nil, p.hdr(), body, &out); err != nil {
+		if !httpx.IsDefinitiveRejection(err) {
+			return r, p.c.Ambiguous("cloudflare: create record "+r.Name, err) // may exist: the caller must record it
+		}
 		return dns.Record{}, p.wrapErr("create record "+r.Name, err)
 	}
-	if err := out.ok(); err != nil || out.Result.ID == "" {
-		return dns.Record{}, fmt.Errorf("cloudflare: create record %s: %s", r.Name, p.c.Scrub(errText(err, out.Result.ID == "")))
+	if err := out.ok(); err != nil {
+		return dns.Record{}, fmt.Errorf("cloudflare: create record %s: %s", r.Name, p.c.Scrub(err.Error()))
+	}
+	if out.Result.ID == "" { // accepted, but no usable answer
+		return r, p.c.Ambiguous("cloudflare: create record "+r.Name, errors.New("response carried no record ID"))
 	}
 	return fromAPI(out.Result), nil
 }
@@ -365,10 +371,18 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		Result apiRecord `json:"result"`
 	}
 	if _, err := p.c.Do(ctx, "PATCH", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.hdr(), body, &out); err != nil {
+		if !httpx.IsDefinitiveRejection(err) {
+			r.ID = cur.ID
+			return r, p.c.Ambiguous("cloudflare: update record "+r.Name, err)
+		}
 		return dns.Record{}, p.wrapErr("update record "+r.Name, err)
 	}
-	if err := out.ok(); err != nil || out.Result.ID == "" {
-		return dns.Record{}, fmt.Errorf("cloudflare: update record %s: %s", r.Name, p.c.Scrub(errText(err, out.Result.ID == "")))
+	if err := out.ok(); err != nil {
+		return dns.Record{}, fmt.Errorf("cloudflare: update record %s: %s", r.Name, p.c.Scrub(err.Error()))
+	}
+	if out.Result.ID == "" {
+		r.ID = cur.ID
+		return r, p.c.Ambiguous("cloudflare: update record "+r.Name, errors.New("response carried no record ID"))
 	}
 	return fromAPI(out.Result), nil
 }
@@ -398,6 +412,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 			continue
 		}
 		if err != nil {
+			if !httpx.IsDefinitiveRejection(err) {
+				return p.c.Ambiguous("cloudflare: delete record "+cur.Name, err) // keep the ownership row
+			}
 			return p.wrapErr("delete record "+cur.Name, err)
 		}
 		if err := out.ok(); err != nil {

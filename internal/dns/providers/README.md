@@ -130,3 +130,16 @@ adguard, unifi), Update without an ID **refuses** (wrapping
 `dns.ErrRecordExists`) unless exactly one value exists, and Delete removes only
 the exact value. The optional conformance case `Options.SeedMultiValue` checks
 this against a fake backend.
+
+## Unconfirmed and ambiguous writes
+
+`dns.ErrUnconfirmed` means a write may exist even though the call did not
+report plain success: the service accepted it but a verification read did not
+show it (route53), or the request was in flight when it timed out, was
+cancelled, was cut off or got an unparseable answer. Providers decide with
+`httpx.IsDefinitiveRejection` (the server ANSWERED with an error status or API
+error: plain error, empty Record) versus everything else (ambiguous: the
+attempted Record plus an error wrapping `ErrUnconfirmed`). Create and Update
+return the Record so the caller can record ownership; Delete returns the error
+so the caller keeps its ownership row. Errors raised before the request is sent
+(validation, zone mismatch, dial failure) stay plain.

@@ -145,6 +145,16 @@ func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
 
 // do performs an authenticated call, logging in on demand and once more on 401.
 func (p *Provider) do(ctx context.Context, op, method, path string, body, out any) error {
+	return p.doOpt(ctx, op, method, path, body, out, false)
+}
+
+// write is do for a mutating call: a failure that does not show whether the
+// call was applied (timeout, cancellation, reset) wraps dns.ErrUnconfirmed.
+func (p *Provider) write(ctx context.Context, op, method, path string) error {
+	return p.doOpt(ctx, op, method, path, nil, nil, true)
+}
+
+func (p *Provider) doOpt(ctx context.Context, op, method, path string, body, out any, mutating bool) error {
 	for attempt := 0; ; attempt++ {
 		sid := p.getSID()
 		if sid == "" {
@@ -160,6 +170,9 @@ func (p *Provider) do(ctx context.Context, op, method, path string, body, out an
 			continue
 		}
 		if err != nil {
+			if mutating && !httpx.IsDefinitiveRejection(err) {
+				return p.c.Ambiguous("pihole: "+op, err)
+			}
 			return p.mapErr(op, err)
 		}
 		return nil
@@ -407,10 +420,13 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if exists {
 		return dns.Record{}, dns.ErrRecordExists
 	}
-	if err := p.do(ctx, "create record "+r.Name, "PUT", entryPath(r), nil, nil); err != nil {
+	r.TTL = 0
+	if err := p.write(ctx, "create record "+r.Name, "PUT", entryPath(r)); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err // may exist: the caller must record it
+		}
 		return dns.Record{}, err
 	}
-	r.TTL = 0
 	return r, nil
 }
 
@@ -445,18 +461,22 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		return dns.Record{}, fmt.Errorf("pihole: %s is on a hosts line naming several hosts; refusing to edit it: %w", r.Name, dns.ErrRecordExists)
 	}
 	// add the new entry first so the name never disappears, then drop the old ones
-	if err := p.do(ctx, "update record "+r.Name, "PUT", entryPath(r), nil, nil); err != nil {
+	r.TTL = 0
+	if err := p.write(ctx, "update record "+r.Name, "PUT", entryPath(r)); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err
+		}
 		return dns.Record{}, err
 	}
 	for _, o := range old {
 		if o.Value == r.Value {
 			continue
 		}
-		if err := p.do(ctx, "update record "+r.Name+" (remove old value)", "DELETE", entryPath(o.Record), nil, nil); err != nil {
-			return dns.Record{}, fmt.Errorf("%w (the new value was added; the old one may remain)", err)
+		if err := p.write(ctx, "update record "+r.Name+" (remove old value)", "DELETE", entryPath(o.Record)); err != nil {
+			// the new value was added, so the caller must own it either way
+			return r, fmt.Errorf("%w (the new value was added; the old one may remain)", errors.Join(err, dns.ErrUnconfirmed))
 		}
 	}
-	r.TTL = 0
 	return r, nil
 }
 
@@ -476,7 +496,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 			if e.shared {
 				return fmt.Errorf("pihole: %s is on a hosts line naming several hosts; refusing to edit it: %w", r.Name, dns.ErrRecordExists)
 			}
-			return p.do(ctx, "delete record "+r.Name, "DELETE", entryPath(r), nil, nil)
+			return p.write(ctx, "delete record "+r.Name, "DELETE", entryPath(r))
 		}
 	}
 	return nil
