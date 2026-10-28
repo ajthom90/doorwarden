@@ -30,3 +30,22 @@ func (s *Store) DeleteSetting(ctx context.Context, key string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM kv WHERE key = ?`, key)
 	return err
 }
+
+// ListSettingsWithPrefix returns every key that starts with prefix, with its
+// value.
+func (s *Store) ListSettingsWithPrefix(ctx context.Context, prefix string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM kv WHERE substr(key, 1, length(?)) = ?`, prefix, prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
