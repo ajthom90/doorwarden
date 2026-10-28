@@ -82,6 +82,9 @@ const (
 	StatusValid    = "valid"    // issued by doorwarden
 	StatusImported = "imported" // imported, not managed
 	StatusFailed   = "failed"   // never issued successfully
+	// StatusUnwanted: managed, but no longer wanted (ManagerConfig.Wanted);
+	// not renewed and no notifications. Restored once wanted again.
+	StatusUnwanted = "unwanted"
 )
 
 // Errors.
@@ -93,11 +96,15 @@ var (
 	ErrInFlight = errors.New("acme: an order for this certificate is already in progress")
 	// ErrNoIssuer: the zone has no certificate issuer.
 	ErrNoIssuer = errors.New("acme: zone has no certificate issuer")
-	// ErrImported: imported certificates are not renewed automatically.
-	ErrImported = errors.New("acme: imported certificate is not renewed automatically (use RenewNow)")
+	// ErrImported: an imported certificate whose zone has no issuer is not
+	// renewed (with an issuer, Renew adopts it once it is due).
+	ErrImported = errors.New("acme: imported certificate is not renewed: its zone has no certificate issuer")
 	// ErrNeedsSwitch: the certificate's staging flag differs from its issuer's
-	// current directory; re-issue it explicitly (SwitchIssuer / RenewNow).
-	ErrNeedsSwitch = errors.New("acme: issuer directory changed between staging and production; re-issue explicitly")
+	// current directory. Renew never re-issues across that change.
+	ErrNeedsSwitch = errors.New("acme: certificate was issued by the issuer's other Let's Encrypt directory (staging vs production); automatic renewal will not switch it, re-issue it with RenewNow or SwitchIssuer")
+	// ErrUnwanted: the certificate's names are no longer wanted
+	// (ManagerConfig.Wanted); it is not renewed.
+	ErrUnwanted = errors.New("acme: certificate is no longer wanted; not renewed")
 	// ErrNotFound: no certificate with that id.
 	ErrNotFound = errors.New("acme: certificate not found")
 )
@@ -157,6 +164,14 @@ type ManagerConfig struct {
 	// IssueTimeout overrides Config.ACME.IssueTimeout (default 5m).
 	IssueTimeout time.Duration
 	Logger       *slog.Logger
+	// Wanted, when set, returns the host names currently wanted in a zone
+	// (e.g. the routes' hosts; "*.<zone>" covers its one-label children).
+	// Renew then renews a managed certificate only while every name on it
+	// is wanted; a wildcard certificate is wanted while its zone is
+	// configured with an issuer and the wildcard strategy. An unwanted
+	// certificate gets StatusUnwanted, is not renewed and sends no
+	// notifications. nil: every managed certificate is wanted.
+	Wanted func(zone string) []string
 }
 
 // Manager issues and renews certificates. It is safe for concurrent use.
@@ -177,6 +192,7 @@ type Manager struct {
 	onChange       func()
 	issueTimeout   time.Duration
 	renewBefore    time.Duration
+	wanted         func(zone string) []string
 	log            *slog.Logger
 	red            *redactor
 
@@ -227,7 +243,7 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 		now: mc.Now, jitter: mc.Jitter, httpClient: mc.HTTPClient, providerByName: mc.ProviderByName,
 		http01: mc.HTTP01Provider, dnsOpts: mc.DNS01Options, settingValue: mc.SettingValue,
 		notifier: mc.Notifier, onChange: mc.OnChange, issueTimeout: mc.IssueTimeout, log: mc.Logger,
-		inflight: map[string]bool{},
+		wanted: mc.Wanted, inflight: map[string]bool{},
 	}
 	if m.now == nil {
 		m.now = time.Now
@@ -292,6 +308,7 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 		legolog.Logger = slog.NewLogLogger(redactHandler{inner: defaultHandler{}, r: globalRedactor}, slog.LevelDebug)
 	})
 	m.cleanupCertDirs(context.Background())
+	m.clearStaleOverrides(context.Background())
 	return m, nil
 }
 
@@ -491,11 +508,44 @@ func (m *Manager) effectiveDirectory(ctx context.Context, issuer string) (direct
 		if err != nil {
 			return d, is, err
 		}
-		if ok && v == "production" {
+		if ok && v == overrideValue(d) {
 			d, _ = resolveDirectory("production")
 		}
 	}
 	return d, is, nil
+}
+
+// overrideValue is the stored staging->production switch for an issuer whose
+// configured directory resolves to d: the switch only applies while the
+// configuration still names that directory.
+func overrideValue(d directory) string { return "production from " + d.URL }
+
+// clearStaleOverrides deletes switches (SwitchIssuer) whose issuer is gone
+// or whose configured directory changed since.
+func (m *Manager) clearStaleOverrides(ctx context.Context) {
+	keys, err := m.st.ListSettingKeys(ctx, overrideKeyPrefix)
+	if err != nil {
+		m.log.Warn("acme: list issuer switches", "err", err)
+		return
+	}
+	for _, k := range keys {
+		issuer, ok := strings.CutSuffix(strings.TrimPrefix(k, overrideKeyPrefix), overrideKeySuffix)
+		if !ok {
+			continue
+		}
+		v, _, err := m.st.GetSetting(ctx, k)
+		if err != nil {
+			continue
+		}
+		if is, defined := m.cfg.Issuers[issuer]; defined {
+			if d, err := resolveDirectory(is.Directory); err == nil && d.Staging && v == overrideValue(d) {
+				continue
+			}
+		}
+		if err := m.st.DeleteSetting(ctx, k); err != nil {
+			m.log.Warn("acme: delete stale issuer switch", "issuer", issuer, "err", err)
+		}
+	}
 }
 
 func (m *Manager) markInFlight(id string) bool {
@@ -1048,9 +1098,16 @@ func rowNames(r store.Cert) []string {
 }
 
 // Renew renews every managed certificate whose remaining lifetime is at most
-// settings.renew_before (default 30 days), sends expiry notifications for
-// all certificates, and returns one Result per certificate it considered
-// (due ones, renewed or not). Imported certificates are never renewed here.
+// settings.renew_before (default 30 days), sends expiry notifications, and
+// returns one Result per certificate it considered (due ones, renewed or
+// not). With ManagerConfig.Wanted set, unwanted certificates are marked
+// StatusUnwanted and skipped (ErrUnwanted) without notifications.
+//
+// An imported certificate is adopted (re-issued under the same id, becoming
+// managed) only once it is due and its zone has an issuer; otherwise it is
+// left alone (ErrImported when due). A certificate issued by the other
+// Let's Encrypt directory than its issuer's current one is never re-issued
+// here (ErrNeedsSwitch; use RenewNow or SwitchIssuer).
 func (m *Manager) Renew(ctx context.Context) []Result {
 	return m.safeResults(m.renew(ctx))
 }
@@ -1063,17 +1120,43 @@ func (m *Manager) renew(ctx context.Context) []Result {
 	now := m.now()
 	var out []Result
 	for _, r := range rows {
-		m.notifyExpiry(ctx, r, now)
-		if !r.NotAfter.IsZero() && r.NotAfter.Sub(now) > m.renewBefore {
-			continue
-		}
+		due := r.NotAfter.IsZero() || r.NotAfter.Sub(now) <= m.renewBefore
 		res := Result{CertID: r.ID, Zone: r.Zone, Names: rowNames(r)}
-		if !r.Managed {
-			res.Err, res.Skipped = ErrImported, true
-			out = append(out, res)
+		if m.wanted != nil {
+			wanted := m.rowWanted(r)
+			if r.Managed {
+				m.setUnwanted(ctx, r, !wanted)
+			}
+			if !wanted {
+				if due && (r.Managed || !r.NotAfter.IsZero()) {
+					res.Err, res.Skipped = ErrUnwanted, true
+					out = append(out, res)
+				}
+				if r.Managed {
+					continue
+				}
+				// An unwanted imported certificate keeps its notifications
+				// but is never adopted.
+				m.notifyExpiry(ctx, r, now)
+				continue
+			}
+		}
+		m.notifyExpiry(ctx, r, now)
+		if !due {
 			continue
 		}
 		z, ok := m.zone(r.Zone)
+		if !r.Managed {
+			if !ok || z.Certificate.Issuer == "" {
+				res.Err, res.Skipped = ErrImported, true
+				out = append(out, res)
+				continue
+			}
+			ictx, cancel := context.WithTimeout(ctx, m.issueTimeout)
+			out = append(out, m.issueSet(ictx, z, res.Names, r.ID, false))
+			cancel()
+			continue
+		}
 		if !ok || z.Certificate.Issuer == "" {
 			res.Err, res.Skipped = ErrNoIssuer, true
 			out = append(out, res)
@@ -1099,6 +1182,62 @@ func (m *Manager) renew(ctx context.Context) []Result {
 		cancel()
 	}
 	return out
+}
+
+// rowWanted applies ManagerConfig.Wanted to a certificate row.
+func (m *Manager) rowWanted(r store.Cert) bool {
+	z, ok := m.zone(r.Zone)
+	if !ok || z.Certificate.Issuer == "" {
+		return false
+	}
+	names := rowNames(r)
+	if len(names) == 0 {
+		return false
+	}
+	if hasWildcard(names) {
+		return zoneStrategy(z) == StrategyWildcard
+	}
+	zone := normName(z.Name)
+	want := map[string]bool{}
+	for _, n := range m.wanted(zone) {
+		if c, err := checkName(zone, n); err == nil {
+			want[c] = true
+		}
+	}
+	for _, n := range names {
+		c, err := canonName(n)
+		if err != nil {
+			return false
+		}
+		if want[c] {
+			continue
+		}
+		if _, parent, ok := strings.Cut(c, "."); ok && want["*."+parent] {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// setUnwanted moves a managed row into or out of StatusUnwanted.
+func (m *Manager) setUnwanted(ctx context.Context, r store.Cert, unwanted bool) {
+	switch {
+	case unwanted && r.Status != StatusUnwanted:
+		r.Status = StatusUnwanted
+	case !unwanted && r.Status == StatusUnwanted:
+		r.Status = StatusValid
+		if r.NotAfter.IsZero() {
+			r.Status = StatusFailed
+		}
+	default:
+		return
+	}
+	if err := m.st.UpsertCert(ctx, r); err != nil {
+		m.log.Warn("acme: update certificate status", "id", r.ID, "err", err)
+		return
+	}
+	m.changed()
 }
 
 // notifyExpiry sends one EventExpiring for the tightest threshold crossed,
@@ -1136,7 +1275,8 @@ func (m *Manager) notifyExpiry(ctx context.Context, r store.Cert, now time.Time)
 }
 
 // RenewNow re-issues one certificate now, skipping the ordinary backoff
-// (never a rate-limit park). For an imported certificate this is the
+// (never a rate-limit park), from the issuer's current directory (this is
+// how a certificate left on staging by a failed SwitchIssuer is retried). For an imported certificate this is the
 // explicit switch to managed: its zone must have an issuer, and on success
 // the row becomes managed=true with the same id.
 func (m *Manager) RenewNow(ctx context.Context, certID string) Result {
@@ -1162,23 +1302,20 @@ func (m *Manager) renewNow(ctx context.Context, certID string) Result {
 		}
 		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: err}
 	}
-	if r.Managed && !r.NotAfter.IsZero() {
-		d, _, err := m.effectiveDirectory(ctx, z.Certificate.Issuer)
-		if err != nil {
-			return Result{CertID: certID, Zone: r.Zone, Names: names, Err: err}
-		}
-		if d.Staging != r.Staging {
-			return Result{CertID: certID, Zone: r.Zone, Names: names, Err: ErrNeedsSwitch}
-		}
-	}
+	// A certificate from the issuer's other Let's Encrypt directory
+	// (ErrNeedsSwitch in Renew) is re-issued from the current one here.
 	return m.issueSet(ctx, z, names, certID, true)
 }
 
 // SwitchIssuer is the explicit staging->production flow: after the caller
 // has confirmed, it records that the Let's Encrypt issuer now uses the
 // production directory and re-issues every staging certificate of that
-// issuer (same ids, so Traefik's paths do not change). It never runs on its
-// own. to must be "production".
+// issuer (same ids), each independently: the result has one entry per
+// certificate, and one that failed stays on staging and can be retried
+// with RenewNow. It never runs on its own. to must be "production". The
+// switch is tied to the issuer's configured directory: once the
+// configuration names another directory it no longer applies (and is
+// deleted at the next start).
 func (m *Manager) SwitchIssuer(ctx context.Context, issuer, to string) ([]Result, error) {
 	out, err := m.switchIssuer(ctx, issuer, to)
 	return m.safeResults(out), m.red.safeErr(err)
@@ -1200,7 +1337,7 @@ func (m *Manager) switchIssuer(ctx context.Context, issuer, to string) ([]Result
 		return nil, fmt.Errorf("acme: issuer %q uses a custom directory; edit its configuration instead", issuer)
 	}
 	if d.Staging {
-		if err := m.st.SetSetting(ctx, overrideKey(issuer), "production"); err != nil {
+		if err := m.st.SetSetting(ctx, overrideKey(issuer), overrideValue(d)); err != nil {
 			return nil, err
 		}
 	}

@@ -69,7 +69,13 @@ func fvKey(issuer, name string) string    { return "acme/fv/" + issuer + "/" + n
 func ordersKey(issuer string) string      { return "acme/orders/" + issuer }
 func accountParkKey(issuer string) string { return "acme/park/" + issuer }
 func accountKeyKey(issuer string) string  { return "acme/account/" + issuer + "/key" }
-func overrideKey(issuer string) string    { return "acme/issuer/" + issuer + "/directory" }
+func overrideKey(issuer string) string    { return overrideKeyPrefix + issuer + overrideKeySuffix }
+
+const (
+	overrideKeyPrefix = "acme/issuer/"
+	overrideKeySuffix = "/directory"
+)
+
 func regKey(issuer, dirURL string) string {
 	h := sha256.Sum256([]byte(dirURL))
 	return "acme/account/" + issuer + "/reg/" + hex.EncodeToString(h[:8])

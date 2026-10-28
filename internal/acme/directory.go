@@ -31,7 +31,8 @@ type directory struct {
 // => a URL that must be https unless its host is a loopback name (tests).
 // "letsencrypt" is rejected as ambiguous.
 func resolveDirectory(dir string) (directory, error) {
-	switch strings.TrimSpace(dir) {
+	dir = strings.TrimSpace(dir)
+	switch dir {
 	case "", "staging":
 		return directory{URL: LEStagingURL, Staging: true, LetsEncrypt: true}, nil
 	case "production":
@@ -47,11 +48,16 @@ func resolveDirectory(dir string) (directory, error) {
 		return directory{}, fmt.Errorf("directory %q must use https", dir)
 	}
 	d := directory{URL: dir}
-	switch dir {
-	case LEStagingURL:
-		d.Staging, d.LetsEncrypt = true, true
-	case LEProductionURL:
-		d.LetsEncrypt = true
+	// Let's Encrypt's own URLs are recognized however they are written
+	// (scheme and host case, trailing slash) and stored in canonical form.
+	norm := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) + strings.TrimRight(u.EscapedPath(), "/")
+	if u.RawQuery == "" && u.Fragment == "" {
+		switch norm {
+		case LEStagingURL:
+			d = directory{URL: LEStagingURL, Staging: true, LetsEncrypt: true}
+		case LEProductionURL:
+			d = directory{URL: LEProductionURL, LetsEncrypt: true}
+		}
 	}
 	return d, nil
 }

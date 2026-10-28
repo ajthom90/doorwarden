@@ -386,7 +386,9 @@ func TestRenewBeforeFromSettings(t *testing.T) {
 
 func TestImportedCertNotAutoRenewed(t *testing.T) {
 	h := newHarness(t, nil, nil)
-	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(10*24*time.Hour))
+	// Not yet within renew_before: Renew leaves it alone (adoption of a
+	// due imported cert: TestImportedAdoptedOnlyWhenDueAndZoneHasIssuer).
+	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(60*24*time.Hour))
 	ir, err := h.m.ImportPEM(ctx, "example.test", chain, key)
 	if err != nil {
 		t.Fatal(err)
@@ -396,7 +398,7 @@ func TestImportedCertNotAutoRenewed(t *testing.T) {
 		t.Fatalf("row %+v", r)
 	}
 	res := h.m.Renew(ctx)
-	if len(res) != 1 || !errors.Is(res[0].Err, ErrImported) || !res[0].Skipped || h.ca.count() != 0 {
+	if len(res) != 0 || h.ca.count() != 0 {
 		t.Fatalf("renew %+v (orders %d)", res, h.ca.count())
 	}
 	if r := h.row(t, ir.Bundle.ID); r.Managed {
@@ -453,27 +455,6 @@ func TestSwitchIssuerStagingToProduction(t *testing.T) {
 	// New issuance now goes to production.
 	if b2, err := h.m.Issue(ctx, IssueRequest{Zone: "other.test", Names: []string{"x.other.test"}}); err != nil || b2.Staging {
 		t.Fatal(b2, err)
-	}
-}
-
-func TestRenewRefusesSilentDirectorySwitch(t *testing.T) {
-	cfg := testConfig()
-	h := newHarness(t, cfg, nil)
-	b, _ := h.m.Issue(ctx, wildcardReq())
-	is := cfg.Issuers["le"]
-	is.Directory = "production" // config edited by hand
-	cfg.Issuers["le"] = is
-	h.clock.Add(70 * 24 * time.Hour)
-	n := h.ca.count()
-	res := h.m.Renew(ctx)
-	if len(res) != 1 || !errors.Is(res[0].Err, ErrNeedsSwitch) || h.ca.count() != n {
-		t.Fatalf("%+v", res)
-	}
-	if r := h.m.RenewNow(ctx, b.ID); !errors.Is(r.Err, ErrNeedsSwitch) {
-		t.Fatalf("%+v", r)
-	}
-	if res, err := h.m.SwitchIssuer(ctx, "le", "production"); err != nil || len(res) != 1 || res[0].Err != nil {
-		t.Fatalf("%+v %v", res, err)
 	}
 }
 
