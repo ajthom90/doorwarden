@@ -231,11 +231,14 @@
 // means unknown, never "gone", and also suspends removals already due). With
 // no RemovedAfter, ScheduleRemoval carries now+grace (settings.grace_period,
 // 24h when unset) for the caller to persist; nothing is deleted. Once now is
-// strictly after RemovedAfter: RouteRemove. An absent service whose hostname
-// is taken over by a present Published, routable service of the same or a
-// higher source rank is removed earlier (see Hostname conflicts). A present
-// service with a RemovedAfter gets CancelRemoval in any state. Route removal
-// never deletes DNS: records have exactly one deletion path, the orphan rule.
+// strictly after RemovedAfter: RouteRemove{Cause: removal-grace,
+// RemovedAfter: the schedule}. An absent service whose hostname is taken
+// over by a present Published, routable service of the same or a higher
+// source rank is removed earlier (RouteRemove{Cause: takeover}; see Hostname
+// conflicts), and a loser that renamed away loses its old route
+// (Cause: rename). A present service with a RemovedAfter gets CancelRemoval
+// in any state. Route removal never deletes DNS: records have exactly one
+// deletion path, the orphan rule.
 //
 // # Orphan DNS records
 //
@@ -261,23 +264,40 @@
 //     ownership row (store.SetOwnedRemoval, owner-guarded).
 //   - orphan, now not strictly after RemovedAfter: nothing.
 //   - orphan, now strictly after RemovedAfter: DNSDelete with the STORED row
-//     (provider, zone, name, type, value, provider ID, owner). The executor
-//     deletes by stored ID/value only (a foreign record that took the name is
-//     never hit) and forgets the row on success. On failure the row stays,
-//     past its deadline, so every following cycle emits the DNSDelete again
-//     until it succeeds, even after RouteRemove forgot the Known entry.
+//     (provider, zone, name, type, value, provider ID, owner) and the
+//     planned RemovedAfter. The executor deletes by stored ID/value only (a
+//     foreign record that took the name is never hit) and forgets the row on
+//     success. On failure the row stays, past its deadline, so every
+//     following cycle emits the DNSDelete again until it succeeds, even after
+//     RouteRemove forgot the Known entry.
+//   - orphan whose hostname winner (resolveHostnames) is another present,
+//     cleanly Published service that wants exactly this (provider, zone,
+//     name, type) and the stored value equals the zone's desired value:
+//     DNSReassign{Owner: old, NewOwner: winner} instead of any schedule or
+//     delete, whatever the row's RemovedAfter. The executor moves the row to
+//     the new owner and clears its RemovedAfter (store.ReassignOwnedRecord,
+//     owner-guarded, no provider call): a rename without a stable id or a
+//     container recreate keeps the record continuously. A loser that also
+//     wants the row never gets it; when the values differ the row takes the
+//     schedule/delete path and the winner creates its record after the
+//     delete (see Hostname takeover delay). A row gets at most one of
+//     DNSEnsure, DNSReassign, DNSScheduleRemoval, DNSCancelRemoval and
+//     DNSDelete per plan.
 //   - wanted again (the owner wants the row) with RemovedAfter set:
 //     DNSCancelRemoval (executor clears it). A wanted row is never scheduled
 //     or deleted, whatever its RemovedAfter.
 //
-// Exclusions (never scheduled, never deleted; an existing RemovedAfter is
-// left as it is, neither cancelled nor executed):
+// Exclusions (never scheduled, never deleted, never reassigned):
 //   - (a) the owner is present but does not cleanly want records: not
 //     Published (Pending, Stopped, Error, Discovered, ...), Invalid (labels or
-//     middlewares), a held-Invalid holder, Published without
-//     any backend, or its zone's target_ip does not parse (wanted type
-//     unknown). Stopped containers never lose DNS; a Pending service keeps
-//     what it had.
+//     middlewares), a held-Invalid holder, its source Unavailable (carried
+//     forward), Published without any backend, or its zone's target_ip does
+//     not parse (wanted type unknown). Stopped containers never lose DNS; a
+//     Pending service keeps what it had. A RemovedAfter set while the owner
+//     was absent is CANCELLED (DNSCancelRemoval, "service is present again"):
+//     a deadline frozen during the absence must not delete the record in the
+//     first cycle that publishes it under another name; once Published and no
+//     longer wanting the row, a fresh grace period starts.
 //   - (b) the owner is absent and its source is unknown this cycle. With a
 //     Known entry, Known.Source decides (empty or Unavailable: unknown).
 //     Without one (route already removed) the key prefix must be "static:",
@@ -286,7 +306,9 @@
 //     prefix is Unavailable (the prefix itself, case-insensitively, and every
 //     Source carried this cycle by a desired service or Known entry with
 //     that prefix) or when an Unavailable source name maps to no prefix at
-//     all (it might be this owner's renamed source).
+//     all (it might be this owner's renamed source). Only that evidence maps
+//     a name to a prefix: a name that merely looks like a prefix does not (a
+//     TrueNAS source may be named "docker").
 //   - (c) the wildcard record ("zone:" owner, or a "*." name): never removed
 //     automatically, as before; the executor refuses it too.
 //   - (d) a zone with records mode off (or unset): nothing is touched, and
@@ -297,8 +319,8 @@
 //     they are left alone so no name goes dark.
 //   - (e) the row's zone is no longer configured, or the zone's records
 //     provider is not the row's provider: a Skip per row says so; nothing is
-//     changed (it cannot be verified). GatherObserved never returns such rows
-//     today, so this is a defensive rule.
+//     changed (it cannot be verified). GatherObserved returns every row in
+//     the store, so such rows are seen and reported.
 //   - a row for which the same plan emits a DNSEnsure (same provider, zone,
 //     name, type) is never scheduled or deleted.
 //
@@ -310,20 +332,44 @@
 // (target_ip switched between IPv4 and IPv6) makes the old-type row an orphan
 // the same way.
 //
-// Hostname takeover delay: a winner never re-owns a loser's row (no ownership
-// transfer). While the loser's row exists the winner's ensure is a no-op (same
-// value) or a Skip (other value); after the loser's row is deleted (grace
-// expired) the winner's DNSEnsure creates its own record in the NEXT cycle
-// (the plan that deletes has the row in Observed, so it emits no create).
-// The name therefore has no record for one reconcile interval (plus
-// negative-caching TTLs).
+// Hostname takeover delay (values differ only): when the loser's stored value
+// is not the winner's desired value there is no reassign. While the loser's
+// row exists the winner's ensure is a Skip; after the loser's row is deleted
+// (grace expired) the winner's DNSEnsure creates its own record in the NEXT
+// cycle (the plan that deletes has the row in Observed, so it emits no
+// create). The name then has no record for one reconcile interval (plus
+// negative-caching TTLs). With the same value the row is reassigned and
+// there is no gap.
+//
+// Stale plans: Observed is gathered outside Runner's lock, so a plan may
+// act on a view an applied newer cycle has already changed. Every
+// destructive or bookkeeping action re-checks the stored state before it
+// acts, and does nothing (logged) when it differs from what the plan saw:
+//   - DNSDelete carries its planned RemovedAfter; the executor re-reads the
+//     row and deletes only if it has the same owner, value and RemovedAfter,
+//     and that is due (strictly before now, in whole seconds). It deletes at
+//     the provider first, then the row with store.DeleteOwnedRecordIfDue. If
+//     the row changed between the two (a cancel, reschedule or reassign won
+//     the race) the record is gone but the row is not: the executor logs an
+//     error activity, blanks the row's stored value and provider ID, and the
+//     next plan's DNSEnsure re-creates the record (bounded gap, never a
+//     permanent loss).
+//   - DNSScheduleRemoval acts only on an unscheduled row, DNSCancelRemoval
+//     only on a scheduled one, and DNSReassign only on a row that still has
+//     the old owner; all require the same owner and value.
+//   - RouteRemove{Cause: removal-grace} (or no Cause) deletes only through
+//     store.DeleteRouteIfDue (removed_after set and due at apply time).
+//     takeover and rename removals are decided on the hostname state of the
+//     plan and are applied as planned: a stale one removes a route the next
+//     cycle writes again.
 //
 // Known gaps, resolved conservatively: when a published service becomes
 // Pending (fingerprint changed) its route is left as last written, not
 // removed; likewise a Stopped/Error service's route is left as last written
-// (its RouteWrite is a no-op in the route executor). A row re-owned between
-// Plan and the executor's delete is protected only by the executor's
-// read-then-delete owner check (not atomic).
+// (its RouteWrite is a no-op in the route executor). The re-checks above are
+// read-then-write, not one transaction; the final row write in each is
+// owner- and schedule-guarded in SQL. store.DeleteOwnedRecord (unconditional)
+// is for the UI/admin only; reconcile never calls it.
 //
 // # Execution
 //
@@ -334,16 +380,24 @@
 // Caller duties (T19): pass desired for every available source in one call;
 // persist ScheduleRemoval/CancelRemoval; forget a service's Known entry once
 // its RouteRemove was applied (removal past grace, or a conflict loser);
-// pass Observed.Owned (with RemovedAfter) for every managed provider/zone
-// (GatherObserved) and register the DNS executor for DNSEnsure, DNSDelete,
-// DNSScheduleRemoval and DNSCancelRemoval (it persists and forgets
-// ownership rows itself); mark a source
+// pass Observed.Owned (with RemovedAfter) as EVERY ownership row in the
+// store, not only the configured provider/zone pairs (GatherObserved does
+// both); register the DNS executor for every kind in DNSActionKinds
+// (RegisterDNSExecutor; it persists, reassigns and forgets ownership rows
+// itself) and the route executor for RouteWrite, RouteRemove,
+// ScheduleRemoval and CancelRemoval (its store must implement
+// DeleteRouteIfDue); mark a source
 // Unavailable when it failed to construct, its List failed, its services
 // could not be resolved (a Resolve/merge error), or its approvals failed to
 // load (otherwise its services would look absent and be removed); key
 // Unavailable (and fill Known.Source) with the value services carry in
 // Service.Source, which is what Plan compares, not necessarily
-// Source.Name(). Persist last-known backends ONLY from
+// Source.Name(). For an absent owner without a Known entry, Plan maps an
+// Unavailable name to a key prefix only through this cycle's evidence, so
+// either Service.Source equals the key prefix ("static", "truenas",
+// "docker") or every Known entry carries its Source; otherwise any outage
+// of an unmapped name blocks every such owner's removals (safe, but nothing
+// is cleaned up until the source is back). Persist last-known backends ONLY from
 // Action.Backend of RouteWrite actions (for a stopped service that already is
 // the last-known one) or from Discovered/Published services, never from
 // Svc.Backend of a Stopped/Error service.
