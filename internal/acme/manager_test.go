@@ -385,7 +385,7 @@ func TestRenewBeforeFromSettings(t *testing.T) {
 }
 
 func TestImportedCertNotAutoRenewed(t *testing.T) {
-	h := newHarness(t, nil, nil)
+	h := newHarness(t, productionConfig(), nil)
 	// Not yet within renew_before: Renew leaves it alone (adoption of a
 	// due imported cert: TestImportedAdoptedOnlyWhenDueAndZoneHasIssuer).
 	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(60*24*time.Hour))

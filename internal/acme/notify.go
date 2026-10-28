@@ -15,6 +15,10 @@ const (
 	// EventExpiring: a certificate crossed an expiry threshold (sent once
 	// per certificate, threshold and expiry date).
 	EventExpiring EventKind = "cert.expiring"
+	// EventAdoptionBlocked (a warning): an imported certificate is due but
+	// its zone's issuer uses a staging directory, so Renew will not replace
+	// it (sent once per certificate, threshold and expiry date).
+	EventAdoptionBlocked EventKind = "cert.adoption_blocked"
 )
 
 // ExpiryThresholds are the remaining-lifetime thresholds that trigger an

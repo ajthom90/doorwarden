@@ -2,11 +2,16 @@ package acme
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ajthom90/doorwarden/internal/config"
 )
 
 // --- Wanted filter ---
@@ -110,7 +115,7 @@ func TestWantedNilKeepsBehavior(t *testing.T) {
 // --- Imported adoption ---
 
 func TestImportedAdoptedOnlyWhenDueAndZoneHasIssuer(t *testing.T) {
-	h := newHarness(t, nil, nil)
+	h := newHarness(t, productionConfig(), nil)
 	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(60*24*time.Hour))
 	ir, err := h.m.ImportPEM(ctx, "example.test", chain, key)
 	if err != nil {
@@ -363,5 +368,133 @@ func TestNeedsSwitchMessageGeneric(t *testing.T) {
 	msg := ErrNeedsSwitch.Error()
 	if strings.Contains(msg, "other Let's Encrypt directory") || !strings.Contains(msg, "issuer directory changed") {
 		t.Fatalf("message: %s", msg)
+	}
+}
+
+// productionConfig is testConfig with the "le" issuer on production.
+func productionConfig() *config.Config {
+	cfg := testConfig()
+	is := cfg.Issuers["le"]
+	is.Directory = "production"
+	cfg.Issuers["le"] = is
+	return cfg
+}
+
+// stagingCA is a test CA whose name carries Let's Encrypt's staging marker.
+func stagingCA(t *testing.T) *testCA {
+	t.Helper()
+	ca := newTestCA(t)
+	tmpl := *ca.cert
+	tmpl.Subject.CommonName = "(STAGING) Doorwarden Test R1"
+	tmpl.RawSubject, tmpl.RawIssuer = nil, nil
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &ca.key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca.cert, _ = x509.ParseCertificate(der)
+	return ca
+}
+
+// A due imported (production) certificate in a zone whose issuer is a
+// staging CA is never replaced from staging: no order, ErrDowngrade
+// (Skipped), the row stays imported, the expiry notice still fires and a
+// blocked-adoption event is sent once per threshold.
+func TestImportedNotAdoptedFromStagingIssuer(t *testing.T) {
+	h := newHarness(t, nil, nil) // issuer "le" is staging
+	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(10*24*time.Hour))
+	ir, err := h.m.ImportPEM(ctx, "example.test", chain, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := h.row(t, ir.Bundle.ID)
+	for range 2 {
+		res := h.m.Renew(ctx)
+		if len(res) != 1 || !errors.Is(res[0].Err, ErrDowngrade) || !errors.Is(res[0].Err, ErrImportedStaging) || !res[0].Skipped {
+			t.Fatalf("%+v", res)
+		}
+	}
+	if h.ca.count() != 0 {
+		t.Fatalf("%d orders placed from a staging issuer", h.ca.count())
+	}
+	if r := h.row(t, ir.Bundle.ID); r.Managed || r.Status != StatusImported || r.Path != before.Path || !r.NotAfter.Equal(before.NotAfter) {
+		t.Fatalf("row changed: %+v", r)
+	}
+	var expiring, blocked int
+	for _, e := range h.evs.list() {
+		switch e.Kind {
+		case EventExpiring:
+			expiring++
+		case EventAdoptionBlocked:
+			blocked++
+			if !strings.Contains(e.Message, "staging issuer blocks adoption") {
+				t.Errorf("message %q", e.Message)
+			}
+		}
+	}
+	if expiring != 1 || blocked != 1 {
+		t.Fatalf("expiring %d, blocked %d events (want 1, 1): %+v", expiring, blocked, h.evs.list())
+	}
+	// Crossing the next threshold sends one more.
+	h.clock.Add(4 * 24 * time.Hour)
+	h.m.Renew(ctx)
+	blocked = 0
+	for _, e := range h.evs.list() {
+		if e.Kind == EventAdoptionBlocked {
+			blocked++
+		}
+	}
+	if blocked != 2 {
+		t.Fatalf("blocked events %d, want 2", blocked)
+	}
+}
+
+// RenewNow on an imported production certificate with a staging issuer
+// needs AllowDowngrade; an imported staging certificate does not.
+func TestRenewNowImportedDowngrade(t *testing.T) {
+	h := newHarness(t, nil, nil) // staging issuer
+	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(60*24*time.Hour))
+	ir, err := h.m.ImportPEM(ctx, "example.test", chain, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := h.m.RenewNow(ctx, ir.Bundle.ID); !errors.Is(r.Err, ErrDowngrade) || h.ca.count() != 0 {
+		t.Fatalf("imported production cert downgraded: %v (orders %d)", r.Err, h.ca.count())
+	}
+	if r := h.m.RenewNow(ctx, ir.Bundle.ID, AllowDowngrade()); r.Err != nil || h.ca.count() != 1 {
+		t.Fatalf("AllowDowngrade: %v (orders %d)", r.Err, h.ca.count())
+	}
+	if !strings.Contains(h.logs.String(), "replacing a production certificate with a staging one") {
+		t.Errorf("no downgrade warning logged")
+	}
+
+	sca := stagingCA(t)
+	schain, skey := sca.leaf(t, []string{"app.other.test"}, t0.Add(60*24*time.Hour))
+	sr, err := h.m.ImportPEM(ctx, "other.test", schain, skey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := h.m.RenewNow(ctx, sr.Bundle.ID); r.Err != nil {
+		t.Fatalf("imported staging cert refused: %v", r.Err)
+	}
+}
+
+func TestStagingIssuerMarkers(t *testing.T) {
+	for _, tc := range []struct {
+		cn, o string
+		want  bool
+	}{
+		{"(STAGING) Pretend Pear X1", "(STAGING) Let's Encrypt", true},
+		{"Fake LE Intermediate X1", "", true},
+		{"Pebble Intermediate CA 1a2b3c", "", true},
+		{"R11", "Let's Encrypt", false},
+		{"doorwarden test CA", "", false},
+	} {
+		c := &x509.Certificate{Issuer: pkix.Name{CommonName: tc.cn}}
+		if tc.o != "" {
+			c.Issuer.Organization = []string{tc.o}
+		}
+		if got := stagingIssued(c); got != tc.want {
+			t.Errorf("%q/%q: %v", tc.cn, tc.o, got)
+		}
 	}
 }

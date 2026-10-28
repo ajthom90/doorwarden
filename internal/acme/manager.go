@@ -109,9 +109,21 @@ var (
 	// ErrUnwanted: the certificate's names are no longer wanted
 	// (ManagerConfig.Wanted); it is not renewed.
 	ErrUnwanted = errors.New("acme: certificate is no longer wanted; not renewed")
+	// ErrImportedStaging (errors.Is ErrDowngrade too): Renew will not adopt
+	// a due imported certificate from a staging issuer.
+	ErrImportedStaging error = &wrappedSentinel{msg: "acme: imported certificate is due but the issuer is a staging CA; switch the issuer to production (or use RenewNow with AllowDowngrade) before renewal", base: ErrDowngrade}
 	// ErrNotFound: no certificate with that id.
 	ErrNotFound = errors.New("acme: certificate not found")
 )
+
+// wrappedSentinel is a sentinel error that also matches base (errors.Is).
+type wrappedSentinel struct {
+	msg  string
+	base error
+}
+
+func (e *wrappedSentinel) Error() string { return e.msg }
+func (e *wrappedSentinel) Unwrap() error { return e.base }
 
 // DeferredError reports an attempt that was not made.
 type DeferredError struct {
@@ -662,6 +674,8 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 				if derr := m.beginAttempt(bg, issuer, id); derr != nil {
 					// Nothing could be persisted: never contact the CA.
 					r = Result{CertID: id, Zone: normName(z.Name), Names: append([]string(nil), names...), Err: derr, NextAttempt: derr.Until}
+					ev = &Event{Kind: EventFailure, CertID: id, Zone: normName(z.Name), Names: append([]string(nil), names...),
+						Message: "order not placed: " + derr.Reason, NextAttempt: derr.Until}
 					return
 				}
 				started = true
@@ -774,7 +788,31 @@ func (m *Manager) guard(ctx context.Context, issuer, id string, names []string, 
 	if _, err := m.kv.getJSON(ctx, attemptKey(id), &a); err != nil {
 		return &DeferredError{Until: now.Add(backoffBase), Reason: m.red.redact("state unreadable: " + err.Error())}
 	}
+	// Clamp on read: a backward clock jump (or a corrupt record) must not
+	// defer a set longer than the longest park, or the backoff cap when
+	// not parked. A clamped value is written back so the wait ends.
+	parkCap := now.Add(maxRateLimitPark)
+	clamped := false
+	if a.ParkedUntil.After(parkCap) {
+		a.ParkedUntil, clamped = parkCap, true
+	}
+	nextCap := now.Add(backoffCap)
+	if a.ParkedUntil.After(nextCap) {
+		nextCap = a.ParkedUntil
+	}
+	if a.NextAttempt.After(nextCap) {
+		a.NextAttempt, clamped = nextCap, true
+	}
+	if clamped {
+		m.log.Warn("acme: attempt state lay beyond the backoff caps (clock moved back?); clamped", "cert", id)
+		if err := m.kv.putJSON(ctx, attemptKey(id), a); err != nil {
+			m.log.Warn("acme: persist clamped attempt state", "cert", id, "err", err)
+		}
+	}
 	if t := m.memNext[id]; !force && t.After(now) {
+		if t.After(parkCap) {
+			t = parkCap
+		}
 		return &DeferredError{Until: t, Reason: "backing off: the state store was not writable at the last attempt", LastError: a.LastError}
 	}
 	if a.ParkedUntil.After(now) {
@@ -782,6 +820,13 @@ func (m *Manager) guard(ctx context.Context, issuer, id string, names []string, 
 	}
 	var acct time.Time
 	_, _ = m.kv.getJSON(ctx, accountParkKey(issuer), &acct)
+	if acct.After(parkCap) {
+		acct = parkCap
+		m.log.Warn("acme: account park lay beyond the cap (clock moved back?); clamped", "issuer", issuer)
+		if err := m.kv.putJSON(ctx, accountParkKey(issuer), acct); err != nil {
+			m.log.Warn("acme: persist clamped account park", "issuer", issuer, "err", err)
+		}
+	}
 	if acct.After(now) {
 		return &DeferredError{Until: acct, Reason: fmt.Sprintf("issuer %s account rate limited by the CA", issuer)}
 	}
@@ -1155,8 +1200,10 @@ func rowNames(r store.Cert) []string {
 // StatusUnwanted and skipped (ErrUnwanted) without notifications.
 //
 // An imported certificate is adopted (re-issued under the same id, becoming
-// managed) only once it is due and its zone has an issuer; otherwise it is
-// left alone (ErrImported when due). A certificate issued by the other
+// managed) only once it is due and its zone has an issuer whose directory
+// is not staging; otherwise it is left alone (ErrImported when due without
+// an issuer; ErrImportedStaging plus an EventAdoptionBlocked notice when the
+// issuer is staging). A certificate issued by the other
 // Let's Encrypt directory than its issuer's current one is never re-issued
 // here (ErrNeedsSwitch; use RenewNow or SwitchIssuer).
 func (m *Manager) Renew(ctx context.Context) []Result {
@@ -1202,6 +1249,20 @@ func (m *Manager) renew(ctx context.Context) []Result {
 			if !ok || z.Certificate.Issuer == "" {
 				res.Err, res.Skipped = ErrImported, true
 				out = append(out, res)
+				continue
+			}
+			// Adoption never replaces an imported certificate from a
+			// staging directory (it would serve an untrusted certificate).
+			d, _, err := m.effectiveDirectory(ctx, z.Certificate.Issuer)
+			if err != nil {
+				res.Err = err
+				out = append(out, res)
+				continue
+			}
+			if d.Staging {
+				res.Err, res.Skipped = ErrImportedStaging, true
+				out = append(out, res)
+				m.notifyAdoptionBlocked(ctx, r, now)
 				continue
 			}
 			ictx, cancel := context.WithTimeout(ctx, m.issueTimeout)
@@ -1404,11 +1465,73 @@ func (m *Manager) notifyExpiry(ctx context.Context, r store.Cert, now time.Time)
 		NotAfter: r.NotAfter, Threshold: hit, Message: msg})
 }
 
+// notifyAdoptionBlocked warns (log, and a notifier event once per
+// certificate, expiry threshold and expiry date) that a due imported
+// certificate is not adopted because its issuer is a staging CA.
+func (m *Manager) notifyAdoptionBlocked(ctx context.Context, r store.Cert, now time.Time) {
+	m.log.Warn("acme: imported certificate due; staging issuer blocks adoption", "cert", r.ID, "zone", r.Zone, "not_after", r.NotAfter)
+	if m.notifier == nil {
+		return
+	}
+	var hit time.Duration
+	for _, th := range ExpiryThresholds {
+		if r.NotAfter.Sub(now) < th {
+			hit = th
+		}
+	}
+	key := fmt.Sprintf("acme/notified/%s/blocked-%d/%d", r.ID, int64(hit/time.Hour), r.NotAfter.Unix())
+	m.stateMu.Lock()
+	_, seen, err := m.st.GetSetting(ctx, key)
+	if err == nil && !seen {
+		err = m.st.SetSetting(ctx, key, now.UTC().Format(time.RFC3339))
+	}
+	m.stateMu.Unlock()
+	if err != nil || seen {
+		return
+	}
+	m.notifier.Notify(ctx, Event{Kind: EventAdoptionBlocked, CertID: r.ID, Zone: r.Zone, Names: rowNames(r), NotAfter: r.NotAfter,
+		Threshold: hit, Message: fmt.Sprintf("imported certificate %s due (expires %s); staging issuer blocks adoption: switch the issuer to production",
+			r.ID, r.NotAfter.UTC().Format(time.RFC3339))})
+}
+
+// stagingIssued reports whether a certificate's issuer name carries a
+// staging/test CA marker (Let's Encrypt staging "(STAGING)", its older
+// "Fake LE", Pebble).
+func stagingIssued(c *x509.Certificate) bool {
+	names := append([]string{c.Issuer.CommonName}, c.Issuer.Organization...)
+	for _, n := range names {
+		l := strings.ToLower(n)
+		if strings.Contains(l, "(staging)") || strings.Contains(l, "fake le") || strings.Contains(l, "pebble") {
+			return true
+		}
+	}
+	return false
+}
+
+// rowIsStaging reports whether r holds a staging certificate: the row's flag
+// for managed rows; for imported rows the leaf's issuer markers (an
+// unreadable leaf counts as production).
+func (m *Manager) rowIsStaging(r store.Cert) bool {
+	if r.Managed || r.Staging {
+		return r.Staging
+	}
+	if _, ok := pathVersion(r.ID, r.Path); !ok {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(m.certsDir, filepath.FromSlash(r.Path), FullchainFile))
+	if err != nil {
+		return false
+	}
+	leaf, err := leafCert(b)
+	return err == nil && stagingIssued(leaf)
+}
+
 // RenewNow re-issues one certificate now, skipping the ordinary backoff
 // (never a rate-limit park), from the issuer's current directory (this is
 // how a certificate left on staging by a failed SwitchIssuer is retried),
-// but it refuses (ErrDowngrade) to replace a managed production
-// certificate with a staging one unless AllowDowngrade is passed. For an
+// but it refuses (ErrDowngrade) to replace a production certificate
+// (managed, or imported without a staging issuer marker) with a staging
+// one unless AllowDowngrade is passed. For an
 // imported certificate this is the explicit switch to managed: its zone
 // must have an issuer, and on success the row becomes managed=true with
 // the same id.
@@ -1456,8 +1579,11 @@ func (m *Manager) renewNow(ctx context.Context, certID string, o renewNowOpts) R
 	if err != nil {
 		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: err}
 	}
-	if r.Managed && !r.Staging && !r.NotAfter.IsZero() && d.Staging && !o.allowDowngrade {
-		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: ErrDowngrade}
+	if d.Staging && !r.NotAfter.IsZero() && !m.rowIsStaging(r) {
+		if !o.allowDowngrade {
+			return Result{CertID: certID, Zone: r.Zone, Names: names, Err: ErrDowngrade}
+		}
+		m.log.Warn("acme: AllowDowngrade: replacing a production certificate with a staging one", "cert", certID, "zone", r.Zone)
 	}
 	return m.issueSet(ctx, z, names, certID, true)
 }

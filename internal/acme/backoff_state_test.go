@@ -238,3 +238,49 @@ func TestDeferredReasonFromStoreErrorRedacted(t *testing.T) {
 		t.Fatalf("reason not redacted: %q", de.Reason)
 	}
 }
+
+// A backward clock jump (or a corrupt record) cannot defer a set for longer
+// than the caps: the backoff cap without a park, the longest park with one.
+func TestGuardClampsFarFutureState(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	id := certID("example.test", []string{"*.example.test", "example.test"})
+	names := []string{"*.example.test", "example.test"}
+	now := h.clock.Now()
+	must(t, h.m.kv.putJSON(ctx, attemptKey(id), attemptState{Failures: 3, NextAttempt: now.Add(400 * 24 * time.Hour)}))
+	if d := h.m.guard(ctx, "le", id, names, false); d == nil || d.Until.After(now.Add(backoffCap)) {
+		t.Fatalf("backoff not clamped: %+v", d)
+	}
+	// The clamped value is stored, so the wait ends at the cap.
+	h.clock.Add(backoffCap + time.Minute)
+	if d := h.m.guard(ctx, "le", id, names, false); d != nil {
+		t.Fatalf("backoff clamp not persisted: %+v", d)
+	}
+	now = h.clock.Now()
+	must(t, h.m.kv.putJSON(ctx, attemptKey(id), attemptState{Failures: 3, NextAttempt: now.Add(400 * 24 * time.Hour), ParkedUntil: now.Add(400 * 24 * time.Hour)}))
+	if d := h.m.guard(ctx, "le", id, names, false); d == nil || d.Until.After(now.Add(maxRateLimitPark)) {
+		t.Fatalf("park not clamped: %+v", d)
+	}
+	must(t, h.m.kv.putJSON(ctx, attemptKey(id), attemptState{}))
+	must(t, h.m.kv.putJSON(ctx, accountParkKey("le"), now.Add(400*24*time.Hour)))
+	if d := h.m.guard(ctx, "le", id, names, false); d == nil || d.Until.After(now.Add(maxRateLimitPark)) {
+		t.Fatalf("account park not clamped: %+v", d)
+	}
+	h.clock.Add(maxRateLimitPark + time.Minute)
+	if d := h.m.guard(ctx, "le", id, names, false); d != nil {
+		t.Fatalf("still deferred after the cap: %+v", d)
+	}
+}
+
+// An order aborted because the state store is unwritable is reported to
+// the notifier.
+func TestUnwritableStoreNotifies(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.m.kv = kvStore{failingSets{settingsBackend: h.st, err: errors.New("disk full")}}
+	if _, err := h.m.Issue(ctx, wildcardReq()); !errors.Is(err, ErrDeferred) {
+		t.Fatal(err)
+	}
+	evs := h.evs.list()
+	if len(evs) != 1 || evs[0].Kind != EventFailure || !strings.Contains(evs[0].Message, "state store unwritable") || evs[0].NextAttempt.IsZero() {
+		t.Fatalf("events %+v", evs)
+	}
+}
