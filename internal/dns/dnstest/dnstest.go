@@ -28,6 +28,12 @@ type Options struct {
 	// write intact (or refuse with an error). Providers that cannot hold
 	// several values per (name, type) leave it nil.
 	SeedMultiValue func(ctx context.Context, zone, name string, values ...string) error
+	// Unconfirmed, when set, returns a provider (same backend, writes accepted
+	// but never visible to reads) that can only answer Create with
+	// dns.ErrUnconfirmed. The UnconfirmedCreateReturnsRecord subtest requires the
+	// error to wrap dns.ErrUnconfirmed AND the returned Record to describe what
+	// was written, so a caller can record ownership.
+	Unconfirmed func(t *testing.T) dns.Provider
 }
 
 // Run executes the suite with default zones example.test and other.test.
@@ -300,6 +306,26 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 		if v := values(); v["192.0.2.1"] || !v["192.0.2.2"] {
 			t.Fatalf("Delete of one value: now %v", v)
 		}
+	})
+
+	t.Run("UnconfirmedCreateReturnsRecord", func(t *testing.T) {
+		if o.Unconfirmed == nil {
+			t.Skip("provider does not declare an unconfirmed-write mode")
+		}
+		p := o.Unconfirmed(t)
+		rec := mk("unconf")
+		got, err := p.CreateRecord(ctx(t), zone, rec)
+		if !errors.Is(err, dns.ErrUnconfirmed) {
+			t.Fatalf("want ErrUnconfirmed, got %v", err)
+		}
+		if got.Name != rec.Name || got.Type != rec.Type || got.Value != rec.Value {
+			t.Fatalf("ErrUnconfirmed must come with the written record, got %+v", got)
+		}
+		t.Cleanup(func() {
+			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = factory(t).DeleteRecord(c, zone, rec)
+		})
 	})
 
 	t.Run("ListScopedToZone", func(t *testing.T) {

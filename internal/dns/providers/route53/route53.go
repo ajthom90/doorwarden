@@ -86,10 +86,14 @@ type Config struct {
 	Endpoint        string // Go-level test seam; not reachable from user config (SSRF/credential exfiltration)
 
 	// VerifyTimeout bounds how long a write waits for its change to become
-	// visible to reads (default 60s); VerifyInterval is the poll step (default
-	// 1s). Route 53 does not promise that a read right after a change shows it.
+	// visible to reads (default 20s, and never beyond the caller's context
+	// deadline minus 2s); VerifyInterval is the poll step (default 1s). Route 53
+	// does not promise that a read right after a change shows it.
 	VerifyTimeout  time.Duration
 	VerifyInterval time.Duration
+	// Now and Sleep replace time.Now and a context-aware sleep (tests only).
+	Now   func() time.Time
+	Sleep func(ctx context.Context, d time.Duration) error
 }
 
 // Provider implements dns.Provider. It holds no secret-bearing value: the AWS
@@ -101,6 +105,8 @@ type Provider struct {
 	pinned  string
 
 	verifyTimeout, verifyEvery time.Duration
+	now                        func() time.Time
+	sleep                      func(ctx context.Context, d time.Duration) error
 
 	mu    *sync.Mutex
 	cache map[string]zoneRef // zone -> hosted zone
@@ -140,13 +146,27 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 	_, scrub := dns.Scrubber(sec...)
 	vt, vi := c.VerifyTimeout, c.VerifyInterval
 	if vt <= 0 {
-		vt = 60 * time.Second
+		vt = 20 * time.Second
 	}
 	if vi <= 0 {
 		vi = time.Second
 	}
+	now, sleep := c.Now, c.Sleep
+	if now == nil {
+		now = time.Now
+	}
+	if sleep == nil {
+		sleep = func(ctx context.Context, d time.Duration) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+				return nil
+			}
+		}
+	}
 	return &Provider{client: func() *r53.Client { return cl }, scrubFn: scrub,
-		pinned: strings.TrimPrefix(c.HostedZoneID, "/hostedzone/"), verifyTimeout: vt, verifyEvery: vi,
+		pinned: strings.TrimPrefix(c.HostedZoneID, "/hostedzone/"), verifyTimeout: vt, verifyEvery: vi, now: now, sleep: sleep,
 		mu: &sync.Mutex{}, cache: map[string]zoneRef{}}, nil
 }
 
@@ -276,6 +296,7 @@ func (p *Provider) getZone(ctx context.Context, op, id string) (zoneRef, error) 
 }
 
 func (p *Provider) zoneFor(ctx context.Context, zone string) (zoneRef, error) {
+	zone = normZoneName(zone)
 	p.mu.Lock()
 	ref, ok := p.cache[zone]
 	p.mu.Unlock()
@@ -370,6 +391,7 @@ func (p *Provider) allSets(ctx context.Context, zid string) ([]types.ResourceRec
 func inZone(name, zone string) bool { return name == zone || strings.HasSuffix(name, "."+zone) }
 
 func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, error) {
+	zone = normZoneName(zone)
 	ref, err := p.zoneFor(ctx, zone)
 	if err != nil {
 		return nil, err
@@ -466,29 +488,48 @@ func sameValues(s *types.ResourceRecordSet, want ...string) bool {
 	return true
 }
 
-// verify re-reads the single (name, type) set until it shows the expected
-// state. Route 53 does not promise that a read issued right after a change
-// already reflects it, so the read is polled every verifyEvery for at most
-// verifyTimeout (we deliberately do not wait for GetChange to reach INSYNC,
-// which can take minutes and is not what the next read depends on). If the
-// state never shows up the error names the record: success is never claimed.
-func (p *Provider) verify(ctx context.Context, zid, op, name, typ string, want ...string) error {
-	deadline := time.Now().Add(p.verifyTimeout)
+// verify re-reads the single (name, type) set until it shows the requested
+// state want. pre is the state before the change. Route 53 does not promise that
+// a read issued right after a change already reflects it, so the read is polled
+// every verifyEvery for at most the verification window: verifyTimeout, capped
+// at the caller's context deadline minus 2s so this provider answers before the
+// caller's own timeout cancels it. (We deliberately do not wait for GetChange
+// to reach INSYNC, which can take minutes and is not what the next read
+// depends on.)
+//
+// Outcomes: nil (confirmed); an ordinary error when a read shows values that
+// are neither pre nor want (another writer changed the set); otherwise an error
+// wrapping dns.ErrUnconfirmed: the change was accepted, so the caller must
+// treat it as made.
+func (p *Provider) verify(ctx context.Context, zid, op, name, typ string, pre, want []string) error {
+	start := p.now()
+	limit := p.verifyTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		if room := dl.Sub(start) - 2*time.Second; room < limit {
+			limit = room
+		}
+	}
+	deadline := start.Add(limit) // limit <= 0 still allows the first read
+	unconfirmed := func(cause error) error {
+		return fmt.Errorf("route53: %s: change for %s %s was accepted but could not be confirmed within %s (%s): %w",
+			op, name, typ, p.verifyTimeout, p.scrub(cause.Error()), dns.ErrUnconfirmed)
+	}
 	for {
 		got, err := p.getSet(ctx, zid, name, typ)
 		if err != nil {
-			return fmt.Errorf("%w (change submitted but not confirmed)", err)
+			return unconfirmed(err)
 		}
-		if sameValues(got, want...) {
+		if sameValues(got, append([]string(nil), want...)...) {
 			return nil
 		}
-		if !time.Now().Add(p.verifyEvery).Before(deadline) {
-			return fmt.Errorf("route53: %s: change for %s %s was accepted but the record set did not show the expected values within %s; refusing to report success", op, name, typ, p.verifyTimeout)
+		if !sameValues(got, append([]string(nil), pre...)...) {
+			return fmt.Errorf("route53: %s: %s %s now holds %v, neither the previous nor the requested values (changed by another writer?)", op, name, typ, valuesOf(got))
 		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("route53: %s: %w (change for %s %s submitted but not confirmed)", op, ctx.Err(), name, typ)
-		case <-time.After(p.verifyEvery):
+		if !p.now().Add(p.verifyEvery).Before(deadline) {
+			return unconfirmed(errors.New("the record set still shows the previous values"))
+		}
+		if err := p.sleep(ctx, p.verifyEvery); err != nil {
+			return unconfirmed(err)
 		}
 	}
 }
@@ -592,7 +633,10 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err := p.change(ctx, ref.id, "create record "+r.Name, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
 		return dns.Record{}, err
 	}
-	if err := p.verify(ctx, ref.id, "create record "+r.Name, r.Name, r.Type, r.Value); err != nil {
+	if err := p.verify(ctx, ref.id, "create record "+r.Name, r.Name, r.Type, nil, []string{r.Value}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err // accepted: the caller must record ownership
+		}
 		return dns.Record{}, err
 	}
 	return r, nil
@@ -631,7 +675,10 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
 		return dns.Record{}, err
 	}
-	if err := p.verify(ctx, ref.id, "update record "+r.Name, r.Name, r.Type, r.Value); err != nil {
+	if err := p.verify(ctx, ref.id, "update record "+r.Name, r.Name, r.Type, valuesOf(cur), []string{r.Value}); err != nil {
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			return r, err
+		}
 		return dns.Record{}, err
 	}
 	return r, nil
@@ -676,7 +723,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	if err := p.change(ctx, ref.id, op, changes...); err != nil {
 		return err
 	}
-	return p.verify(ctx, ref.id, op, r.Name, r.Type, restVals...)
+	return p.verify(ctx, ref.id, op, r.Name, r.Type, valuesOf(cur), restVals)
 }
 
 // String, GoString and Format print only the type: a Provider holds no

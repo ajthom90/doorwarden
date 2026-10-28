@@ -440,7 +440,7 @@ func TestCreateWithoutEchoFindsIDOrFails(t *testing.T) {
 	}))
 	defer srv.Close()
 	p2, _ := unifi.New(unifi.Config{URL: srv.URL, APIKey: fakeKey})
-	if got, err := p2.CreateRecord(ctx, "example.test", dns.Record{Name: "lost.example.test", Type: "A", Value: "192.0.2.45"}); err == nil || got.ID != "" {
+	if got, err := p2.CreateRecord(ctx, "example.test", dns.Record{Name: "lost.example.test", Type: "A", Value: "192.0.2.45"}); !errors.Is(err, dns.ErrUnconfirmed) || got.Name != "lost.example.test" || got.Value != "192.0.2.45" || got.ID != "" {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}
 }

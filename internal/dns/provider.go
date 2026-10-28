@@ -17,6 +17,18 @@ var (
 	// ErrRecordExists is returned when creating a record whose (name, type)
 	// already exists with a different value.
 	ErrRecordExists = errors.New("dns: record already exists with a different value")
+	// ErrUnconfirmed is returned (wrapped) when a write was ACCEPTED by the
+	// service but could not be confirmed within the provider's verification
+	// window. The Record returned alongside it describes what was written, so
+	// callers MUST treat a Create/Update that returns errors.Is(err,
+	// ErrUnconfirmed) with a non-empty Record.Name as done (create the ownership
+	// row, warn, verify on a later cycle): ignoring it would leave a record the
+	// service holds but nobody owns. For DeleteRecord the error wraps
+	// ErrUnconfirmed and the caller must KEEP its ownership row, because the
+	// record may or may not be gone yet. Providers return it only after the
+	// service acknowledged the change and no read showed a conflicting value; a
+	// conflicting value (another writer) is an ordinary error.
+	ErrUnconfirmed = errors.New("dns: write accepted but not confirmed")
 )
 
 // Record is a single DNS record.

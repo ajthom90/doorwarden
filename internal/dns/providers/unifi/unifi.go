@@ -354,14 +354,18 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	// the response did not echo the policy: find it again to learn its ID
 	pols, err = p.policies(ctx, sid)
 	if err != nil {
-		return dns.Record{}, fmt.Errorf("unifi: create DNS policy %s: created but could not confirm: %w", r.Name, err)
+		// the POST was accepted: report what was written so the caller records it
+		return r, fmt.Errorf("unifi: create DNS policy %s: accepted but could not be confirmed (%v): %w", r.Name, err, dns.ErrUnconfirmed)
 	}
 	for _, po := range pols {
 		if e := po.record(); e.Name == r.Name && e.Type == r.Type && e.Value == r.Value {
 			return e, nil
 		}
 	}
-	return dns.Record{}, fmt.Errorf("unifi: create DNS policy %s: the gateway accepted the request but the policy ID could not be determined", r.Name)
+	// accepted, but the policy cannot be found again: the record may exist without
+	// an ID. Delete without an ID matches (name, type, value), so ownership is
+	// still recordable.
+	return r, fmt.Errorf("unifi: create DNS policy %s: the gateway accepted the request but the policy ID could not be determined: %w", r.Name, dns.ErrUnconfirmed)
 }
 
 func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) (dns.Record, error) {

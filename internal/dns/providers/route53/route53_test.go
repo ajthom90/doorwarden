@@ -41,7 +41,8 @@ type set struct {
 }
 
 type backend struct {
-	lag, lagLeft             int // reads that still show the old state after a change
+	afterChange              func(z *zone) // runs after a change was applied (simulates another writer)
+	lag, lagLeft             int           // reads that still show the old state after a change
 	mu                       sync.Mutex
 	zones                    []*zone
 	failCode                 string // when set, every call fails with this error code
@@ -289,6 +290,11 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				delete(next, key)
 			}
 		}
+		if b.afterChange != nil && !b.dropChange {
+			z.sets = next
+			b.afterChange(z)
+			next = z.sets
+		}
 		if !b.dropChange && b.lag > 0 {
 			z.pending, b.lagLeft = next, b.lag
 		} else if !b.dropChange {
@@ -307,11 +313,39 @@ func (b *backend) seed(zid, name string, values ...string) {
 	b.zone(zid).sets[n+"|A"] = &set{name: n, typ: "A", ttl: 300, vals: values}
 }
 
+// fakeClock is the injected time source: Sleep advances it instantly, so the
+// verification polling never waits in real time.
+type fakeClock struct {
+	mu      sync.Mutex
+	t       time.Time
+	slept   time.Duration
+	onSleep func() // runs on every sleep (tests use it to cancel a context)
+}
+
+func newClock() *fakeClock { return &fakeClock{t: time.Now()} }
+
+func (c *fakeClock) now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+
+func (c *fakeClock) sleep(ctx context.Context, d time.Duration) error {
+	if c.onSleep != nil {
+		c.onSleep()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.t, c.slept = c.t.Add(d), c.slept+d
+	c.mu.Unlock()
+	return nil
+}
+
 func newProvider(t *testing.T, b *backend, mod func(*route53.Config)) *route53.Provider {
 	t.Helper()
 	srv := httptest.NewServer(b)
 	t.Cleanup(srv.Close)
-	cfg := route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL, VerifyTimeout: 150 * time.Millisecond, VerifyInterval: 10 * time.Millisecond}
+	clk := newClock()
+	cfg := route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL,
+		VerifyTimeout: 10 * time.Second, VerifyInterval: time.Second, Now: clk.now, Sleep: clk.sleep}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -329,6 +363,18 @@ func TestConformance(t *testing.T) {
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			b.seed("ZEXAMPLE", name, values...)
 			return nil
+		},
+		Unconfirmed: func(t *testing.T) dns.Provider {
+			lagging := &lagHandler{inner: b}
+			srv := httptest.NewServer(lagging)
+			t.Cleanup(srv.Close)
+			clk := newClock()
+			p, err := route53.New(context.Background(), route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL,
+				VerifyTimeout: 3 * time.Second, VerifyInterval: time.Second, Now: clk.now, Sleep: clk.sleep})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return p
 		}})
 	// all rrset activity for example.test went to the public longest-suffix zone
 	for _, id := range b.listed {
@@ -596,23 +642,25 @@ func TestDeleteWithMalformedChangeStillDetected(t *testing.T) {
 	}
 }
 
-func TestSilentlyDroppedChangesDetected(t *testing.T) {
+func TestAcceptedButInvisibleChangesAreUnconfirmedNotSuccess(t *testing.T) {
 	ctx := context.Background()
 	b := newBackend()
 	b.dropChange = true
 	p := newProvider(t, b, nil)
-	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"})
-	if err == nil || !strings.Contains(err.Error(), "refusing to report success") {
-		t.Fatalf("create: err = %v", err)
+	rec := dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}
+	got, err := p.CreateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value || got.Type != "A" {
+		t.Fatalf("create: want the written record with ErrUnconfirmed, got %+v / %v", got, err)
 	}
 	b.dropChange = false
 	b.seed("ZEXAMPLE", "d.example.test", "192.0.2.5")
 	b.dropChange = true
-	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.5"}); err == nil {
-		t.Fatal("dropped delete reported success")
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.5"}); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("delete: err = %v", err)
 	}
-	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.6"}); err == nil {
-		t.Fatal("dropped update reported success")
+	got, err = p.UpdateRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.6"})
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Value != "192.0.2.6" {
+		t.Fatalf("update: got %+v err %v", got, err)
 	}
 }
 
@@ -717,7 +765,7 @@ func TestPinnedProviderRefusesOtherZones(t *testing.T) {
 	}
 }
 
-func TestEventualConsistencyIsPolledAndTimeoutNamesRecord(t *testing.T) {
+func TestEventualConsistencyIsPolledAndUnconfirmedNamesRecord(t *testing.T) {
 	ctx := context.Background()
 	b := newBackend()
 	b.lag = 3 // the first reads after a change still show the old state
@@ -726,9 +774,90 @@ func TestEventualConsistencyIsPolledAndTimeoutNamesRecord(t *testing.T) {
 		t.Fatalf("lagging reads must be polled: %v", err)
 	}
 	b.lag = 1000
-	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "never.example.test", Type: "A", Value: "192.0.2.2"})
-	if err == nil || !strings.Contains(err.Error(), "never.example.test") || !strings.Contains(err.Error(), "refusing to report success") {
+	got, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "never.example.test", Type: "A", Value: "192.0.2.2"})
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != "never.example.test" || !strings.Contains(err.Error(), "never.example.test") {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+}
+
+func TestConflictingValueIsAnOrdinaryError(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	// another writer replaces the set right after our change was applied
+	b.afterChange = func(z *zone) {
+		z.sets["w.example.test.|A"] = &set{name: "w.example.test.", typ: "A", ttl: 60, vals: []string{"192.0.2.99"}}
+	}
+	p := newProvider(t, b, nil)
+	got, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "w.example.test", Type: "A", Value: "192.0.2.1"})
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Fatalf("a conflicting value must be a normal error: got %+v err %v", got, err)
+	}
+}
+
+func TestContextExpiryAfterAcceptedChangeIsUnconfirmed(t *testing.T) {
+	b := newBackend()
+	b.lag = 1000
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := httptest.NewServer(b)
+	defer srv.Close()
+	clk := newClock()
+	clk.onSleep = cancel // the caller's deadline hits while we poll
+	p, err := route53.New(context.Background(), route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL,
+		VerifyTimeout: 20 * time.Second, VerifyInterval: time.Second, Now: clk.now, Sleep: clk.sleep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.1"})
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != "c.example.test" {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+}
+
+func TestVerifyWindowEndsBeforeTheCallersDeadline(t *testing.T) {
+	b := newBackend()
+	b.lag = 1000
+	srv := httptest.NewServer(b)
+	defer srv.Close()
+	clk := newClock()
+	p, err := route53.New(context.Background(), route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL,
+		VerifyTimeout: 20 * time.Second, VerifyInterval: time.Second, Now: clk.now, Sleep: clk.sleep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a 30s per-call deadline (the executor's), nearly all of it still ahead
+	ctx, cancel := context.WithDeadline(context.Background(), clk.now().Add(30*time.Second))
+	defer cancel()
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.1"}); !errors.Is(err, dns.ErrUnconfirmed) {
 		t.Fatalf("err = %v", err)
+	}
+	if clk.slept > 20*time.Second || clk.slept < 15*time.Second {
+		t.Fatalf("polled for %s, want about the 20s verify timeout", clk.slept)
+	}
+	// with only 5s left the window shrinks to ~3s, leaving 2s for the caller
+	clk2 := newClock()
+	p2, _ := route53.New(context.Background(), route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL,
+		VerifyTimeout: 20 * time.Second, VerifyInterval: time.Second, Now: clk2.now, Sleep: clk2.sleep})
+	ctx2, cancel2 := context.WithDeadline(context.Background(), clk2.now().Add(5*time.Second))
+	defer cancel2()
+	if _, err := p2.CreateRecord(ctx2, "example.test", dns.Record{Name: "e.example.test", Type: "A", Value: "192.0.2.1"}); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("err = %v", err)
+	}
+	if clk2.slept > 3*time.Second {
+		t.Fatalf("polled %s past the deadline-minus-2s cap", clk2.slept)
+	}
+}
+
+func TestZoneNameIsNormalised(t *testing.T) {
+	b := newBackend()
+	p := newProvider(t, b, func(c *route53.Config) { c.HostedZoneID = "ZEXAMPLE" })
+	for _, z := range []string{"Example.Test.", "EXAMPLE.test", "Lab.Example.Test."} {
+		if _, err := p.ListRecords(context.Background(), z); err != nil {
+			t.Errorf("%q: %v", z, err)
+		}
+	}
+	if _, err := p.CreateRecord(context.Background(), "Example.Test.", dns.Record{Name: "n.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -743,4 +872,22 @@ func TestCNAMEConflictCoversEveryType(t *testing.T) {
 			t.Errorf("%s: CNAME over a non-address set: %v", n, err)
 		}
 	}
+}
+
+// lagHandler serves the same backend but hides every change from rrset reads
+// of the single-set kind (MaxItems=1) the verification uses, which is what a
+// lagging read looks like. Changes are applied to the backend.
+type lagHandler struct{ inner *backend }
+
+func (h *lagHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/rrset") && r.URL.Query().Get("maxitems") == "1" {
+		h.inner.mu.Lock()
+		name := strings.ToLower(r.URL.Query().Get("name"))
+		h.inner.mu.Unlock()
+		if strings.Contains(name, "unconf") { // changes to this name are never visible
+			fmt.Fprintf(w, `<ListResourceRecordSetsResponse %s><ResourceRecordSets></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>1</MaxItems></ListResourceRecordSetsResponse>`, ns)
+			return
+		}
+	}
+	h.inner.ServeHTTP(w, r)
 }
