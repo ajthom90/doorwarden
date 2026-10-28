@@ -27,9 +27,31 @@ and `traefik-dynamic/`.
 
 Services: `doorwarden` (control plane), `traefik` (published 80/443; routing
 from the file provider only, no ACME, no dashboard, no docker provider) and
-`docker-socket-proxy` (read-only, `CONTAINERS=1`, `POST=0`, internal network
+`docker-socket-proxy` (an allowlisting proxy, see below; internal network
 only, no host ports). Point the docker source at
-`tcp://docker-socket-proxy:2375`.
+`tcp://docker-socket-proxy:2375`. Set `DOCKER_GID` to the group that owns
+`/var/run/docker.sock` on the host.
+
+## Docker API access
+
+Doorwarden's Docker source calls exactly one Docker Engine endpoint:
+`GET /containers/json?all=1` (container list). The proxy
+(`wollomatic/socket-proxy`) allows only `GET` on the path
+`^/containers/json$` (matched against the path, not the query), only from the
+`doorwarden` service, and answers 403/405 for everything else. This matters
+because container inspect would expose other containers' environment
+variables (secrets), `/archive` reads files out of containers, and logs and
+attach are readable too. A read-only (`:ro`) bind mount of the socket does
+not limit any of that; the allowlist does. The socket stays root-equivalent
+for anything that can reach an allowed endpoint, so only `doorwarden` shares
+the proxy's isolated `socket` network.
+
+If a future Doorwarden version needs another endpoint (for example container
+inspect), that must be added explicitly to the proxy flags (a new exact
+pattern, never `.*`), and the deploy tests in `internal/deploycheck` updated
+deliberately. Symptom of a missing allowlist entry: Docker discovery logs
+HTTP 403 from the proxy; check the proxy's logs, which print each denied
+request.
 
 ## Environment
 

@@ -1,6 +1,9 @@
 package deploycheck
 
 import (
+	"regexp"
+
+	"github.com/ajthom90/doorwarden/internal/source/docker"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,27 +49,67 @@ func TestComposeSafety(t *testing.T) {
 		}
 	}
 	sp := sub(t, svcs, "docker-socket-proxy")
+	if !strings.HasPrefix(sp["image"].(string), "wollomatic/socket-proxy:") || strings.HasSuffix(sp["image"].(string), ":latest") {
+		t.Errorf("proxy must be the pinned allowlist proxy, got %v", sp["image"])
+	}
 	if _, has := sp["ports"]; has {
 		t.Error("socket proxy must not publish ports")
 	}
-	env := sub(t, sp, "environment")
-	if env["POST"] != "0" || env["CONTAINERS"] != "1" {
-		t.Errorf("socket proxy env %v", env)
+	if _, has := sp["expose"]; has {
+		t.Error("socket proxy should not expose ports")
 	}
-	for k, v := range env {
-		if k != "CONTAINERS" && v != "0" {
-			t.Errorf("socket proxy %s=%v, want 0", k, v)
-		}
+	if sp["read_only"] != true {
+		t.Error("proxy rootfs must be read_only")
+	}
+	if caps, _ := sp["cap_drop"].([]any); len(caps) != 1 || caps[0] != "ALL" {
+		t.Errorf("cap_drop %v", sp["cap_drop"])
+	}
+	if sec, _ := sp["security_opt"].([]any); len(sec) != 1 || sec[0] != "no-new-privileges:true" {
+		t.Errorf("security_opt %v", sp["security_opt"])
 	}
 	vols, _ := sp["volumes"].([]any)
-	if len(vols) != 1 || !strings.HasSuffix(vols[0].(string), "/docker.sock:/var/run/docker.sock:ro") {
-		t.Errorf("socket must be mounted read-only: %v", vols)
+	if len(vols) != 1 || vols[0] != "/var/run/docker.sock:/var/run/docker.sock:ro" {
+		t.Errorf("socket mount: %v", vols)
 	}
-	if sp["networks"].([]any)[0] != "socket" || sub(t, c, "networks", "socket")["internal"] != true {
-		t.Error("socket proxy must sit on the internal network only")
+	nets, _ := sp["networks"].([]any)
+	if len(nets) != 1 || nets[0] != "socket" || sub(t, c, "networks", "socket")["internal"] != true {
+		t.Error("socket proxy must sit only on the internal socket network")
 	}
-	if strings.Contains(sp["image"].(string), ":latest") || !strings.Contains(sp["image"].(string), ":") {
-		t.Error("socket proxy image must be pinned")
+	for name, v := range svcs {
+		if name == "docker-socket-proxy" {
+			continue
+		}
+		ns, _ := v.(map[string]any)["networks"].([]any)
+		shares := false
+		for _, n := range ns {
+			shares = shares || n == "socket"
+		}
+		if shares && name != "doorwarden" {
+			t.Errorf("service %s must not share the proxy network", name)
+		}
+	}
+	// Allowlist: exactly one flag set per method, only GET, only the list path.
+	var get string
+	for _, a := range sp["command"].([]any) {
+		f := a.(string)
+		if strings.HasPrefix(f, "-allow") && !strings.HasPrefix(f, "-allowGET=") && !strings.HasPrefix(f, "-allowfrom=") {
+			t.Errorf("unexpected allow flag %q (only GET on containers/json is permitted)", f)
+		}
+		if v, ok := strings.CutPrefix(f, "-allowGET="); ok {
+			get = strings.ReplaceAll(v, "$$", "$") // compose escape
+		}
+	}
+	if get == "" || strings.Contains(get, ".*") || strings.Contains(get, "|") {
+		t.Fatalf("allowGET %q must be one exact pattern", get)
+	}
+	re := regexp.MustCompile(get)
+	if !re.MatchString(docker.ContainersListPath) {
+		t.Errorf("allowlist %q does not permit the docker source path %q", get, docker.ContainersListPath)
+	}
+	for _, bad := range []string{"/containers/abc/json", "/containers/abc/archive", "/containers/json/x", "/v1.45/containers/json", "/version", "/exec/x/start", "/containers/abc/logs"} {
+		if re.MatchString(bad) {
+			t.Errorf("allowlist %q must not permit %q", get, bad)
+		}
 	}
 	tr := sub(t, svcs, "traefik")
 	if strings.HasSuffix(tr["image"].(string), ":latest") {
@@ -139,5 +182,21 @@ func TestComposeConfigWithDocker(t *testing.T) {
 	out, err := exec.Command("docker", "compose", "--env-file", env, "-f", "../../deploy/compose.truenas.yml", "config", "-q").CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker compose config: %v\n%s", err, out)
+	}
+}
+
+// The docker source must issue exactly one request, built from the exported
+// path constant; a second request site means the proxy allowlist needs review.
+func TestDockerSourceSingleEndpoint(t *testing.T) {
+	b, err := os.ReadFile("../source/docker/docker.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	if n := strings.Count(src, "http.NewRequest"); n != 1 {
+		t.Errorf("docker source has %d request sites, want 1: update the proxy allowlist explicitly", n)
+	}
+	if !strings.Contains(src, "ContainersListPath") {
+		t.Error("docker source must build its URL from ContainersListPath")
 	}
 }
