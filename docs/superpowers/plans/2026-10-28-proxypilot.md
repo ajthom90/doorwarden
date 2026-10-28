@@ -112,7 +112,7 @@ func Hostname(svc Service, zones []string, defaultZone string) (string, error)
 
 **Interfaces:** Produces `NewClient(url string, apiKey secrets.Secret, insecureTLS bool)`; `Call(ctx, method string, params ...any) (json.RawMessage, error)`; source `List` calls `app.query`, maps `name,state,portals` → Services with `Backend.Host=target_ip`, port parsed from portal URL (host `0.0.0.0` ignored); empty portals fall back to a `PortLookup` interface (Docker published ports by `ix-<app>-` prefix); `state != RUNNING` → `stopped`.
 
-- [ ] **Step 1 (spike, first):** against the real box (`https://<truenas-host>:9463`, key `<truenas-api-key-file>`, TLS verify off, read-only `core.ping`, `system.version`, `app.query`) record the auth handshake (`auth.login_with_api_key`) and one sanitized `app.query` response into `testdata/app_query.json` (replace names/ports with `example` values before commit).
+- [ ] **Step 1 (spike, first):** against a real TrueNAS box (URL and API-key file path supplied by the operator at run time, never committed; TLS verify off, read-only `core.ping`, `system.version`, `app.query`) record the auth handshake (`auth.login_with_api_key`) and one sanitized `app.query` response into `testdata/app_query.json` (replace names/ports with `example` values before commit).
 - [ ] Tests: portal `http://0.0.0.0:30088/` → port 30088 host target_ip; `https` portals set scheme; two portals → first "Web UI" wins; empty portals + lookup hit/miss (`error: no port`); API down → `ErrSourceUnavailable`. Implement; commit.
 
 ### Task 8: Static source and approval gate
