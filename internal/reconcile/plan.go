@@ -124,7 +124,8 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 			p.planZone(p.zones[zn], hosts)
 		}
 	}
-	p.planRemovals(present, winners, losers)
+	p.planRemovals(present, losers)
+	p.planOrphans(entries)
 
 	sortActions(p.out)
 	return p.out, winners
@@ -416,6 +417,14 @@ func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) 
 		if sameValue(o.Value, z.value) {
 			return // idempotent; ownership transfer between keys is not the plan's job
 		}
+		if o.OwnerKey != owner {
+			// The executor would refuse it (ErrOwnerConflict), and a DNSEnsure
+			// here would keep the row's owner from ever cleaning it up.
+			p.emit(Action{Kind: Skip, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+				Reason: fmt.Sprintf("record %s %s is owned by %s with another value; not changing it (it is removed once %s no longer wants it)",
+					name, z.recType, o.OwnerKey, o.OwnerKey)})
+			return
+		}
 		want.ID = o.ProviderRecordID
 		p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 			Record: &want, Owner: owner, Reason: "owned record has a different value"})
@@ -491,8 +500,9 @@ func certCovers(c store.Cert, name string) bool {
 	return false
 }
 
-// planRemovals handles known services absent from desired.
-func (p *planner) planRemovals(present map[string]bool, winners map[string]claimant, losers map[string]loss) {
+// planRemovals handles the routes of known services absent from desired.
+// Their DNS records are handled by planOrphans, like every other record.
+func (p *planner) planRemovals(present map[string]bool, losers map[string]loss) {
 	for _, k := range sortedKnown(p.obs.Known) {
 		if present[k.Key] || p.unavailable(k) {
 			continue // present, or unknown state: never schedule or remove
@@ -501,8 +511,8 @@ func (p *planner) planRemovals(present map[string]bool, winners map[string]claim
 		if l, lost := losers[k.Key]; lost && p.takesOver(k.Key, k.Source, l.winner) {
 			// a present Published, routable service of the same or a higher
 			// source rank takes over its hostname now: remove its route
-			// without waiting for the grace period (its owned DNS record
-			// stays: the winner uses that hostname).
+			// without waiting for the grace period (its owned DNS record is
+			// an orphan, removed after the grace period by planOrphans).
 			p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key,
 				Reason: "service no longer discovered and hostname " + host + " now belongs to published " + l.winner.key})
 			continue
@@ -517,21 +527,6 @@ func (p *planner) planRemovals(present map[string]bool, winners map[string]claim
 			continue // still within grace
 		}
 		p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key, Reason: "grace period expired"})
-		z := p.zones[zn]
-		if z == nil || z.mode != "per-host" || host == "" {
-			continue // wildcard record is never deleted automatically
-		}
-		if w, taken := winners[host]; taken && w.key != k.Key {
-			continue // another service now uses this hostname; its record stays
-		}
-		for _, o := range p.obs.Owned {
-			if o.Provider != z.provider || normName(o.Zone) != zn || normName(o.Name) != host || o.OwnerKey != k.Key {
-				continue
-			}
-			rec := dns.Record{ID: o.ProviderRecordID, Name: normName(o.Name), Type: normType(o.Type), Value: o.Value}
-			p.emit(Action{Kind: DNSDelete, Zone: zn, Host: host, Key: k.Key, Provider: z.provider, Record: &rec,
-				Owner: o.OwnerKey, Reason: "grace period expired"})
-		}
 	}
 }
 

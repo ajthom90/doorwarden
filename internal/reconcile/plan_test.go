@@ -406,10 +406,13 @@ func TestPlanOtherSourcesUnaffectedByOutage(t *testing.T) {
 func TestPlanRemoval(t *testing.T) {
 	ph := cfgOf(zone("example.test", "per-host", "per-host"))
 	wc := cfgOf(zone("example.test", "wildcard", "wildcard"))
-	recs := []store.DNSRecord{
-		owned("example.test", "app.example.test", "A", target, "docker:app"),
-		owned("example.test", "*.example.test", "A", target, WildcardOwnerKey("example.test")),
-		owned("example.test", "other.example.test", "A", target, "docker:other"),
+	// recs are the ownership rows as the executor left them: the service's
+	// record was scheduled together with its route (same deadline).
+	recs := func(ra *time.Time) []store.DNSRecord {
+		return []store.DNSRecord{
+			ownedRA("example.test", "app.example.test", "A", target, "docker:app", ra),
+			owned("example.test", "*.example.test", "A", target, WildcardOwnerKey("example.test")),
+		}
 	}
 	foreign := map[string][]dns.Record{"dnsp/example.test": {{Name: "app.example.test", Type: "AAAA", Value: "2001:db8::1"}}}
 	tests := []struct {
@@ -419,18 +422,23 @@ func TestPlanRemoval(t *testing.T) {
 		owned []store.DNSRecord
 		want  []string
 	}{
-		{"first absence schedules", ph, nil, recs, []string{"ScheduleRemoval example.test app.example.test docker:app"}},
-		{"within grace", ph, tp(t0.Add(time.Minute)), recs, nil},
-		{"exactly at deadline waits", ph, tp(t0), recs, nil},
-		{"past grace per-host", ph, tp(t0.Add(-time.Second)), recs, []string{
+		{"first absence schedules route and record together", ph, nil, recs(nil), []string{
+			"ScheduleRemoval example.test app.example.test docker:app",
+			"DNSScheduleRemoval example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
+		{"within grace", ph, tp(t0.Add(time.Minute)), recs(tp(t0.Add(time.Minute))), nil},
+		{"exactly at deadline waits", ph, tp(t0), recs(tp(t0)), nil},
+		{"past grace per-host", ph, tp(t0.Add(-time.Second)), recs(tp(t0.Add(-time.Second))), []string{
 			"RouteRemove example.test app.example.test docker:app",
 			"DNSDelete example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
 		{"past grace not owned", ph, tp(t0.Add(-time.Second)), nil, []string{"RouteRemove example.test app.example.test docker:app"}},
-		{"past grace owned by other key", ph, tp(t0.Add(-time.Second)),
+		{"past grace, row owned by another absent key: that key's own orphan", ph, tp(t0.Add(-time.Second)),
 			[]store.DNSRecord{owned("example.test", "app.example.test", "A", target, "docker:someone")},
-			[]string{"RouteRemove example.test app.example.test docker:app"}},
-		{"past grace wildcard never deletes wildcard record", wc, tp(t0.Add(-time.Second)), recs,
-			[]string{"RouteRemove example.test app.example.test docker:app"}},
+			[]string{"DNSScheduleRemoval example.test app.example.test docker:someone [app.example.test A 192.0.2.10]",
+				"RouteRemove example.test app.example.test docker:app"}},
+		{"past grace wildcard zone: per-host leftover deleted, wildcard record never", wc, tp(t0.Add(-time.Second)),
+			recs(tp(t0.Add(-time.Second))), []string{
+				"RouteRemove example.test app.example.test docker:app",
+				"DNSDelete example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -440,6 +448,11 @@ func TestPlanRemoval(t *testing.T) {
 			if s := ofKind(got, ScheduleRemoval); len(s) == 1 {
 				if s[0].RemovedAfter == nil || !s[0].RemovedAfter.Equal(t0.Add(24*time.Hour)) {
 					t.Fatalf("RemovedAfter %v", s[0].RemovedAfter)
+				}
+			}
+			if s := ofKind(got, DNSScheduleRemoval); len(s) == 1 {
+				if s[0].RemovedAfter == nil || !s[0].RemovedAfter.Equal(t0.Add(24*time.Hour)) {
+					t.Fatalf("DNS RemovedAfter %v", s[0].RemovedAfter)
 				}
 			}
 			if d := ofKind(got, DNSDelete); len(d) == 1 {
@@ -460,6 +473,9 @@ func TestPlanRemovalGraceDefaultsWhenUnset(t *testing.T) {
 	}
 }
 
+// The evicted service's record is not deleted with its route: it becomes an
+// orphan (scheduled with the route's deadline) and the winner keeps using it
+// until it is removed; the winner then creates its own (one cycle later).
 func TestPlanRemovalSkipsDNSDeleteWhenHostnameTakenOver(t *testing.T) {
 	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
 	obs := Observed{
@@ -468,6 +484,9 @@ func TestPlanRemovalSkipsDNSDeleteWhenHostnameTakenOver(t *testing.T) {
 	}
 	got := Plan([]model.Service{pub("docker:new", "app", "example.test", 80)}, obs, cfg, t0)
 	assertNone(t, got, DNSDelete, DNSEnsure)
+	if s := ofKind(got, DNSScheduleRemoval); len(s) != 1 || s[0].Owner != "docker:old" || !s[0].RemovedAfter.Equal(t0.Add(-time.Hour)) {
+		t.Fatalf("got %v", sums(got))
+	}
 	if len(ofKind(got, RouteRemove)) != 1 || len(ofKind(got, RouteWrite)) != 1 {
 		t.Fatalf("got %v", sums(got))
 	}
@@ -846,8 +865,9 @@ func TestPlanZoneRemovedFromConfig(t *testing.T) {
 	t.Run("present service", func(t *testing.T) {
 		obs := Observed{Owned: ownedRec, Foreign: listed("example.test", "other.test"), Known: knownMap(k)}
 		got := Plan([]model.Service{pub("docker:app", "app", "example.test", 1)}, obs, cfg, t0)
-		if len(got) != 1 || got[0].Kind != Invalid {
-			t.Fatalf("want only Invalid, got %v", sums(got))
+		// Invalid, and the row in the unconfigured zone is reported, never removed
+		if len(got) != 2 || got[0].Kind != Invalid || got[1].Kind != Skip || !strings.Contains(got[1].Reason, "not configured") {
+			t.Fatalf("want only Invalid and Skip, got %v", sums(got))
 		}
 	})
 	t.Run("absent service past grace", func(t *testing.T) {
@@ -855,8 +875,9 @@ func TestPlanZoneRemovedFromConfig(t *testing.T) {
 		k.RemovedAfter = tp(t0.Add(-time.Hour))
 		obs := Observed{Owned: ownedRec, Known: knownMap(k)}
 		got := Plan(nil, obs, cfg, t0)
-		assertNone(t, got, DNSDelete)
-		assertSums(t, got, "RouteRemove example.test app.example.test docker:app")
+		assertNone(t, got, DNSDelete, DNSScheduleRemoval)
+		assertSums(t, got, "Skip example.test app.example.test docker:app [app.example.test A 192.0.2.10]",
+			"RouteRemove example.test app.example.test docker:app")
 	})
 }
 

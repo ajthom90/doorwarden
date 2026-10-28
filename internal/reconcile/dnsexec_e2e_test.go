@@ -35,7 +35,8 @@ func newWorld(t *testing.T, mode string) *world {
 		t.Fatal(err)
 	}
 	re := NewRouteExecutor(w.st, fixedNow(t0))
-	m := NewMultiExecutor(nil).Handle(DNSEnsure, de).Handle(DNSDelete, de)
+	m := NewMultiExecutor(nil).Handle(DNSEnsure, de).Handle(DNSDelete, de).
+		Handle(DNSScheduleRemoval, de).Handle(DNSCancelRemoval, de)
 	for _, k := range []ActionKind{RouteWrite, RouteRemove, ScheduleRemoval, CancelRemoval} {
 		m.Handle(k, re)
 	}
@@ -240,14 +241,21 @@ func TestDNSE2EWildcardNeverDeleted(t *testing.T) {
 	}
 }
 
-func TestDNSE2EDeleteFailureKeepsOwnership(t *testing.T) {
+// Gap 1: a failed DNSDelete keeps the ownership row, and although the route
+// is already gone (Known forgotten) the next cycle re-emits the delete from
+// the row alone, every cycle, until it succeeds.
+func TestDNSE2EDeleteFailureRetriedUntilSuccess(t *testing.T) {
 	w := newWorld(t, "per-host")
 	app := pub("docker:app", "app", dz, 80)
 	w.mustCycle(t0, app)
 	w.mustCycle(t0.Add(time.Minute))
 	w.fk.FailNext("DeleteRecord", errors.New("api down"))
-	if _, err := w.cycle(t0.Add(48 * time.Hour)); err == nil || !strings.Contains(err.Error(), "api down") {
+	acts, err := w.cycle(t0.Add(48 * time.Hour))
+	if err == nil || !strings.Contains(err.Error(), "api down") {
 		t.Fatalf("err %v", err)
+	}
+	if len(ofKind(acts, RouteRemove)) != 1 || len(ofKind(acts, DNSDelete)) != 1 {
+		t.Fatalf("plan %v", sums(acts))
 	}
 	if rows := w.rows(); len(rows) != 1 || rows[0].OwnerKey != "docker:app" {
 		t.Fatalf("ownership dropped: %+v", rows)
@@ -255,33 +263,167 @@ func TestDNSE2EDeleteFailureKeepsOwnership(t *testing.T) {
 	if len(w.records()) != 1 {
 		t.Fatal("record gone")
 	}
+	if rs, _ := w.st.ListRoutes(context.Background()); len(rs) != 0 {
+		t.Fatalf("route kept: %+v", rs)
+	}
+	// still failing: re-emitted from the row alone
+	w.fk.FailNext("DeleteRecord", errors.New("api down again"))
+	acts, err = w.cycle(t0.Add(48*time.Hour + time.Minute))
+	if err == nil || len(ofKind(acts, DNSDelete)) != 1 || len(ofKind(acts, RouteRemove)) != 0 {
+		t.Fatalf("err %v plan %v", err, sums(acts))
+	}
+	// then succeeds
+	acts = w.mustCycle(t0.Add(48*time.Hour + 2*time.Minute))
+	if len(ofKind(acts, DNSDelete)) != 1 {
+		t.Fatalf("plan %v", sums(acts))
+	}
+	if len(w.rows()) != 0 || len(w.records()) != 0 {
+		t.Fatalf("rows %+v records %+v", w.rows(), w.records())
+	}
+	assertOrphans(t, w.mustCycle(t0.Add(48*time.Hour+3*time.Minute)))
 }
 
-// Rename/move: documents what the executor sees (see report). The old record
-// stays owned by the key and is never deleted.
-func TestDNSE2ERenameKeepsOldRecordOwned(t *testing.T) {
+// Rename: the old host's record is an orphan, scheduled and deleted after
+// the grace period; the new one is created at once. Foreign records at the
+// old name (another type) are never touched.
+func TestDNSE2ERenameCleansUpOldRecord(t *testing.T) {
 	w := newWorld(t, "per-host")
+	ctx := context.Background()
 	app := pub("docker:app", "app", dz, 80)
 	w.mustCycle(t0, app)
-	renamed := app
-	renamed.Name = "app2"
-	acts := w.mustCycle(t0.Add(time.Minute), renamed)
-	if e := ofKind(acts, DNSEnsure); len(e) != 1 || e[0].Record.Name != "app2.example.test" || e[0].Owner != "docker:app" {
+	txt, _ := w.fk.CreateRecord(ctx, dz, dns.Record{Name: "app.example.test", Type: "TXT", Value: "user"})
+	oldID := w.rows()[0].ProviderRecordID
+	web := app
+	web.Name = "web"
+	acts := w.mustCycle(t0.Add(time.Minute), web)
+	if e := ofKind(acts, DNSEnsure); len(e) != 1 || e[0].Record.Name != "web.example.test" || e[0].Owner != "docker:app" {
+		t.Fatalf("plan %v", sums(acts))
+	}
+	if s := ofKind(acts, DNSScheduleRemoval); len(s) != 1 || s[0].Record.Name != "app.example.test" {
 		t.Fatalf("plan %v", sums(acts))
 	}
 	assertNone(t, acts, DNSDelete)
 	rows := w.rows()
-	if len(rows) != 2 || rows[0].Name != "app.example.test" || rows[1].Name != "app2.example.test" ||
-		rows[0].OwnerKey != "docker:app" || rows[1].OwnerKey != "docker:app" {
+	if len(rows) != 2 || rows[0].Name != "app.example.test" || rows[0].RemovedAfter == nil ||
+		!rows[0].RemovedAfter.Equal(t0.Add(time.Minute+24*time.Hour)) || rows[1].Name != "web.example.test" || rows[1].RemovedAfter != nil {
 		t.Fatalf("rows %+v", rows)
 	}
-	// removed later: only the current hostname's record is deleted
-	w.mustCycle(t0.Add(2 * time.Minute))
-	acts = w.mustCycle(t0.Add(48 * time.Hour))
-	if d := ofKind(acts, DNSDelete); len(d) != 1 || d[0].Record.Name != "app2.example.test" {
+	// within grace: nothing
+	acts = w.mustCycle(t0.Add(23*time.Hour), web)
+	assertOrphans(t, acts)
+	// past grace: the old record (by stored ID) is deleted, nothing else
+	n := len(w.fk.Calls())
+	acts = w.mustCycle(t0.Add(25*time.Hour), web)
+	assertOrphans(t, acts, "DNSDelete example.test app.example.test docker:app [app.example.test A 192.0.2.10]")
+	if got := w.writes(n); len(got) != 1 || got[0] != "DeleteRecord "+oldID+" app.example.test "+ip1 {
+		t.Fatalf("writes %v", got)
+	}
+	if rows := w.rows(); len(rows) != 1 || rows[0].Name != "web.example.test" {
+		t.Fatalf("rows %+v", rows)
+	}
+	recs := w.records()
+	if len(recs) != 2 || recs[0] != txt || recs[1].Name != "web.example.test" {
+		t.Fatalf("zone %+v", recs)
+	}
+	// steady state afterwards
+	n = len(w.fk.Calls())
+	assertOrphans(t, w.mustCycle(t0.Add(26*time.Hour), web))
+	if got := w.writes(n); len(got) != 0 {
+		t.Fatalf("writes %v", got)
+	}
+}
+
+// Renaming back before the grace period ends cancels the removal.
+func TestDNSE2ERenameBackCancelsRemoval(t *testing.T) {
+	w := newWorld(t, "per-host")
+	app := pub("docker:app", "app", dz, 80)
+	w.mustCycle(t0, app)
+	web := app
+	web.Name = "web"
+	w.mustCycle(t0.Add(time.Minute), web)
+	acts := w.mustCycle(t0.Add(time.Hour), app)
+	if c := ofKind(acts, DNSCancelRemoval); len(c) != 1 || c[0].Record.Name != "app.example.test" {
 		t.Fatalf("plan %v", sums(acts))
 	}
+	if s := ofKind(acts, DNSScheduleRemoval); len(s) != 1 || s[0].Record.Name != "web.example.test" {
+		t.Fatalf("plan %v", sums(acts))
+	}
+	rows := w.rows()
+	if len(rows) != 2 || rows[0].Name != "app.example.test" || rows[0].RemovedAfter != nil || rows[1].RemovedAfter == nil {
+		t.Fatalf("rows %+v", rows)
+	}
+	acts = w.mustCycle(t0.Add(48*time.Hour), app)
+	assertOrphans(t, acts, "DNSDelete example.test web.example.test docker:app [web.example.test A 192.0.2.10]")
 	if rows := w.rows(); len(rows) != 1 || rows[0].Name != "app.example.test" {
+		t.Fatalf("rows %+v", rows)
+	}
+}
+
+// A foreign record that now holds an orphan's name (ours was removed out of
+// band) is never deleted: the executor deletes by the stored ID only.
+func TestDNSE2EOrphanDeleteNeverHitsForeignRecord(t *testing.T) {
+	w := newWorld(t, "per-host")
+	ctx := context.Background()
+	app := pub("docker:app", "app", dz, 80)
+	w.mustCycle(t0, app)
+	row := w.rows()[0]
+	if err := w.fk.DeleteRecord(ctx, dz, dns.Record{ID: row.ProviderRecordID}); err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := w.fk.CreateRecord(ctx, dz, dns.Record{Name: "app.example.test", Type: "A", Value: ipFX})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.mustCycle(t0.Add(time.Minute)) // app gone: scheduled
+	w.mustCycle(t0.Add(48 * time.Hour))
+	if recs := w.records(); len(recs) != 1 || recs[0] != foreign {
+		t.Fatalf("foreign record touched: %+v", recs)
+	}
+	if rows := w.rows(); len(rows) != 0 {
+		t.Fatalf("rows %+v", rows)
+	}
+}
+
+// A source outage never schedules and never deletes, even past the deadline.
+func TestDNSE2ESourceOutageNeverRemovesDNS(t *testing.T) {
+	w := newWorld(t, "per-host")
+	ctx := context.Background()
+	w.mustCycle(t0, pub("docker:app", "app", dz, 80))
+	down := func(now time.Time) []Action {
+		obs := w.observe(ctx)
+		obs.Unavailable = map[string]bool{"docker": true}
+		acts, err := w.runner.Reconcile(ctx, nil, obs, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return acts
+	}
+	assertOrphans(t, down(t0.Add(time.Minute)))
+	assertOrphans(t, down(t0.Add(72*time.Hour)))
+	if rows := w.rows(); len(rows) != 1 || rows[0].RemovedAfter != nil || len(w.records()) != 1 {
+		t.Fatalf("rows %+v", rows)
+	}
+	// scheduled before the outage, due during it: still nothing
+	w.mustCycle(t0.Add(73 * time.Hour))
+	if rows := w.rows(); rows[0].RemovedAfter == nil {
+		t.Fatal("not scheduled")
+	}
+	assertOrphans(t, down(t0.Add(200*time.Hour)))
+	if len(w.rows()) != 1 || len(w.records()) != 1 {
+		t.Fatal("deleted during an outage")
+	}
+}
+
+// A stopped container never loses its record, however long it stays stopped.
+func TestDNSE2EStoppedServiceKeepsRecord(t *testing.T) {
+	w := newWorld(t, "per-host")
+	app := pub("docker:app", "app", dz, 80)
+	w.mustCycle(t0, app)
+	stopped := svc("docker:app", "app", dz, model.StateStopped, "", 0)
+	for _, off := range []time.Duration{time.Minute, 48 * time.Hour, 500 * time.Hour} {
+		assertOrphans(t, w.mustCycle(t0.Add(off), stopped))
+	}
+	if rows := w.rows(); len(rows) != 1 || rows[0].RemovedAfter != nil || len(w.records()) != 1 {
 		t.Fatalf("rows %+v", rows)
 	}
 }

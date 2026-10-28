@@ -250,8 +250,9 @@ func TestPlanPublishedInvalidHolderZoneRemovedFromConfig(t *testing.T) {
 		Owned: []store.DNSRecord{owned("old.test", "app.old.test", "A", target, "docker:app")},
 		Known: knownMap(known("docker:app", "old.test", "app.old.test", nil))}
 	got := Plan([]model.Service{s}, obs, cfg, t0)
-	if len(got) != 1 || got[0].Kind != Invalid || got[0].Key != "docker:app" {
-		t.Fatalf("want only Invalid, got %v", sums(got))
+	// Invalid; its row in the unconfigured zone is only reported (Skip)
+	if len(got) != 2 || got[0].Kind != Invalid || got[0].Key != "docker:app" || got[1].Kind != Skip {
+		t.Fatalf("want only Invalid and Skip, got %v", sums(got))
 	}
 }
 
@@ -379,11 +380,11 @@ func TestE2EAbsentInGraceKeepsRouteAgainstNonRoutableNewcomer(t *testing.T) {
 }
 
 func TestPlanAbsentPastGraceKeepsDNSDeleteForItsOwnHostname(t *testing.T) {
-	// the absent service is the only claimant of its hostname: it must not
-	// count as "another service now uses this hostname"
+	// the absent service is the only claimant of its hostname; its record was
+	// scheduled together with its route, so both go in the same plan
 	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
 	obs := Observed{Foreign: listed("example.test"),
-		Owned: []store.DNSRecord{owned("example.test", "app.example.test", "A", target, "docker:app")},
+		Owned: []store.DNSRecord{ownedRA("example.test", "app.example.test", "A", target, "docker:app", tp(t0.Add(-time.Second)))},
 		Known: knownMap(known("docker:app", "example.test", "app.example.test", tp(t0.Add(-time.Second))))}
 	assertSums(t, Plan(nil, obs, cfg, t0),
 		"RouteRemove example.test app.example.test docker:app",
