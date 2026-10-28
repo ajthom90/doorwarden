@@ -94,11 +94,18 @@ func ValidateExternalMiddleware(ref string) error {
 // under Traefik's http.middlewares.<name>: a mapping with exactly one key
 // (the middleware type, [A-Za-z0-9]+, e.g. basicAuth) whose value is a
 // mapping (possibly empty). The type itself is not checked against a list.
+// Traefik's file provider matches keys case-insensitively (stated from
+// memory, not verified against its source), so "Chain"/"CHAIN" is a chain
+// and its "Middlewares" key is looked up ignoring case; keys that differ
+// only by case (at the top level or in a chain's options) are rejected.
 func ValidateMiddlewareDef(def any) error {
 	var typ any
 	var val any
 	switch m := def.(type) {
 	case map[string]any:
+		if err := noCaseDupKeys(m); err != nil {
+			return fmt.Errorf("definition: %w", err)
+		}
 		if len(m) != 1 {
 			return fmt.Errorf("definition must have exactly one middleware type key, got %d", len(m))
 		}
@@ -106,6 +113,9 @@ func ValidateMiddlewareDef(def any) error {
 			typ, val = k, v
 		}
 	case map[any]any:
+		if err := noCaseDupKeys(m); err != nil {
+			return fmt.Errorf("definition: %w", err)
+		}
 		if len(m) != 1 {
 			return fmt.Errorf("definition must have exactly one middleware type key, got %d", len(m))
 		}
@@ -133,7 +143,9 @@ func ValidateMiddlewareDef(def any) error {
 	if err := noTemplates(val); err != nil {
 		return fmt.Errorf("middleware type %q: %w", ts, err)
 	}
-	if ts == "chain" {
+	// Traefik's file provider matches keys case-insensitively, so "Chain"
+	// and "CHAIN" are chains too and get the same member checks.
+	if strings.EqualFold(ts, "chain") {
 		if _, err := chainMembers(val); err != nil {
 			return err
 		}
@@ -182,12 +194,12 @@ func noTemplates(v any) error {
 // chainMembers returns the middleware references of a chain's options
 // ({middlewares: [ref, ...]}, non-empty, each a valid reference).
 func chainMembers(opts any) ([]string, error) {
-	var raw any
-	switch m := opts.(type) {
-	case map[string]any:
-		raw = m["middlewares"]
-	case map[any]any:
-		raw = m["middlewares"]
+	raw, found, err := foldLookup(opts, "middlewares")
+	if err != nil {
+		return nil, fmt.Errorf("chain: %w", err)
+	}
+	if !found {
+		return nil, errors.New("chain: middlewares must be a non-empty list of middleware references")
 	}
 	list, ok := raw.([]any)
 	if ss, isStrs := raw.([]string); isStrs {
@@ -258,27 +270,78 @@ func ValidateMiddlewareDefs(defs map[string]any, external []string) (valid map[s
 				}
 			}
 		}
+		// Find every cycle member against the same valid set before removing
+		// any, so all members of a cycle get the same message.
+		var cyclic []string
 		for _, n := range names {
 			if valid[n] && chainReaches(n, n, members, valid, map[string]bool{}) {
-				problems[n] = fmt.Errorf("chain %q is part of a cycle", n)
-				delete(valid, n)
-				changed = true
+				cyclic = append(cyclic, n)
 			}
+		}
+		for _, n := range cyclic {
+			problems[n] = fmt.Errorf("chain %q is part of a cycle", n)
+			delete(valid, n)
+			changed = true
 		}
 	}
 	return valid, problems
 }
 
+// chainOpts returns the options of def when its type key is "chain" in any
+// letter case (Traefik matches file-provider keys case-insensitively).
 func chainOpts(def any) (any, bool) {
-	switch m := def.(type) {
-	case map[string]any:
-		v, ok := m["chain"]
-		return v, ok
-	case map[any]any:
-		v, ok := m["chain"]
-		return v, ok
+	v, ok, err := foldLookup(def, "chain")
+	return v, ok && err == nil
+}
+
+// foldLookup returns the value of the single string key of mapping m equal
+// to key ignoring case. Two keys that fold to key are an error (Traefik
+// would pick one of them unpredictably); a non-mapping m finds nothing.
+func foldLookup(m any, key string) (any, bool, error) {
+	var val any
+	n := 0
+	visit := func(k any, v any) {
+		if ks, ok := k.(string); ok && strings.EqualFold(ks, key) {
+			val = v
+			n++
+		}
 	}
-	return nil, false
+	switch x := m.(type) {
+	case map[string]any:
+		for k, v := range x {
+			visit(k, v)
+		}
+	case map[any]any:
+		for k, v := range x {
+			visit(k, v)
+		}
+	}
+	if n > 1 {
+		return nil, false, fmt.Errorf("key %q is given %d times in different letter case", key, n)
+	}
+	return val, n == 1, nil
+}
+
+// noCaseDupKeys rejects a mapping with two string keys that differ only by
+// letter case: Traefik folds key case, so only one of them would apply.
+func noCaseDupKeys[K comparable](m map[K]any) error {
+	seen := map[string]string{}
+	for k := range m {
+		ks, ok := any(k).(string)
+		if !ok {
+			continue
+		}
+		f := strings.ToLower(ks)
+		if prev, dup := seen[f]; dup {
+			a, b := prev, ks
+			if b < a {
+				a, b = b, a
+			}
+			return fmt.Errorf("keys %q and %q differ only by letter case", a, b)
+		}
+		seen[f] = ks
+	}
+	return nil
 }
 
 // chainReaches reports whether chain from reaches target through local

@@ -174,3 +174,70 @@ func TestRendererStillFailsClosedOnPersistedRow(t *testing.T) {
 		t.Fatalf("served %v", got)
 	}
 }
+
+// A chain spelled "Chain"/"CHAIN" with an undefined member, or in a cycle,
+// is not a usable definition in Plan either (one shared rule); the same
+// chain with resolvable members is.
+func TestPlanChainTypeCaseInsensitive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		defs     map[string]map[string]any
+		routable bool
+	}{
+		"Chain undefined member": {map[string]map[string]any{"c": {"Chain": map[string]any{"Middlewares": []any{"nope"}}}}, false},
+		"CHAIN cycle": {map[string]map[string]any{
+			"c": {"CHAIN": map[string]any{"middlewares": []any{"d"}}},
+			"d": {"chain": map[string]any{"MIDDLEWARES": []any{"c"}}}}, false},
+		"Chain resolvable": {map[string]map[string]any{"c": {"Chain": map[string]any{"Middlewares": []any{"auth", "gzip@file"}}}}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newE2E(t)
+			for n, d := range tc.defs {
+				e.cfg.Middlewares[n] = d
+			}
+			acts := e.cycle([]model.Service{withMW(pub("static:app", "app", "example.test", 80), "c@file")})
+			if got := len(ofKind(acts, RouteWrite)) == 1 && len(ofKind(acts, Invalid)) == 0; got != tc.routable {
+				t.Fatalf("routable %v, actions %v", got, sums(acts))
+			}
+			if served := servedByRenderer(t, e)["app.example.test"] == "static:app"; served != tc.routable {
+				t.Fatalf("served %v", served)
+			}
+		})
+	}
+}
+
+// The unfavourable half of the label-typo trade-off, pinned so it stays a
+// conscious choice: labels that ADD a typo'd auth middleware to a route that
+// had none leave the old route WITHOUT auth served as last written. In auto
+// mode the service is Published and Plan reports only an Invalid action; in
+// approve mode the changed fingerprint makes it Pending (Plan: Skip) and it
+// waits for review. In both modes the old route is still served.
+func TestE2ETypoAddingAuthKeepsOldUnauthenticatedRoute(t *testing.T) {
+	for _, state := range []string{model.StatePublished, model.StatePending} {
+		t.Run(state, func(t *testing.T) {
+			e := newE2E(t)
+			e.cycle([]model.Service{pub("static:app", "app", "example.test", 80)})
+			before := e.mustRoute("static:app")
+			if len(before.Middlewares) != 0 {
+				t.Fatalf("setup: %+v", before)
+			}
+
+			e.now = t0.Add(time.Hour)
+			typo := withMW(pub("static:app", "app", "example.test", 80), "atuh@file")
+			typo.State = state
+			acts := e.cycle([]model.Service{typo})
+			want := Invalid // auto: Published, reported Invalid
+			if state == model.StatePending {
+				want = Skip // approve: held Pending until a human approves
+			}
+			if len(acts) != 1 || acts[0].Kind != want {
+				t.Fatalf("actions %v", sums(acts))
+			}
+			if after := e.mustRoute("static:app"); !reflect.DeepEqual(after, before) {
+				t.Fatalf("row changed: %+v", after)
+			}
+			if got := servedByRenderer(t, e); got["app.example.test"] != "static:app" {
+				t.Fatalf("served %v", got)
+			}
+		})
+	}
+}

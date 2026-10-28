@@ -5,11 +5,16 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/store"
+	"github.com/ajthom90/doorwarden/internal/traefik"
+	"gopkg.in/yaml.v3"
 )
 
 // propSeeds is the number of deterministic seeds TestPropertyRouteInvariants
@@ -27,7 +32,19 @@ type propCase struct {
 	desired     []model.Service
 	unavailable map[string]bool
 	desc        []string
+	// role8 maps each role-8 key to its variant: "typo" (labels name an
+	// undefined middleware; any row keeps its last-written, defined
+	// middlewares) or "removed" (labels name a middleware whose definition
+	// was deleted from the config; any row was written with it).
+	role8 map[string]string
 }
+
+// role8Typo and role8Removed are the middlewares the role-8 variants
+// reference. Neither is defined in e2eMiddlewares.
+const (
+	role8Typo    = "authh@file"
+	role8Removed = "gone@file"
+)
 
 // genProp builds one case. Each key optionally has a persisted row (at most
 // one row per hostname, removal unset, in grace or past grace) and a role:
@@ -37,7 +54,7 @@ type propCase struct {
 // middleware (Invalid; held when it has a row). Some sources are unavailable (their
 // services are then not in desired, and their rows are phantoms).
 func genProp(r *rand.Rand) propCase {
-	c := propCase{unavailable: map[string]bool{}}
+	c := propCase{unavailable: map[string]bool{}, role8: map[string]string{}}
 	hosts := []string{"app", "web", "api", "db"}
 	used := map[string]bool{}
 	for _, src := range []string{"static", "truenas", "docker", "other"} {
@@ -64,6 +81,9 @@ func genProp(r *rand.Rand) propCase {
 			c.rows = append(c.rows, store.Route{Key: k, Source: sourceOf(k), Zone: "example.test",
 				Hostname: rowHost + ".example.test", Scheme: "http", Host: "198.51.100.9",
 				Port: 1000 + r.Intn(100), RemovedAfter: ra})
+			if r.Intn(2) == 0 {
+				c.rows[len(c.rows)-1].Middlewares = []string{"auth@file"} // defined
+			}
 		}
 		role := r.Intn(9)
 		cur := hosts[r.Intn(3)]
@@ -84,9 +104,18 @@ func genProp(r *rand.Rand) propCase {
 			s = pub(k, cur, "missing.test", 2000) // invalid labels
 		case 7:
 			s = svc(k, cur, "example.test", model.StateError, "", 0)
-		case 8:
+		case 8: // undefined middleware: fails closed, Invalid
 			s = pub(k, cur, "example.test", 2000)
-			s.Options.Middlewares = []string{"undefined@file"} // fails closed: Invalid
+			if r.Intn(2) == 0 {
+				c.role8[k] = "typo"
+				s.Options.Middlewares = []string{"auth@file", role8Typo}
+			} else {
+				c.role8[k] = "removed"
+				s.Options.Middlewares = []string{role8Removed}
+				if hasRow { // the row was written while the definition existed
+					c.rows[len(c.rows)-1].Middlewares = []string{role8Removed}
+				}
+			}
 		} // 0, 1: absent
 		if s.Key != "" && !c.unavailable[s.Source] {
 			c.desired = append(c.desired, s)
@@ -104,16 +133,80 @@ func rowSource(k string) string { return sourceOf(k) }
 const propShards = 8
 
 func TestPropertyRouteInvariants(t *testing.T) {
-	for sh := int64(0); sh < propShards; sh++ {
-		t.Run(fmt.Sprintf("shard%d", sh), func(t *testing.T) {
-			t.Parallel()
-			propRun(t, sh)
-		})
+	var cnt propCounters
+	t.Run("shards", func(t *testing.T) {
+		for sh := int64(0); sh < propShards; sh++ {
+			t.Run(fmt.Sprintf("shard%d", sh), func(t *testing.T) {
+				t.Parallel()
+				propRun(t, sh, &cnt)
+			})
+		}
+	}) // returns once every parallel shard is done
+	if t.Failed() {
+		return
+	}
+	// The role-8 checks must not be vacuous.
+	for name, n := range map[string]int64{
+		"role-8 services generated":                      cnt.role8.Load(),
+		"role-8 typo services":                           cnt.role8Typo.Load(),
+		"role-8 removed-definition rows":                 cnt.role8RemovedRows.Load(),
+		"role-8 services outranking a row holder":        cnt.role8Outranks.Load(),
+		"of those, Invalid and evicting nobody":          cnt.role8HeldOff.Load(),
+		"routable winners checked against Render":        cnt.servedChecked.Load(),
+		"removed-definition rows checked dark in Render": cnt.darkChecked.Load(),
+	} {
+		t.Logf("%s: %d", name, n)
+		if n == 0 {
+			t.Errorf("counter %q is 0: the check never ran", name)
+		}
+	}
+	if cnt.role8HeldOff.Load() != cnt.role8Outranks.Load() {
+		t.Errorf("%d role-8 services outrank a row holder but only %d were Invalid and evicted nobody",
+			cnt.role8Outranks.Load(), cnt.role8HeldOff.Load())
 	}
 }
 
+// propCounters counts how often the role-8 and served-by-Render checks
+// actually ran, across all shards.
+type propCounters struct {
+	role8, role8Typo, role8RemovedRows atomic.Int64
+	role8Outranks, role8HeldOff        atomic.Int64
+	servedChecked, darkChecked         atomic.Int64
+}
+
+// propServed renders rows with the REAL renderer and the config's
+// middleware definitions and allowlist (exactly what the orchestrator must
+// pass), and returns hostname -> key of the router actually served.
+func propServed(t *testing.T, rows []store.Route, cfg *config.Config) map[string]string {
+	t.Helper()
+	f, _, err := traefik.Render(rows, traefik.MiddlewareDefs(cfg.MiddlewareDefs()), nil,
+		traefik.Options{ExternalMiddlewares: cfg.Traefik.ExternalMiddlewares})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d struct {
+		HTTP struct {
+			Routers map[string]struct {
+				Rule string `yaml:"rule"`
+			} `yaml:"routers"`
+		} `yaml:"http"`
+	}
+	if err := yaml.Unmarshal(f[traefik.RoutesFile], &d); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, r := range rows {
+		byName[traefik.Name(r.Key)] = r.Key
+	}
+	out := map[string]string{}
+	for n, r := range d.HTTP.Routers {
+		out[strings.TrimSuffix(strings.TrimPrefix(r.Rule, "Host(`"), "`)")] = byName[n]
+	}
+	return out
+}
+
 // propRun checks the seeds shard, shard+propShards, ... below propSeeds.
-func propRun(t *testing.T, shard int64) {
+func propRun(t *testing.T, shard int64, cnt *propCounters) {
 	ctx := context.Background()
 	e := newE2E(t)
 	e.crashWindow = true               // checked here, with the documented carve-out
@@ -149,7 +242,26 @@ func propRun(t *testing.T, shard int64) {
 		present := map[string]model.Service{}
 		for _, s := range c.desired {
 			present[s.Key] = s
+			switch c.role8[s.Key] {
+			case "typo":
+				cnt.role8.Add(1)
+				cnt.role8Typo.Add(1)
+			case "removed":
+				cnt.role8.Add(1)
+			}
 		}
+		seededMW := map[string][]string{}
+		for _, row := range c.rows {
+			seededMW[row.Key] = row.Middlewares
+			if c.role8[row.Key] == "removed" {
+				cnt.role8RemovedRows.Add(1)
+			}
+		}
+		mwValid, _ := model.ValidateMiddlewareDefs(e.cfg.MiddlewareDefs(), e.cfg.Traefik.ExternalMiddlewares)
+		resolves := func(ref string) bool {
+			return model.CheckMiddlewareRef(ref, func(n string) bool { return mwValid[n] }, e.cfg.Traefik.ExternalMiddlewares) == nil
+		}
+		written := map[string]bool{} // keys Plan wrote in any cycle so far
 		for ci, off := range propCycles {
 			now := t0.Add(off)
 			e.now = now
@@ -274,6 +386,95 @@ func propRun(t *testing.T, shard int64) {
 				}
 			}
 			assertNone(t, acts, DNSDelete) // no records mode configured
+
+			// Middlewares fail closed, checked against the REAL renderer.
+			served := propServed(t, after, e.cfg)
+			for _, a := range ofKind(acts, RouteWrite) {
+				written[a.Key] = true
+				for _, ref := range a.Svc.Options.Middlewares {
+					if !resolves(ref) {
+						fail("RouteWrite %s carries unresolvable middleware %q", a.Key, ref)
+					}
+				}
+			}
+			// (a) every routable Published winner with a row at its hostname
+			// is actually served there by Render.
+			for h, w := range wins {
+				if w.absent || w.phantom || !w.published || !w.routable {
+					continue
+				}
+				if row, ok := byKey[w.key]; ok && row.Hostname == h {
+					cnt.servedChecked.Add(1)
+					if served[h] != w.key {
+						fail("winner %s at %s is routable with a row but Render serves %q", w.key, h, served[h])
+					}
+				}
+			}
+			// (b) a persisted row only carries an unresolvable middleware
+			// when it is a "removed"-variant row left as last written; that
+			// row is dark by design. A typo never darkens a row.
+			for _, row := range after {
+				for _, ref := range row.Middlewares {
+					if resolves(ref) {
+						continue
+					}
+					if c.role8[row.Key] != "removed" || written[row.Key] ||
+						!reflect.DeepEqual(row.Middlewares, seededMW[row.Key]) {
+						fail("row %s carries unresolvable middleware %q", row.Key, ref)
+					}
+					cnt.darkChecked.Add(1)
+					if served[row.Hostname] == row.Key {
+						fail("row %s with removed definition %q is still served", row.Key, ref)
+					}
+				}
+			}
+			// (c) a role-8 service that outranks the holder of a row at its
+			// hostname is Invalid and evicts nobody.
+			if ci == 0 {
+				for _, s := range c.desired {
+					if c.role8[s.Key] == "" {
+						continue
+					}
+					h := s.Name + ".example.test"
+					for _, row := range before {
+						if row.Hostname != h || row.Key == s.Key {
+							continue
+						}
+						sr, hr := model.SourceRank(s.Key, s.Source), model.SourceRank(row.Key, row.Source)
+						if sr > hr || sr == hr && s.Key > row.Key {
+							continue
+						}
+						cnt.role8Outranks.Add(1)
+						if len(ofKind(forKey(acts, s.Key), Invalid)) != 1 {
+							fail("role-8 %s outranks %s at %s but is not Invalid", s.Key, row.Key, h)
+						}
+						if w, ok := wins[h]; ok && w.key == s.Key && w.routable {
+							fail("role-8 %s is a routable winner at %s", s.Key, h)
+						}
+						for _, a := range acts {
+							if a.Kind == RouteWrite && a.Key == s.Key {
+								fail("role-8 %s gets a RouteWrite", s.Key)
+							}
+							if a.Kind != RouteRemove {
+								continue
+							}
+							// the eviction's winner (as in the RouteRemove check
+							// above) must never be the role-8 service
+							claimed := known[a.Key].Hostname
+							for _, cf := range ofKind(forKey(acts, a.Key), Conflict) {
+								claimed = cf.Host
+							}
+							if ps, ok := present[a.Key]; ok && ps.State == model.StatePublished && claimed != known[a.Key].Hostname {
+								continue // a renamed-away loser removes its own old row
+							}
+							if w, ok := wins[claimed]; ok && w.key == s.Key {
+								fail("role-8 %s evicted %s at %s", s.Key, a.Key, claimed)
+							}
+						}
+						cnt.role8HeldOff.Add(1)
+					}
+				}
+			}
 
 			// Determinism under input order.
 			if ci == 0 && seed%10 == 0 {

@@ -201,6 +201,27 @@ middlewares:
     chain:
       middlewares: [nope]
 `,
+		"Chain to undefined": `
+middlewares:
+  Auth:
+    Chain:
+      Middlewares: [nope]
+`,
+		"CHAIN cycle": `
+middlewares:
+  a:
+    CHAIN:
+      middlewares: [b]
+  b:
+    chain:
+      MIDDLEWARES: [a]
+`,
+		"case-duplicate type keys": `
+middlewares:
+  a:
+    headers: {}
+    Headers: {}
+`,
 		"template": `
 middlewares:
   hdr:

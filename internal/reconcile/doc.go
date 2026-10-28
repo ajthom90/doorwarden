@@ -42,6 +42,18 @@
 // removed or broken), the renderer, which re-checks every row, stops serving
 // that route: the hostname goes dark rather than serve without its auth.
 //
+// The same rule has an unfavourable half: when labels ADD a middleware with
+// a typo (e.g. auth to a route that had none), the old route WITHOUT that
+// middleware keeps being served as last written. In auto approval mode the
+// service stays Published and Plan reports it only as an Invalid action
+// each cycle; in approve mode the changed fingerprint makes it Pending (a
+// Skip) and it waits for review, and approving it as is would only make it
+// Invalid. Either way the old route stays up, so an admin must act on
+// Invalid actions (fix the label or the definition): doorwarden does not
+// take a running route down because a newer label is broken. Plan and the
+// renderer must both be given cfg.MiddlewareDefs() and
+// cfg.Traefik.ExternalMiddlewares, or they disagree on what is defined.
+//
 // Hostname conflicts are decided on the resulting hostname, case-insensitive,
 // among every desired service with a valid hostname (or a stored-hostname
 // claim, below), the Known services of unavailable sources ("phantoms", whose

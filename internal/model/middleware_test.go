@@ -2,7 +2,9 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -153,5 +155,83 @@ func TestSourceRank(t *testing.T) {
 	}
 	if SourceRank("x:a", "Static") != SourceRank("static:a", "") || SourceRank("docker:a", "static") != SourceRank("docker:b", "") {
 		t.Fatal("source fallback only for unknown prefixes")
+	}
+}
+
+// Traefik matches file-provider keys case-insensitively, so a chain spelled
+// "Chain"/"CHAIN" (and "Middlewares"/"MIDDLEWARES") must get exactly the
+// member and cycle checks of a lowercase chain, not slip through as an
+// opaque unknown type.
+func TestValidateMiddlewareDefsChainCaseInsensitive(t *testing.T) {
+	spellings := []struct{ typ, opt string }{
+		{"chain", "middlewares"}, {"Chain", "middlewares"}, {"CHAIN", "middlewares"},
+		{"chain", "Middlewares"}, {"Chain", "MIDDLEWARES"}, {"cHaIn", "mIdDlEwArEs"},
+	}
+	for _, sp := range spellings {
+		t.Run(sp.typ+"/"+sp.opt, func(t *testing.T) {
+			chain := func(ms ...any) any {
+				return map[string]any{sp.typ: map[string]any{sp.opt: ms}}
+			}
+			defs := map[string]any{
+				"hdr":     map[string]any{"headers": map[string]any{}},
+				"good":    chain("hdr", "ext@docker"),
+				"nope":    chain("nope2"),
+				"cyc1":    chain("cyc2"),
+				"cyc2":    chain("cyc1"),
+				"self":    chain("self"),
+				"badref":  chain("a b"),
+				"empty":   chain(),
+				"nested":  chain("good"),
+				"viabad":  chain("nope"),
+				"anyMap":  map[any]any{sp.typ: map[any]any{sp.opt: []any{"nope3"}}},
+				"anyGood": map[any]any{sp.typ: map[any]any{sp.opt: []any{"hdr"}}},
+			}
+			valid, probs := ValidateMiddlewareDefs(defs, []string{"ext@docker"})
+			want := map[string]bool{"hdr": true, "good": true, "nested": true, "anyGood": true}
+			if !reflect.DeepEqual(valid, want) {
+				t.Fatalf("valid %v, problems %v", valid, probs)
+			}
+			for _, n := range []string{"nope", "viabad", "anyMap"} {
+				if !errors.Is(probs[n], ErrUndefinedMiddleware) {
+					t.Errorf("%s: %v, want undefined member", n, probs[n])
+				}
+			}
+			for _, n := range []string{"cyc1", "cyc2", "self"} {
+				if probs[n] == nil || !strings.Contains(probs[n].Error(), "part of a cycle") {
+					t.Errorf("%s: %v, want cycle", n, probs[n])
+				}
+			}
+			for _, n := range []string{"badref", "empty"} {
+				if probs[n] == nil {
+					t.Errorf("%s accepted", n)
+				}
+			}
+			if _, ok := chainOpts(defs["good"]); !ok {
+				t.Error("chainOpts does not see the chain")
+			}
+		})
+	}
+}
+
+func TestValidateMiddlewareDefCaseDuplicateKeys(t *testing.T) {
+	for _, d := range []any{
+		map[string]any{"chain": map[string]any{"middlewares": []any{"a"}}, "Chain": map[string]any{"middlewares": []any{"b"}}},
+		map[any]any{"headers": map[any]any{}, "HEADERS": map[any]any{}},
+		map[string]any{"chain": map[string]any{"middlewares": []any{"a"}, "Middlewares": []any{"b"}}},
+	} {
+		err := ValidateMiddlewareDef(d)
+		if err == nil || !strings.Contains(err.Error(), "letter case") {
+			t.Errorf("%#v: %v, want a letter-case error", d, err)
+		}
+	}
+}
+
+func TestTwoCycleMessagesSymmetric(t *testing.T) {
+	chain := func(m string) any { return map[string]any{"chain": map[string]any{"middlewares": []any{m}}} }
+	_, probs := ValidateMiddlewareDefs(map[string]any{"a": chain("b"), "b": chain("a")}, nil)
+	for _, n := range []string{"a", "b"} {
+		if probs[n] == nil || probs[n].Error() != fmt.Sprintf("chain %q is part of a cycle", n) {
+			t.Errorf("%s: %v", n, probs[n])
+		}
 	}
 }

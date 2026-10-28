@@ -534,11 +534,40 @@ func reverse(rs []store.Route) []store.Route {
 	return out
 }
 
-func keysOf(m map[string]any) []string {
+func keysOf[V any](m map[string]V) []string {
 	var ks []string
 	for k := range m {
 		ks = append(ks, k)
 	}
 	sort.Strings(ks)
 	return ks
+}
+
+// A chain spelled with other letter case is still a chain (Traefik folds
+// file-provider key case): an undefined member or a cycle must make it
+// invalid and fail closed exactly like a lowercase chain.
+func TestRenderChainTypeCaseInsensitive(t *testing.T) {
+	defs := MiddlewareDefs{
+		"hdr":   map[string]any{"headers": map[string]any{}},
+		"Upper": map[string]any{"Chain": map[string]any{"Middlewares": []any{"nope"}}},
+		"cycA":  map[string]any{"CHAIN": map[string]any{"middlewares": []any{"cycB"}}},
+		"cycB":  map[string]any{"chain": map[string]any{"MIDDLEWARES": []any{"cycA"}}},
+		"good":  map[string]any{"Chain": map[string]any{"Middlewares": []any{"hdr"}}},
+	}
+	var routes []store.Route
+	for _, m := range []string{"Upper", "cycA", "good"} {
+		r := rt("static:"+strings.ToLower(m), strings.ToLower(m), 80)
+		r.Middlewares = []string{m + "@file"}
+		routes = append(routes, r)
+	}
+	_, probs, d := mustRender(t, routes, defs, nil, Options{})
+	if !reflect.DeepEqual(keysOf(d.HTTP.Middlewares), []string{"good", "hdr"}) {
+		t.Fatalf("middlewares %v", keysOf(d.HTTP.Middlewares))
+	}
+	if !reflect.DeepEqual(keysOf(d.HTTP.Routers), []string{Name("static:good")}) {
+		t.Fatalf("routers %v", keysOf(d.HTTP.Routers))
+	}
+	if got := kinds(probs)[KindUndefinedMiddleware]; !reflect.DeepEqual(got, []string{"static:cyca", "static:upper"}) {
+		t.Fatalf("problems %v", probs)
+	}
 }
