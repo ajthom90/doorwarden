@@ -264,3 +264,30 @@ func TestProvidersBlockPlainStaysString(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultZone(t *testing.T) {
+	tests := []struct {
+		name, val string
+		wantErr   bool
+	}{
+		{"unset", "", false},
+		{"configured", "example.test", false},
+		{"normalized", "Example.Test.", false},
+		{"unknown", "other.test", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			yml := base
+			if tc.val != "" {
+				yml += "settings:\n  default_zone: \"" + tc.val + "\"\n"
+			}
+			c := mustLoad(t, yml)
+			if c.Settings.DefaultZone != tc.val {
+				t.Fatalf("DefaultZone = %q", c.Settings.DefaultZone)
+			}
+			if got := hasErr(c.Validate(caps(true)), "default_zone"); got != tc.wantErr {
+				t.Fatalf("default_zone error = %v, want %v", got, tc.wantErr)
+			}
+		})
+	}
+}

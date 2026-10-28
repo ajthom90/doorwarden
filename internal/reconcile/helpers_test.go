@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/config"
+	"github.com/ajthom90/doorwarden/internal/dns"
 	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/store"
 )
@@ -62,6 +63,16 @@ func knownMap(ks ...KnownService) map[string]KnownService {
 func owned(zone, name, typ, value, owner string) store.DNSRecord {
 	return store.DNSRecord{Provider: "dnsp", Zone: zone, Name: name, Type: typ, Value: value,
 		ProviderRecordID: "id-" + name, OwnerKey: owner, CreatedAt: t0.Add(-time.Hour)}
+}
+
+// listed returns Foreign listings that are known and empty for each zone of
+// provider "dnsp".
+func listed(zones ...string) map[string][]dns.Record {
+	m := map[string][]dns.Record{}
+	for _, z := range zones {
+		m["dnsp/"+z] = []dns.Record{}
+	}
+	return m
 }
 
 func tp(t time.Time) *time.Time { return &t }

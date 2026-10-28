@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strings"
 )
 
 // Capabilities describes what a DNS provider type can do. A later task adapts
@@ -102,6 +103,18 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 			add("%s %q must be auto, approve or off", a.name, a.v)
 		}
 	}
+	if dz := normZoneName(c.Settings.DefaultZone); dz != "" {
+		found := false
+		for _, z := range c.Zones {
+			if normZoneName(z.Name) == dz {
+				found = true
+				break
+			}
+		}
+		if !found {
+			add("settings.default_zone %q is not a configured zone", c.Settings.DefaultZone)
+		}
+	}
 	seen := map[string]int{}
 	for i, st := range c.Static {
 		for _, p := range st.Problems() {
@@ -116,6 +129,10 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 		}
 	}
 	return errs
+}
+
+func normZoneName(z string) string {
+	return strings.TrimRight(strings.ToLower(strings.TrimSpace(z)), ".")
 }
 
 func approval(present bool, f func() string) string {

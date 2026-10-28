@@ -95,6 +95,10 @@ type Settings struct {
 	GracePeriod  time.Duration `yaml:"grace_period"`
 	PollInterval time.Duration `yaml:"poll_interval"`
 	RenewBefore  time.Duration `yaml:"renew_before"`
+	// DefaultZone is the zone for services that name none. Unset with exactly
+	// one zone configured means that zone; unset with several means such
+	// services are invalid.
+	DefaultZone string `yaml:"default_zone"`
 }
 
 // Load reads path, substitutes environment variables, decodes strictly

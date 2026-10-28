@@ -55,7 +55,7 @@ func samplePlan() []Action {
 		pub("docker:a", "a", "example.test", 1),
 		pub("docker:b", "b", "example.test", 2),
 		pub("static:b", "b", "example.test", 3),
-	}, Observed{Known: knownMap(known("docker:gone", "example.test", "gone.example.test", nil))}, cfg, t0)
+	}, Observed{Foreign: listed("example.test"), Known: knownMap(known("docker:gone", "example.test", "gone.example.test", nil))}, cfg, t0)
 }
 
 func fullMulti(act ActivityFunc) (*MultiExecutor, map[ActionKind]*fakeProvider) {

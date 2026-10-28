@@ -15,7 +15,7 @@ import (
 
 func TestPlanNewServicePerHost(t *testing.T) {
 	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
-	got := Plan([]model.Service{pub("docker:app", "app", "example.test", 32768)}, Observed{}, cfg, t0)
+	got := Plan([]model.Service{pub("docker:app", "app", "example.test", 32768)}, Observed{Foreign: listed("example.test")}, cfg, t0)
 	assertSums(t, got,
 		"DNSEnsure example.test app.example.test docker:app [app.example.test A 192.0.2.10]",
 		"CertEnsure example.test app.example.test docker:app app.example.test",
@@ -30,18 +30,57 @@ func TestPlanNewServicePerHost(t *testing.T) {
 	}
 }
 
-func TestPlanDefaultZoneIsFirstConfigured(t *testing.T) {
-	cfg := cfgOf(zone("example.test", "off", "wildcard"), zone("other.test", "off", "wildcard"))
-	got := Plan([]model.Service{pub("docker:app", "app", "", 80)}, Observed{}, cfg, t0)
-	if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Host != "app.example.test" {
-		t.Fatalf("route: %v", sums(got))
+func TestPlanDefaultZone(t *testing.T) {
+	one := []config.Zone{zone("example.test", "off", "wildcard")}
+	two := []config.Zone{zone("example.test", "off", "wildcard"), zone("other.test", "off", "wildcard")}
+	tests := []struct {
+		name     string
+		zones    []config.Zone
+		def      string
+		wantHost string // "" => Invalid
+		msg      string
+	}{
+		{"no zones", nil, "", "", "no default_zone is set while 0 zones"},
+		{"one zone implicit", one, "", "app.example.test", ""},
+		{"two zones no default", two, "", "", "no default_zone is set while 2 zones"},
+		{"two zones default second", two, "Other.Test.", "app.other.test", ""},
+		{"one zone explicit default", one, "example.test", "app.example.test", ""},
+		{"default not configured", two, "nope.test", "", "unknown zone"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cfgOf(tc.zones...)
+			cfg.Settings.DefaultZone = tc.def
+			// TrueNAS-style zone-less service
+			s := pub("truenas:app", "app", "", 80)
+			got := Plan([]model.Service{s}, Observed{}, cfg, t0)
+			if tc.wantHost == "" {
+				if len(got) != 1 || got[0].Kind != Invalid || !strings.Contains(got[0].Reason, tc.msg) {
+					t.Fatalf("want Invalid %q, got %v %q", tc.msg, sums(got), func() string {
+						if len(got) > 0 {
+							return got[0].Reason
+						}
+						return ""
+					}())
+				}
+				return
+			}
+			if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Host != tc.wantHost {
+				t.Fatalf("route: %v", sums(got))
+			}
+			// an explicit zone is unaffected by the default
+			s.Zone = "example.test"
+			if r := ofKind(Plan([]model.Service{s}, Observed{}, cfg, t0), RouteWrite); len(r) != 1 || r[0].Host != "app.example.test" {
+				t.Fatalf("explicit zone overridden")
+			}
+		})
 	}
 }
 
 func TestPlanIPv6TargetUsesAAAA(t *testing.T) {
 	z := zone("example.test", "per-host", "per-host")
 	z.TargetIP = "2001:db8::10"
-	got := Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, Observed{}, cfgOf(z), t0)
+	got := Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, Observed{Foreign: listed("example.test")}, cfgOf(z), t0)
 	d := ofKind(got, DNSEnsure)
 	if len(d) != 1 || d[0].Record.Type != "AAAA" || d[0].Record.Value != "2001:db8::10" {
 		t.Fatalf("got %v", sums(got))
@@ -56,7 +95,7 @@ func TestPlanWildcardModeOneRecordPerZone(t *testing.T) {
 		pub("truenas:c", "c", "example.test", 3),
 		pub("docker:d", "d", "other.test", 4),
 	}
-	got := Plan(desired, Observed{}, cfg, t0)
+	got := Plan(desired, Observed{Foreign: listed("example.test", "other.test")}, cfg, t0)
 	assertSums(t, ofKind(got, DNSEnsure),
 		"DNSEnsure example.test *.example.test [*.example.test A 192.0.2.10]",
 		"DNSEnsure other.test *.other.test [*.other.test A 192.0.2.10]",
@@ -98,7 +137,7 @@ func TestPlanWildcardIdempotentAndUpdate(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ofKind(Plan(desired, Observed{Owned: tc.owned}, cfg, t0), DNSEnsure)
+			got := ofKind(Plan(desired, Observed{Owned: tc.owned, Foreign: listed("example.test")}, cfg, t0), DNSEnsure)
 			assertSums(t, got, tc.want...)
 			if len(got) == 1 && tc.name == "owned stale value" && got[0].Record.ID != "id-*.example.test" {
 				t.Fatalf("update must carry provider record id, got %q", got[0].Record.ID)
@@ -273,7 +312,7 @@ func TestPlanStoppedKnownKeepsRoute(t *testing.T) {
 
 func TestPlanStopRestartOnNewPort(t *testing.T) {
 	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
-	obs := Observed{Known: map[string]KnownService{}, LastKnown: map[string]model.Backend{}}
+	obs := Observed{Known: map[string]KnownService{}, LastKnown: map[string]model.Backend{}, Foreign: listed("example.test")}
 	// The orchestrator's bookkeeping, simulated: only RouteWrites for
 	// non-stopped services update LastKnown (Discovered/Published backends).
 	persist := func(desired []model.Service, acts []Action) {
@@ -304,10 +343,8 @@ func TestPlanStopRestartOnNewPort(t *testing.T) {
 	a2 := Plan([]model.Service{stopped}, obs, cfg, t0.Add(time.Minute))
 	persist([]model.Service{stopped}, a2)
 	assertNone(t, a2, RouteRemove, DNSDelete, ScheduleRemoval, DNSEnsure, CertEnsure)
-	for _, r := range ofKind(a2, RouteWrite) {
-		if r.Backend == nil || r.Backend.Port != 32768 || r.Backend.Host != "198.51.100.5" {
-			t.Fatalf("cycle 2 RouteWrite must carry last-known backend, got %v", sums(a2))
-		}
+	if r := ofKind(a2, RouteWrite); len(r) != 1 || r[0].Backend == nil || r[0].Backend.Port != 32768 || r[0].Backend.Host != "198.51.100.5" {
+		t.Fatalf("cycle 2 must emit exactly one RouteWrite carrying the last-known backend, got %v", sums(a2))
 	}
 	if lk := obs.LastKnown["docker:app"]; lk.Port != 32768 {
 		t.Fatalf("stopped service overwrote last-known: %+v", lk)
@@ -337,14 +374,23 @@ func TestPlanUnavailableSourceNeverRemoves(t *testing.T) {
 }
 
 func TestPlanUnavailableSourceStillClaimsHostname(t *testing.T) {
-	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
-	obs := Observed{Unavailable: map[string]bool{"truenas": true},
-		Known: knownMap(known("truenas:app", "example.test", "app.example.test", nil))}
-	got := Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, cfg, t0)
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	obs := Observed{Unavailable: map[string]bool{"truenas": true}, LastKnown: map[string]model.Backend{
+		"docker:app": {Scheme: "http", Host: "198.51.100.5", Port: 81}},
+		Known: knownMap(known("truenas:app", "example.test", "app.example.test", nil),
+			known("docker:app", "example.test", "app.example.test", nil))}
+	// A non-published claimant loses to the phantom (higher source rank).
+	stopped := svc("docker:app", "app", "example.test", model.StateStopped, "", 0)
+	got := Plan([]model.Service{stopped}, obs, cfg, t0)
 	assertSums(t, got, "Conflict example.test app.example.test docker:app")
 	if !strings.Contains(got[0].Reason, "truenas:app") {
 		t.Fatalf("reason %q", got[0].Reason)
 	}
+	// A Published claimant beats the phantom; the phantom emits nothing.
+	got = Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, cfg, t0)
+	assertSums(t, got,
+		"CertEnsure example.test *.example.test *.example.test,example.test",
+		"RouteWrite example.test app.example.test docker:app ->198.51.100.5:80")
 }
 
 func TestPlanOtherSourcesUnaffectedByOutage(t *testing.T) {
@@ -460,7 +506,14 @@ func TestPlanHostnameConflicts(t *testing.T) {
 		{"static beats truenas", []model.Service{pub("truenas:app", "app", "example.test", 1), pub("static:app", "app", "example.test", 2)}, "static:app", []string{"truenas:app"}},
 		{"same source by key", []model.Service{renamed(pub("docker:b", "b", "example.test", 1), "app"), renamed(pub("docker:a", "a", "example.test", 2), "app"), renamed(pub("docker:c", "c", "example.test", 3), "APP")}, "docker:a", []string{"docker:b", "docker:c"}},
 		{"slug collision", []model.Service{pub("docker:my_app", "my_app", "example.test", 1), pub("docker:my-app", "my-app", "example.test", 2)}, "docker:my-app", []string{"docker:my_app"}},
-		{"pending winner still blocks", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StatePending, "198.51.100.5", 2)}, "static:app", []string{"docker:app"}},
+		{"published beats pending of higher rank", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StatePending, "198.51.100.5", 2)}, "docker:app", []string{"static:app"}},
+		{"published beats never-published error", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StateError, "", 0)}, "docker:app", []string{"static:app"}},
+		{"key prefix beats source name", []model.Service{
+			func() model.Service { s := pub("static:x", "app", "example.test", 1); s.Source = "docker"; return s }(),
+			func() model.Service { s := pub("docker:y", "app", "example.test", 2); s.Source = "static"; return s }()}, "static:x", []string{"docker:y"}},
+		{"source name fallback for unknown prefix", []model.Service{
+			func() model.Service { s := pub("custom:a", "app", "example.test", 1); s.Source = "docker"; return s }(),
+			func() model.Service { s := pub("custom:b", "app", "example.test", 2); s.Source = "static"; return s }()}, "custom:b", []string{"custom:a"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -587,7 +640,7 @@ func TestPlanIdempotentAfterApplyingDNSEnsure(t *testing.T) {
 				n := names[(seed+i*3)%len(names)]
 				desired = append(desired, pub(prefixes[(seed+i)%3]+n+string(rune('0'+i)), n, zones[(seed*i+i)%3], 1000+i))
 			}
-			obs := Observed{}
+			obs := Observed{Foreign: listed("example.test", "other.test")}
 			acts := Plan(desired, obs, cfg, t0)
 			for _, a := range ofKind(acts, DNSEnsure) {
 				obs.Owned = append(obs.Owned, store.DNSRecord{Provider: a.Provider, Zone: a.Zone, Name: a.Record.Name,
@@ -625,4 +678,186 @@ func TestPlanDoesNotMutateInputs(t *testing.T) {
 	if desired[0].Name != "b" || desired[0].Backend.Port != 1 {
 		t.Fatalf("actions alias caller's services")
 	}
+}
+
+// --- fix round 1 ------------------------------------------------------------
+
+func TestPlanPublishedTierBeatsExistingRoute(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	lk := map[string]model.Backend{"docker:app_v1": {Scheme: "http", Host: "198.51.100.5", Port: 1111}}
+	v1 := svc("docker:app_v1", "app", "example.test", model.StateStopped, "", 0)
+	v2 := pub("docker:app_v2", "app", "example.test", 2222)
+	obs := Observed{LastKnown: lk, Known: knownMap(known("docker:app_v1", "example.test", "app.example.test", nil))}
+	got := Plan([]model.Service{v1, v2}, obs, cfg, t0)
+	assertSums(t, got,
+		"Conflict example.test app.example.test docker:app_v1",
+		"CertEnsure example.test *.example.test *.example.test,example.test",
+		"RouteWrite example.test app.example.test docker:app_v2 ->198.51.100.5:2222",
+		"RouteRemove example.test app.example.test docker:app_v1",
+	)
+}
+
+func TestPlanNonPublishedClaimantsDecidedByRank(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	lk := map[string]model.Backend{"docker:app": {Scheme: "http", Host: "198.51.100.5", Port: 1111}}
+	st := svc("static:app", "app", "example.test", model.StatePending, "198.51.100.6", 80)
+	dk := svc("docker:app", "app", "example.test", model.StateStopped, "", 0)
+	// docker has an existing route but loses to a higher-ranked non-published
+	// claimant: Conflict only (the winner is not published, so no RouteRemove),
+	// and the pending winner creates nothing.
+	got := Plan([]model.Service{st, dk}, Observed{LastKnown: lk,
+		Known: knownMap(known("docker:app", "example.test", "app.example.test", nil))}, cfg, t0)
+	assertSums(t, got, "Conflict example.test app.example.test docker:app")
+	// without Known nothing has a route
+	got = Plan([]model.Service{st, dk}, Observed{LastKnown: lk}, cfg, t0)
+	assertSums(t, got, "Conflict example.test app.example.test docker:app")
+}
+
+func TestPlanLoserRouteRemovedThenRestored(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
+	obs := Observed{Foreign: listed("example.test"),
+		Owned: []store.DNSRecord{owned("example.test", "app.example.test", "A", target, "docker:app")},
+		Known: knownMap(known("docker:app", "example.test", "app.example.test", nil))}
+	dk := pub("docker:app", "app", "example.test", 1)
+	st := pub("static:app", "app", "example.test", 2)
+
+	got := Plan([]model.Service{dk, st}, obs, cfg, t0)
+	dkActs := forKey(got, "docker:app")
+	assertSums(t, dkActs, "Conflict example.test app.example.test docker:app", "RouteRemove example.test app.example.test docker:app")
+	if !strings.Contains(dkActs[1].Reason, "static:app") {
+		t.Fatalf("RouteRemove reason %q", dkActs[1].Reason)
+	}
+	assertNone(t, got, DNSDelete, DNSEnsure) // the record already has the right value
+	if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "static:app" {
+		t.Fatalf("winner route: %v", sums(got))
+	}
+
+	// caller forgets docker:app after its RouteRemove: no flapping
+	obs.Known = knownMap(known("static:app", "example.test", "app.example.test", nil))
+	got = Plan([]model.Service{dk, st}, obs, cfg, t0)
+	assertSums(t, forKey(got, "docker:app"), "Conflict example.test app.example.test docker:app")
+
+	// winner disappears: docker is no longer a loser and gets its route back
+	got = Plan([]model.Service{dk}, obs, cfg, t0)
+	if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:app" {
+		t.Fatalf("docker route not restored: %v", sums(got))
+	}
+	assertNone(t, got, Conflict, DNSDelete)
+}
+
+func TestPlanUnknownForeignListing(t *testing.T) {
+	ph := cfgOf(zone("example.test", "per-host", "per-host"))
+	wc := cfgOf(zone("example.test", "wildcard", "wildcard"))
+	desired := []model.Service{pub("docker:app", "app", "example.test", 80)}
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		foreign map[string][]dns.Record
+		owned   []store.DNSRecord
+		want    []string // DNS-related actions (Skip/Conflict/DNSEnsure)
+	}{
+		{"absent per-host", ph, nil, nil, []string{"Skip example.test app.example.test docker:app"}},
+		{"absent wildcard", wc, nil, nil, []string{"Skip example.test *.example.test"}},
+		{"absent other zone listed", ph, listed("other.test"), nil, []string{"Skip example.test app.example.test docker:app"}},
+		{"present nil slice", ph, map[string][]dns.Record{"dnsp/example.test": nil}, nil,
+			[]string{"DNSEnsure example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
+		{"present empty unnormalized key", ph, map[string][]dns.Record{"dnsp/Example.Test.": {}}, nil,
+			[]string{"DNSEnsure example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
+		{"absent but owned stale value updates", ph, nil,
+			[]store.DNSRecord{owned("example.test", "app.example.test", "A", "198.51.100.99", "docker:app")},
+			[]string{"DNSEnsure example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
+		{"listed identical user record conflicts", ph, map[string][]dns.Record{"dnsp/example.test": {{Name: "app.example.test", Type: "A", Value: target}}}, nil,
+			[]string{"Conflict example.test app.example.test docker:app [app.example.test A 192.0.2.10]"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Plan(desired, Observed{Foreign: tc.foreign, Owned: tc.owned}, tc.cfg, t0)
+			var dnsActs []Action
+			for _, a := range got {
+				if a.Kind == Skip || a.Kind == Conflict || a.Kind == DNSEnsure {
+					dnsActs = append(dnsActs, a)
+				}
+			}
+			assertSums(t, dnsActs, tc.want...)
+			if len(dnsActs) == 1 && dnsActs[0].Kind == Skip && !strings.Contains(dnsActs[0].Reason, "foreign records for dnsp/example.test unknown") {
+				t.Fatalf("reason %q", dnsActs[0].Reason)
+			}
+			if len(ofKind(got, RouteWrite)) != 1 || len(ofKind(got, CertEnsure)) != 1 {
+				t.Fatalf("routes/certs must proceed: %v", sums(got))
+			}
+		})
+	}
+}
+
+func TestPlanForeignNormalizationDeterministic(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
+	foreign := map[string][]dns.Record{
+		"dnsp/example.test":  {{Name: "app.example.test", Type: "A", Value: "198.51.100.1"}},
+		"dnsp/EXAMPLE.TEST.": {{Name: "app.example.test", Type: "A", Value: "198.51.100.2"}},
+		"dnsp/Example.Test":  {{Name: "app.example.test", Type: "A", Value: "198.51.100.3"}},
+	}
+	want := ""
+	for i := 0; i < 50; i++ {
+		c := ofKind(Plan([]model.Service{pub("docker:app", "app", "example.test", 1)}, Observed{Foreign: foreign}, cfg, t0), Conflict)
+		if len(c) != 1 {
+			t.Fatalf("got %v", sums(c))
+		}
+		if i == 0 {
+			want = c[0].Reason
+		} else if c[0].Reason != want {
+			t.Fatalf("map-order dependent: %q vs %q", c[0].Reason, want)
+		}
+	}
+}
+
+func TestPlanInvalidTargetIPSkipsDNSOnly(t *testing.T) {
+	for _, mode := range []string{"per-host", "wildcard"} {
+		t.Run(mode, func(t *testing.T) {
+			z := zone("example.test", mode, "wildcard")
+			z.TargetIP = "not-an-ip"
+			got := Plan([]model.Service{pub("docker:app", "app", "example.test", 1)}, Observed{Foreign: listed("example.test")}, cfgOf(z), t0)
+			sk := ofKind(got, Skip)
+			if len(sk) != 1 || !strings.Contains(sk[0].Reason, "target_ip") {
+				t.Fatalf("got %v", sums(got))
+			}
+			assertNone(t, got, DNSEnsure, DNSDelete)
+			if len(ofKind(got, RouteWrite)) != 1 {
+				t.Fatalf("route must proceed: %v", sums(got))
+			}
+		})
+	}
+}
+
+func TestPlanZoneRemovedFromConfig(t *testing.T) {
+	cfg := cfgOf(zone("other.test", "per-host", "per-host"))
+	ownedRec := []store.DNSRecord{owned("example.test", "app.example.test", "A", target, "docker:app")}
+	k := known("docker:app", "example.test", "app.example.test", nil)
+	t.Run("present service", func(t *testing.T) {
+		obs := Observed{Owned: ownedRec, Foreign: listed("example.test", "other.test"), Known: knownMap(k)}
+		got := Plan([]model.Service{pub("docker:app", "app", "example.test", 1)}, obs, cfg, t0)
+		if len(got) != 1 || got[0].Kind != Invalid {
+			t.Fatalf("want only Invalid, got %v", sums(got))
+		}
+	})
+	t.Run("absent service past grace", func(t *testing.T) {
+		k := k
+		k.RemovedAfter = tp(t0.Add(-time.Hour))
+		obs := Observed{Owned: ownedRec, Known: knownMap(k)}
+		got := Plan(nil, obs, cfg, t0)
+		assertNone(t, got, DNSDelete)
+		assertSums(t, got, "RouteRemove example.test app.example.test docker:app")
+	})
+}
+
+func TestPlanStoppedOnlyZoneKeepsZoneLevelActions(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "wildcard", "wildcard"))
+	obs := Observed{Foreign: listed("example.test"),
+		LastKnown: map[string]model.Backend{"docker:app": {Scheme: "http", Host: "198.51.100.5", Port: 1}},
+		Known:     knownMap(known("docker:app", "example.test", "app.example.test", nil))}
+	got := Plan([]model.Service{svc("docker:app", "app", "example.test", model.StateStopped, "", 0)}, obs, cfg, t0)
+	assertSums(t, got,
+		"DNSEnsure example.test *.example.test [*.example.test A 192.0.2.10]",
+		"CertEnsure example.test *.example.test *.example.test,example.test",
+		"RouteWrite example.test app.example.test docker:app ->198.51.100.5:1",
+	)
 }

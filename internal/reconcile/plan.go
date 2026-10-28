@@ -37,6 +37,7 @@ type planner struct {
 	grace     time.Duration
 	zones     map[string]*zoneInfo
 	zoneNames []string // config order, normalized
+	defZone   string   // settings.default_zone, or the only zone; "" if none
 	foreign   map[string][]dns.Record
 	out       []Action
 }
@@ -56,7 +57,8 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 	for _, e := range entries {
 		present[e.svc.Key] = true
 		if e.err == nil {
-			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host})
+			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host,
+				published: e.svc.State == model.StatePublished})
 		}
 	}
 	for _, k := range sortedKnown(obs.Known) {
@@ -76,8 +78,15 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()})
 			continue
 		}
-		if why, lost := losers[e.svc.Key]; lost {
-			p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: why})
+		if l, lost := losers[e.svc.Key]; lost {
+			p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
+			// A loser to a Published winner must not keep serving the name:
+			// remove its existing route (only if it has one, so this does not
+			// repeat once the caller forgets the Known entry). DNS is untouched.
+			if k, ok := obs.Known[e.svc.Key]; ok && l.winner.published {
+				p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,
+					Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
+			}
 			continue
 		}
 		if p.planService(e) {
@@ -122,10 +131,23 @@ func newPlanner(obs Observed, cfg *config.Config, now time.Time) *planner {
 		p.zones[n] = zi
 		p.zoneNames = append(p.zoneNames, n)
 	}
-	for k, recs := range obs.Foreign {
+	if dz := normName(cfg.Settings.DefaultZone); dz != "" {
+		p.defZone = dz // validated by config; an unknown one makes services Invalid
+	} else if len(p.zoneNames) == 1 {
+		p.defZone = p.zoneNames[0]
+	}
+	// A present key (even with a nil/empty slice) means "listed"; an absent
+	// key means "unknown". Keys are visited in sorted order so collapsing
+	// unnormalized duplicates is deterministic.
+	fkeys := make([]string, 0, len(obs.Foreign))
+	for k := range obs.Foreign {
+		fkeys = append(fkeys, k)
+	}
+	sort.Strings(fkeys)
+	for _, k := range fkeys {
 		if i := strings.LastIndexByte(k, '/'); i >= 0 {
 			nk := k[:i] + "/" + normName(k[i+1:])
-			p.foreign[nk] = append(p.foreign[nk], recs...)
+			p.foreign[nk] = append(p.foreign[nk], obs.Foreign[k]...)
 		}
 	}
 	return p
@@ -162,15 +184,15 @@ func (p *planner) dedupe(desired []model.Service) []entry {
 }
 
 func (p *planner) resolve(s model.Service) entry {
-	def := ""
-	if len(p.zoneNames) > 0 {
-		def = p.zoneNames[0]
-	}
 	e := entry{svc: s, zone: normName(s.Zone)}
 	if e.zone == "" {
-		e.zone = def
+		if p.defZone == "" {
+			e.err = fmt.Errorf("service has no zone and no default_zone is set while %d zones are configured", len(p.zoneNames))
+			return e
+		}
+		e.zone = p.defZone
 	}
-	h, err := model.Hostname(s, p.zoneNames, def)
+	h, err := model.Hostname(s, p.zoneNames, p.defZone)
 	switch {
 	case err != nil:
 		e.err = err
@@ -272,7 +294,13 @@ func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) 
 			Record: &want, Owner: owner, Reason: "owned record has a different value"})
 		return
 	}
-	for _, f := range p.foreign[z.provider+"/"+z.name] {
+	listing, listed := p.foreign[z.provider+"/"+z.name]
+	if !listed {
+		p.emit(Action{Kind: Skip, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Reason: fmt.Sprintf("foreign records for %s/%s unknown; not creating %s", z.provider, z.name, name)})
+		return
+	}
+	for _, f := range listing {
 		ft := normType(f.Type)
 		if normName(f.Name) != name || (ft != z.recType && ft != "CNAME") || p.owned(z, name, ft) != nil {
 			continue
