@@ -5,6 +5,8 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+
+	"github.com/ajthom90/doorwarden/internal/acme/legonames"
 )
 
 // Capabilities describes what a DNS provider type can do. A later task adapts
@@ -75,7 +77,7 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 		if cert.Challenge != "" && !oneOf(cert.Challenge, "dns-01", "http-01") {
 			add("%s: certificate.challenge %q must be dns-01 or http-01", id, cert.Challenge)
 		}
-		if cert.Strategy == "wildcard" && cert.Challenge != "dns-01" {
+		if cert.Strategy == "wildcard" && cert.Challenge != "" && cert.Challenge != "dns-01" {
 			add("%s: certificate.strategy wildcard requires challenge dns-01", id)
 		}
 		if cert.Issuer != "" {
@@ -87,8 +89,10 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 			p, ok := c.Providers[cert.DNSProvider]
 			if !ok {
 				add("%s: certificate.dns_provider %q is not defined", id, cert.DNSProvider)
-			} else if p.Type == "unifi" {
-				add("%s: certificate.dns_provider %q is of type unifi, which cannot solve ACME challenges", id, cert.DNSProvider)
+			} else if recordOnlyTypes[p.Type] {
+				add("%s: certificate.dns_provider %q is of type %s, a record-only provider that cannot solve ACME challenges", id, cert.DNSProvider, p.Type)
+			} else if !legonames.Known(p.Type) {
+				add("%s: certificate.dns_provider %q has type %q, which is not a supported ACME DNS provider (a lego provider code)", id, cert.DNSProvider, p.Type)
 			}
 		}
 	}
@@ -130,8 +134,13 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 	}
 	errs = append(errs, c.validateTraefik()...)
 	errs = append(errs, c.Notifications.validate()...)
+	errs = append(errs, c.validateACME()...)
 	return errs
 }
+
+// recordOnlyTypes are DNS record providers (records.provider) that cannot
+// solve DNS-01 challenges.
+var recordOnlyTypes = map[string]bool{"unifi": true, "pihole": true, "adguard": true}
 
 func normZoneName(z string) string {
 	return strings.TrimRight(strings.ToLower(strings.TrimSpace(z)), ".")

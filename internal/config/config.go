@@ -36,6 +36,7 @@ type Config struct {
 	Traefik     Traefik                   `yaml:"traefik"`
 	// Notifications configures alert senders (see notify.go).
 	Notifications Notifications `yaml:"notifications"`
+	ACME          ACME          `yaml:"acme"`
 }
 
 // MiddlewareDefs returns Middlewares as name -> definition (any), the shape

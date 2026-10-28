@@ -1,0 +1,55 @@
+# Pebble (test ACME CA) + pebble-challtestsrv (mock DNS / HTTP-01 server)
+# for the internal/acme integration tests:
+#
+#   docker compose -f deploy/test/docker-compose.pebble.yml up -d
+#   go test -tags integration ./internal/acme/...
+#   docker compose -f deploy/test/docker-compose.pebble.yml down
+#
+# Host ports: 14000 Pebble ACME API, 14001 Pebble with external account
+# binding required (EAB), 15000 Pebble management API, 8055 challtestsrv
+# management API. Images pinned to Pebble v2.10.1 (released 2026-04-20).
+name: doorwarden-pebble
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:2.10.1
+    command: -config test/config/pebble-config.json -strict -dnsserver 192.0.2.3:8053
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      # No random nonce rejection / authz reuse: deterministic tests.
+      PEBBLE_WFE_NONCEREJECT: "0"
+      PEBBLE_AUTHZREUSE: "0"
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+    networks:
+      acmenet:
+        ipv4_address: 192.0.2.2
+  pebble-eab:
+    image: ghcr.io/letsencrypt/pebble:2.10.1
+    # Upstream test config: externalAccountBindingRequired with the
+    # well-known public test MAC keys kid-1..kid-3.
+    command: -config test/config/pebble-config-external-account-bindings.json -strict -dnsserver 192.0.2.3:8053
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
+      PEBBLE_AUTHZREUSE: "0"
+    ports:
+      - "14001:14000"
+    networks:
+      acmenet:
+        ipv4_address: 192.0.2.4
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:2.10.1
+    command: -defaultIPv6 "" -defaultIPv4 192.0.2.3
+    ports:
+      - "8055:8055"
+    networks:
+      acmenet:
+        ipv4_address: 192.0.2.3
+networks:
+  acmenet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.0.2.0/24
