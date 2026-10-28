@@ -421,16 +421,19 @@ func TestPrerequisitesProtectAgainstConcurrentWriters(t *testing.T) {
 
 func TestTSIGErrorsAreDistinguished(t *testing.T) {
 	for code, want := range map[int]string{mdns.RcodeBadSig: "BADSIG", mdns.RcodeBadKey: "BADKEY", mdns.RcodeBadTime: "BADTIME"} {
-		err := rfc2136.TSIGErrorFromCode("op", code)
+		err := rfc2136.TSIGErrorFromCode("op", "doorwarden-key.", code)
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("code %d: %v", code, err)
 		}
 	}
-	if rfc2136.TSIGErrorFromCode("op", 0) != nil {
+	if err := rfc2136.TSIGErrorFromCode("op", "doorwarden-key.", mdns.RcodeBadKey); !strings.Contains(err.Error(), `"doorwarden-key."`) {
+		t.Errorf("BADKEY must name the key: %v", err)
+	}
+	if rfc2136.TSIGErrorFromCode("op", "doorwarden-key.", 0) != nil {
 		t.Fatal("NOERROR must map to nil")
 	}
 	for e, want := range map[error]string{mdns.ErrTime: "BADTIME", mdns.ErrSig: "BADSIG", mdns.ErrSecret: "BADKEY"} {
-		if err := rfc2136.TSIGVerifyError("op", e); err == nil || !strings.Contains(err.Error(), want) {
+		if err := rfc2136.TSIGVerifyError("op", "doorwarden-key.", e); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%v: %v", e, err)
 		}
 	}
@@ -448,5 +451,31 @@ func TestClockSkewAndWrongKeyReportedClearly(t *testing.T) {
 	skewed := newProvider(t, f, func(c *rfc2136.Config) { c.Clock = func() time.Time { return time.Now().Add(time.Hour) } })
 	if err := skewed.Test(ctx); err == nil {
 		t.Fatal("clock skew accepted")
+	}
+}
+
+func TestBadBase64SecretIsAConfigError(t *testing.T) {
+	_, err := rfc2136.New(rfc2136.Config{Server: "127.0.0.1", KeyName: "k", KeySecret: "not base64 !!"})
+	if err == nil || !strings.Contains(err.Error(), "base64") || strings.Contains(err.Error(), "not base64") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTXTIsReadOnly(t *testing.T) {
+	f := startServer(t)
+	p := newProvider(t, f, nil)
+	for _, op := range []func() error{
+		func() error {
+			_, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: "t.example.test", Type: "TXT", Value: "v"})
+			return err
+		},
+		func() error {
+			_, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "t.example.test", Type: "TXT", Value: "v"})
+			return err
+		},
+	} {
+		if err := op(); err == nil || !strings.Contains(err.Error(), "not supported") {
+			t.Fatalf("err = %v", err)
+		}
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -83,22 +84,26 @@ type Config struct {
 	Region          string
 	HostedZoneID    string // when set, used for every zone and may be private
 	Endpoint        string // Go-level test seam; not reachable from user config (SSRF/credential exfiltration)
+
+	// VerifyTimeout bounds how long a write waits for its change to become
+	// visible to reads (default 60s); VerifyInterval is the poll step (default
+	// 1s). Route 53 does not promise that a read right after a change shows it.
+	VerifyTimeout  time.Duration
+	VerifyInterval time.Duration
 }
 
-// Provider implements dns.Provider.
+// Provider implements dns.Provider. It holds no secret-bearing value: the AWS
+// client (which embeds the credentials provider) and the scrub list are only
+// reachable through closures.
 type Provider struct {
-	cl     *r53.Client
-	pinned string
-	cr     *creds
+	client  func() *r53.Client
+	scrubFn func(string) string
+	pinned  string
 
-	mu    sync.Mutex
+	verifyTimeout, verifyEvery time.Duration
+
+	mu    *sync.Mutex
 	cache map[string]zoneRef // zone -> hosted zone
-}
-
-// creds keeps credential material off the Provider struct itself.
-type creds struct {
-	dns.Redacted
-	secrets []secrets.Secret
 }
 
 type zoneRef struct{ id, name string }
@@ -111,14 +116,14 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 		region = "us-east-1"
 	}
 	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	cr := &creds{}
+	var sec []secrets.Secret
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
 		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 			return nil, errors.New("route53: access key ID and secret access key must be set together")
 		}
 		opts = append(opts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(c.AccessKeyID.Reveal(), c.SecretAccessKey.Reveal(), "")))
-		cr.secrets = []secrets.Secret{c.AccessKeyID, c.SecretAccessKey}
+		sec = []secrets.Secret{c.AccessKeyID, c.SecretAccessKey}
 	}
 	if c.Endpoint != "" {
 		opts = append(opts, awsconfig.WithRetryMaxAttempts(1))
@@ -132,7 +137,17 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 			o.BaseEndpoint = aws.String(c.Endpoint)
 		}
 	})
-	return &Provider{cl: cl, pinned: strings.TrimPrefix(c.HostedZoneID, "/hostedzone/"), cr: cr, cache: map[string]zoneRef{}}, nil
+	_, scrub := dns.Scrubber(sec...)
+	vt, vi := c.VerifyTimeout, c.VerifyInterval
+	if vt <= 0 {
+		vt = 60 * time.Second
+	}
+	if vi <= 0 {
+		vi = time.Second
+	}
+	return &Provider{client: func() *r53.Client { return cl }, scrubFn: scrub,
+		pinned: strings.TrimPrefix(c.HostedZoneID, "/hostedzone/"), verifyTimeout: vt, verifyEvery: vi,
+		mu: &sync.Mutex{}, cache: map[string]zoneRef{}}, nil
 }
 
 func (p *Provider) Type() string { return Type }
@@ -143,14 +158,7 @@ func (p *Provider) Capabilities() dns.Capabilities {
 	return c
 }
 
-func (p *Provider) scrub(s string) string {
-	for _, x := range p.cr.secrets {
-		if v := x.Reveal(); v != "" {
-			s = strings.ReplaceAll(s, v, "[redacted]")
-		}
-	}
-	return s
-}
+func (p *Provider) scrub(s string) string { return p.scrubFn(s) }
 
 // mapErr converts SDK errors into clear, secret-free errors.
 func (p *Provider) mapErr(op string, err error) error {
@@ -198,7 +206,7 @@ func (p *Provider) listZones(ctx context.Context) ([]hostedZone, error) {
 		if page >= maxPages {
 			return nil, fmt.Errorf("route53: list hosted zones: more than %d pages; refusing to continue", maxPages)
 		}
-		resp, err := p.cl.ListHostedZones(ctx, &r53.ListHostedZonesInput{Marker: marker})
+		resp, err := p.client().ListHostedZones(ctx, &r53.ListHostedZonesInput{Marker: marker})
 		if err != nil {
 			return nil, p.wrapCtx(ctx, "list hosted zones", err)
 		}
@@ -253,7 +261,7 @@ func pick(zone string, zones []hostedZone) (hostedZone, error) {
 
 // getZone fetches a hosted zone by ID and validates the answer.
 func (p *Provider) getZone(ctx context.Context, op, id string) (zoneRef, error) {
-	resp, err := p.cl.GetHostedZone(ctx, &r53.GetHostedZoneInput{Id: aws.String(id)})
+	resp, err := p.client().GetHostedZone(ctx, &r53.GetHostedZoneInput{Id: aws.String(id)})
 	if err != nil {
 		return zoneRef{}, p.wrapCtx(ctx, op, err)
 	}
@@ -277,6 +285,12 @@ func (p *Provider) zoneFor(ctx context.Context, zone string) (zoneRef, error) {
 	var err error
 	if p.pinned != "" {
 		ref, err = p.getZone(ctx, "look up hosted zone", p.pinned)
+		if err == nil && !inZone(zone, ref.name) {
+			// a pinned provider serves exactly one hosted zone; answering for any
+			// other zone would list nothing, write into the wrong zone, or report
+			// deletes that never happened
+			return zoneRef{}, fmt.Errorf("route53: zone %q is not served by the pinned hosted zone %s (%s); hosted_zone_id binds this provider to that one zone", zone, ref.id, ref.name)
+		}
 	} else {
 		var zs []hostedZone
 		if zs, err = p.listZones(ctx); err == nil {
@@ -302,7 +316,7 @@ func (p *Provider) Test(ctx context.Context) error {
 		_, err := p.getZone(ctx, "verify credentials", p.pinned)
 		return err
 	}
-	resp, err := p.cl.ListHostedZones(ctx, &r53.ListHostedZonesInput{MaxItems: aws.Int32(1)})
+	resp, err := p.client().ListHostedZones(ctx, &r53.ListHostedZonesInput{MaxItems: aws.Int32(1)})
 	if err != nil {
 		return p.wrapCtx(ctx, "verify credentials", err)
 	}
@@ -335,7 +349,7 @@ func (p *Provider) allSets(ctx context.Context, zid string) ([]types.ResourceRec
 		if page >= maxPages {
 			return nil, fmt.Errorf("route53: list records: more than %d pages; refusing to continue", maxPages)
 		}
-		resp, err := p.cl.ListResourceRecordSets(ctx, in)
+		resp, err := p.client().ListResourceRecordSets(ctx, in)
 		if err != nil {
 			return nil, p.wrapCtx(ctx, "list records", err)
 		}
@@ -392,7 +406,7 @@ func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, 
 // getSet fetches the plain (non-routing-policy) record set for (name, type).
 func (p *Provider) getSet(ctx context.Context, zid, name, typ string) (*types.ResourceRecordSet, error) {
 	name = strings.ToLower(strings.TrimSuffix(name, "."))
-	resp, err := p.cl.ListResourceRecordSets(ctx, &r53.ListResourceRecordSetsInput{
+	resp, err := p.client().ListResourceRecordSets(ctx, &r53.ListResourceRecordSetsInput{
 		HostedZoneId: aws.String(zid), StartRecordName: aws.String(escName(name)),
 		StartRecordType: types.RRType(typ), MaxItems: aws.Int32(1),
 	})
@@ -413,7 +427,7 @@ func (p *Provider) getSet(ctx context.Context, zid, name, typ string) (*types.Re
 
 // change submits one atomic change batch.
 func (p *Provider) change(ctx context.Context, zid, op string, changes ...types.Change) error {
-	resp, err := p.cl.ChangeResourceRecordSets(ctx, &r53.ChangeResourceRecordSetsInput{
+	resp, err := p.client().ChangeResourceRecordSets(ctx, &r53.ChangeResourceRecordSetsInput{
 		HostedZoneId: aws.String(zid),
 		ChangeBatch:  &types.ChangeBatch{Changes: changes},
 	})
@@ -452,16 +466,31 @@ func sameValues(s *types.ResourceRecordSet, want ...string) bool {
 	return true
 }
 
-// verify re-reads the single (name, type) set and requires the expected state.
+// verify re-reads the single (name, type) set until it shows the expected
+// state. Route 53 does not promise that a read issued right after a change
+// already reflects it, so the read is polled every verifyEvery for at most
+// verifyTimeout (we deliberately do not wait for GetChange to reach INSYNC,
+// which can take minutes and is not what the next read depends on). If the
+// state never shows up the error names the record: success is never claimed.
 func (p *Provider) verify(ctx context.Context, zid, op, name, typ string, want ...string) error {
-	got, err := p.getSet(ctx, zid, name, typ)
-	if err != nil {
-		return fmt.Errorf("%w (change submitted but not confirmed)", err)
+	deadline := time.Now().Add(p.verifyTimeout)
+	for {
+		got, err := p.getSet(ctx, zid, name, typ)
+		if err != nil {
+			return fmt.Errorf("%w (change submitted but not confirmed)", err)
+		}
+		if sameValues(got, want...) {
+			return nil
+		}
+		if !time.Now().Add(p.verifyEvery).Before(deadline) {
+			return fmt.Errorf("route53: %s: change for %s %s was accepted but the record set did not show the expected values within %s; refusing to report success", op, name, typ, p.verifyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("route53: %s: %w (change for %s %s submitted but not confirmed)", op, ctx.Err(), name, typ)
+		case <-time.After(p.verifyEvery):
+		}
 	}
-	if !sameValues(got, want...) {
-		return fmt.Errorf("route53: %s: change was accepted but the record set does not show the expected values; refusing to report success", op)
-	}
-	return nil
 }
 
 func newSet(r dns.Record, ttl int64) types.ResourceRecordSet {
@@ -489,19 +518,48 @@ func checkType(r dns.Record) error {
 	return fmt.Errorf("route53: record type %q is not supported for writes (A, AAAA, CNAME)", r.Type)
 }
 
-// conflicts reports another-type record set that cannot coexist with r.
-func (p *Provider) cnameConflict(ctx context.Context, zid string, r dns.Record) error {
-	others := []string{"CNAME"}
-	if r.Type == "CNAME" {
-		others = []string{"A", "AAAA"}
-	}
-	for _, t := range others {
-		o, err := p.getSet(ctx, zid, r.Name, t)
+// setsAt lists every record set at exactly name (Route 53 sorts a name's sets
+// together).
+func (p *Provider) setsAt(ctx context.Context, zid, name string) ([]types.ResourceRecordSet, error) {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	in := &r53.ListResourceRecordSetsInput{HostedZoneId: aws.String(zid), StartRecordName: aws.String(escName(name)), MaxItems: aws.Int32(100)}
+	var out []types.ResourceRecordSet
+	for page := 0; page < 20; page++ {
+		resp, err := p.client().ListResourceRecordSets(ctx, in)
 		if err != nil {
-			return err
+			return nil, p.wrapCtx(ctx, "get record", err)
 		}
-		if o != nil {
-			return fmt.Errorf("route53: %s already has a %s record set, which cannot coexist with %s: %w", r.Name, t, r.Type, dns.ErrRecordExists)
+		if resp.MaxItems == nil {
+			return nil, malformed("get record", "no MaxItems")
+		}
+		for _, s := range resp.ResourceRecordSets {
+			if unescName(aws.ToString(s.Name)) != name {
+				return out, nil
+			}
+			out = append(out, s)
+		}
+		if !resp.IsTruncated || resp.NextRecordName == nil {
+			return out, nil
+		}
+		in.StartRecordName, in.StartRecordType, in.StartRecordIdentifier = resp.NextRecordName, resp.NextRecordType, resp.NextRecordIdentifier
+	}
+	return nil, errors.New("route53: get record: too many record sets at one name")
+}
+
+// cnameConflict enforces what Route 53 itself enforces: a CNAME set cannot
+// coexist with ANY other record set at the same name (apex NS/SOA aside is
+// irrelevant here because a CNAME at the apex is never created by this tool).
+func (p *Provider) cnameConflict(ctx context.Context, zid string, r dns.Record) error {
+	sets, err := p.setsAt(ctx, zid, r.Name)
+	if err != nil {
+		return err
+	}
+	for _, s := range sets {
+		if r.Type == "CNAME" && s.Type != types.RRTypeCname {
+			return fmt.Errorf("route53: %s already has a %s record set, which cannot coexist with CNAME: %w", r.Name, s.Type, dns.ErrRecordExists)
+		}
+		if r.Type != "CNAME" && s.Type == types.RRTypeCname {
+			return fmt.Errorf("route53: %s already has a CNAME record set, which cannot coexist with %s: %w", r.Name, r.Type, dns.ErrRecordExists)
 		}
 	}
 	return nil
@@ -621,7 +679,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return p.verify(ctx, ref.id, op, r.Name, r.Type, restVals...)
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider.
-func (p *Provider) String() string   { return "route53.Provider" }
-func (p *Provider) GoString() string { return "route53.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "route53.Provider <redacted>" }
+func (p Provider) GoString() string           { return "route53.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "route53.Provider") }

@@ -16,9 +16,9 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/ajthom90/doorwarden/internal/dns"
 	"github.com/ajthom90/doorwarden/internal/secrets"
 )
 
@@ -48,15 +48,16 @@ func (e *StatusError) Error() string {
 // IsAuth reports 401/403.
 func (e *StatusError) IsAuth() bool { return e.Status == 401 || e.Status == 403 }
 
-// Client talks to one base URL.
+// Client talks to one base URL. The secrets it scrubs from error text are held
+// only inside closures (see dns.Scrubber), never in a field, so formatting a
+// Client by reflection cannot reveal them.
 type Client struct {
 	Base    *url.URL
 	HC      *http.Client
 	MaxBody int64
-	// Secrets are scrubbed from every error string this client returns.
-	// Set before use; add later (session tokens) with AddSecret.
-	Secrets []secrets.Secret
-	smu     sync.RWMutex
+
+	addSecret func(secrets.Secret)
+	scrub     func(string) string
 }
 
 // New builds a client for base (scheme://host[:port][/prefix]).
@@ -80,7 +81,8 @@ func New(base string, insecureSkipVerify bool, timeout time.Duration) (*Client, 
 		IdleConnTimeout:       30 * time.Second,
 	}
 	hc := &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: refuseCrossHost}
-	return &Client{Base: u, HC: hc, MaxBody: DefaultMaxBody}, nil
+	add, scrub := dns.Scrubber()
+	return &Client{Base: u, HC: hc, MaxBody: DefaultMaxBody, addSecret: add, scrub: scrub}, nil
 }
 
 // refuseCrossHost stops redirects that leave the original host, so credential
@@ -123,24 +125,16 @@ func privateHost(h string) bool {
 // Close drops idle connections.
 func (c *Client) Close() { c.HC.CloseIdleConnections() }
 
-// AddSecret registers another value to scrub (for example a session token).
-func (c *Client) AddSecret(s secrets.Secret) {
-	c.smu.Lock()
-	c.Secrets = append(c.Secrets, s)
-	c.smu.Unlock()
+// AddSecret registers values to scrub from every error string this client
+// returns (credentials, session tokens).
+func (c *Client) AddSecret(ss ...secrets.Secret) {
+	for _, s := range ss {
+		c.addSecret(s)
+	}
 }
 
-// Scrub replaces every configured secret in s.
-func (c *Client) Scrub(s string) string {
-	c.smu.RLock()
-	defer c.smu.RUnlock()
-	for _, sec := range c.Secrets {
-		if v := sec.Reveal(); v != "" {
-			s = strings.ReplaceAll(s, v, "[redacted]")
-		}
-	}
-	return s
-}
+// Scrub replaces every registered secret in s.
+func (c *Client) Scrub(s string) string { return c.scrub(s) }
 
 type scrubbed struct {
 	msg string

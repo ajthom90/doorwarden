@@ -65,15 +65,8 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	c  *httpx.Client
-	cr *creds
-}
-
-// creds keeps the basic-auth token off the Provider struct itself, so a
-// dereferenced copy of the provider cannot print it.
-type creds struct {
-	dns.Redacted
-	auth secrets.Secret // base64 user:password
+	c    *httpx.Client
+	auth func() http.Header // builds the Authorization header; the credentials live only in this closure
 }
 
 // New validates cfg and builds a provider.
@@ -89,13 +82,11 @@ func New(cfg Config) (*Provider, error) {
 		return nil, fmt.Errorf("adguard: %w", err)
 	}
 	tok := secrets.Secret(base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password.Reveal())))
-	c.Secrets = []secrets.Secret{cfg.Password, tok}
-	return &Provider{c: c, cr: &creds{auth: tok}}, nil
+	c.AddSecret(cfg.Password, tok)
+	return &Provider{c: c, auth: func() http.Header { return http.Header{"Authorization": {"Basic " + tok.Reveal()}} }}, nil
 }
 
-func (p *Provider) hdr() http.Header {
-	return http.Header{"Authorization": {"Basic " + p.cr.auth.Reveal()}}
-}
+func (p *Provider) hdr() http.Header { return p.auth() }
 
 func (p *Provider) Type() string                   { return Type }
 func (p *Provider) Capabilities() dns.Capabilities { return staticCaps }
@@ -319,8 +310,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return nil
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
-func (p *Provider) String() string   { return "adguard.Provider" }
-func (p *Provider) GoString() string { return "adguard.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "adguard.Provider <redacted>" }
+func (p Provider) GoString() string           { return "adguard.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "adguard.Provider") }

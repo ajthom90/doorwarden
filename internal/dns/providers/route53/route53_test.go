@@ -27,6 +27,7 @@ const (
 )
 
 type zone struct {
+	pending  map[string]*set // changes not yet visible to reads
 	id, name string
 	private  bool
 	sets     map[string]*set // key name|type
@@ -40,6 +41,7 @@ type set struct {
 }
 
 type backend struct {
+	lag, lagLeft             int // reads that still show the old state after a change
 	mu                       sync.Mutex
 	zones                    []*zone
 	failCode                 string // when set, every call fails with this error code
@@ -189,6 +191,13 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 1 && r.Method == "GET":
 		fmt.Fprintf(w, `<GetHostedZoneResponse %s><HostedZone><Id>/hostedzone/%s</Id><Name>%s</Name><CallerReference>c</CallerReference></HostedZone></GetHostedZoneResponse>`, ns, z.id, z.name)
 	case len(parts) == 2 && parts[1] == "rrset" && r.Method == "GET":
+		if z.pending != nil {
+			if b.lagLeft > 0 {
+				b.lagLeft--
+			} else {
+				z.sets, z.pending = z.pending, nil
+			}
+		}
 		b.listed = append(b.listed, z.id)
 		q := r.URL.Query()
 		var all []*set
@@ -280,7 +289,9 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				delete(next, key)
 			}
 		}
-		if !b.dropChange {
+		if !b.dropChange && b.lag > 0 {
+			z.pending, b.lagLeft = next, b.lag
+		} else if !b.dropChange {
 			z.sets = next // the batch is atomic
 		}
 		fmt.Fprintf(w, `<ChangeResourceRecordSetsResponse %s><ChangeInfo><Id>/change/C1</Id><Status>PENDING</Status><SubmittedAt>2024-01-01T00:00:00Z</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>`, ns)
@@ -300,7 +311,7 @@ func newProvider(t *testing.T, b *backend, mod func(*route53.Config)) *route53.P
 	t.Helper()
 	srv := httptest.NewServer(b)
 	t.Cleanup(srv.Close)
-	cfg := route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL}
+	cfg := route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL, VerifyTimeout: 150 * time.Millisecond, VerifyInterval: 10 * time.Millisecond}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -672,5 +683,64 @@ func TestCNAMEBlocksARecord(t *testing.T) {
 	}
 	if len(b.zone("ZEXAMPLE").sets) != n {
 		t.Fatal("conflicting set created")
+	}
+}
+
+func TestPinnedProviderRefusesOtherZones(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	p := newProvider(t, b, func(c *route53.Config) { c.HostedZoneID = "ZEXAMPLE" })
+	before := len(b.zone("ZEXAMPLE").sets)
+	rec := dns.Record{Name: "y.other.test", Type: "A", Value: "192.0.2.1"}
+	checks := map[string]error{}
+	_, checks["list"] = p.ListRecords(ctx, "other.test")
+	_, checks["create"] = p.CreateRecord(ctx, "other.test", rec)
+	_, checks["update"] = p.UpdateRecord(ctx, "other.test", rec)
+	checks["delete"] = p.DeleteRecord(ctx, "other.test", rec)
+	for op, err := range checks {
+		if err == nil || !strings.Contains(err.Error(), "not served by the pinned hosted zone") {
+			t.Errorf("%s with a foreign zone: err = %v", op, err)
+		}
+	}
+	if len(b.zone("ZEXAMPLE").sets) != before {
+		t.Fatal("a record for another zone was written into the pinned zone")
+	}
+	// the pinned zone itself and its sub-domains still work
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ListRecords(ctx, "lab.example.test"); err != nil {
+		t.Fatalf("sub-zone of the pinned zone: %v", err)
+	}
+	if err := p.Test(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEventualConsistencyIsPolledAndTimeoutNamesRecord(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.lag = 3 // the first reads after a change still show the old state
+	p := newProvider(t, b, nil)
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "lag.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+		t.Fatalf("lagging reads must be polled: %v", err)
+	}
+	b.lag = 1000
+	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "never.example.test", Type: "A", Value: "192.0.2.2"})
+	if err == nil || !strings.Contains(err.Error(), "never.example.test") || !strings.Contains(err.Error(), "refusing to report success") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCNAMEConflictCoversEveryType(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.zone("ZEXAMPLE").sets["t.example.test.|TXT"] = &set{name: "t.example.test.", typ: "TXT", ttl: 60, vals: []string{`"hello"`}}
+	b.zone("ZEXAMPLE").sets["m.example.test.|MX"] = &set{name: "m.example.test.", typ: "MX", ttl: 60, vals: []string{"10 mail.example.test."}}
+	p := newProvider(t, b, nil)
+	for _, n := range []string{"t.example.test", "m.example.test"} {
+		if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: n, Type: "CNAME", Value: "x.example.test"}); !errors.Is(err, dns.ErrRecordExists) {
+			t.Errorf("%s: CNAME over a non-address set: %v", n, err)
+		}
 	}
 }

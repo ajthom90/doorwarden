@@ -11,11 +11,12 @@
 // (name, type[, value]). ListRecords uses AXFR, so the server must allow zone
 // transfers to the TSIG key (BIND: allow-transfer { key doorwarden; };); if it
 // does not, ListRecords returns a clear error and everything else still works.
-// Supported record types: A, AAAA, CNAME, TXT.
+// Writable record types: A, AAAA, CNAME (others, TXT included, are listed read-only).
 package rfc2136
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -73,16 +74,10 @@ type Provider struct {
 	addr    string
 	keyName string
 	alg     string
-	cr      *creds
+	secret  func() secrets.Secret // the TSIG secret lives only behind this closure
+	scrubFn func(string) string
 	timeout time.Duration
 	now     func() time.Time
-}
-
-// creds keeps the TSIG secret off the Provider struct itself, so a
-// dereferenced copy of the provider cannot print it.
-type creds struct {
-	dns.Redacted
-	secret secrets.Secret
 }
 
 // New validates cfg and builds a provider.
@@ -112,25 +107,24 @@ func New(c Config) (*Provider, error) {
 	if to <= 0 {
 		to = 10 * time.Second
 	}
+	if _, err := base64.StdEncoding.DecodeString(c.KeySecret.Reveal()); err != nil {
+		return nil, errors.New("rfc2136: config field \"key_secret\" is not valid base64")
+	}
+	_, scrub := dns.Scrubber(c.KeySecret)
 	now := c.Clock
 	if now == nil {
 		now = time.Now
 	}
 	return &Provider{
 		addr: net.JoinHostPort(host, port), keyName: mdns.Fqdn(strings.ToLower(c.KeyName)),
-		alg: full, cr: &creds{secret: c.KeySecret}, timeout: to, now: now,
+		alg: full, secret: dns.StaticSecret(c.KeySecret), scrubFn: scrub, timeout: to, now: now,
 	}, nil
 }
 
 func (p *Provider) Type() string                   { return Type }
 func (p *Provider) Capabilities() dns.Capabilities { return staticCaps }
 
-func (p *Provider) scrub(s string) string {
-	if v := p.cr.secret.Reveal(); v != "" {
-		s = strings.ReplaceAll(s, v, "[redacted]")
-	}
-	return s
-}
+func (p *Provider) scrub(s string) string { return p.scrubFn(s) }
 
 func (p *Provider) sign(m *mdns.Msg) *mdns.Msg {
 	m.SetTsig(p.keyName, p.alg, 300, p.now().Unix())
@@ -153,7 +147,7 @@ func (p *Provider) exchangeRaw(ctx context.Context, op string, m *mdns.Msg) (*md
 		return fmt.Errorf("rfc2136: %s: %s", op, p.scrub(err.Error()))
 	}
 	p.sign(m)
-	out, reqMAC, err := mdns.TsigGenerate(m, p.cr.secret.Reveal(), "", false)
+	out, reqMAC, err := mdns.TsigGenerate(m, p.secret().Reveal(), "", false)
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -184,42 +178,42 @@ func (p *Provider) exchangeRaw(ctx context.Context, op string, m *mdns.Msg) (*md
 		}
 		return nil, fmt.Errorf("rfc2136: %s: server response is not TSIG-signed; refusing it", op)
 	}
-	if e := tsigErrorFromCode(op, int(t.Error)); e != nil {
+	if e := tsigErrorFromCode(op, p.keyName, int(t.Error)); e != nil {
 		return nil, e
 	}
 	if !strings.EqualFold(t.Hdr.Name, p.keyName) {
 		return nil, fmt.Errorf("rfc2136: %s: response signed with an unexpected key %q; refusing it", op, t.Hdr.Name)
 	}
-	if err := mdns.TsigVerify(raw, p.cr.secret.Reveal(), reqMAC, false); err != nil {
-		return nil, tsigVerifyError(op, err)
+	if err := mdns.TsigVerify(raw, p.secret().Reveal(), reqMAC, false); err != nil {
+		return nil, tsigVerifyError(op, p.keyName, err)
 	}
 	return r, nil
 }
 
 // tsigErrorFromCode maps a TSIG-record error code (RFC 8945 section 3.2) to a
 // specific message; nil for NOERROR.
-func tsigErrorFromCode(op string, code int) error {
+func tsigErrorFromCode(op, keyName string, code int) error {
 	switch code {
 	case 0:
 		return nil
 	case mdns.RcodeBadSig:
 		return fmt.Errorf("rfc2136: %s: server reports BADSIG: the TSIG secret or algorithm does not match the server's key", op)
 	case mdns.RcodeBadKey:
-		return fmt.Errorf("rfc2136: %s: server reports BADKEY: it does not know the TSIG key name %q", op, "key_name")
+		return fmt.Errorf("rfc2136: %s: server reports BADKEY: it does not know the TSIG key name %q", op, keyName)
 	case mdns.RcodeBadTime:
 		return fmt.Errorf("rfc2136: %s: server reports BADTIME: the clocks of doorwarden and the DNS server differ by more than the TSIG fudge (300s); fix time synchronisation", op)
 	}
 	return fmt.Errorf("rfc2136: %s: server reports TSIG error %s", op, mdns.RcodeToString[code])
 }
 
-func tsigVerifyError(op string, err error) error {
+func tsigVerifyError(op, keyName string, err error) error {
 	switch {
 	case errors.Is(err, mdns.ErrTime):
-		return tsigErrorFromCode(op, mdns.RcodeBadTime)
+		return tsigErrorFromCode(op, keyName, mdns.RcodeBadTime)
 	case errors.Is(err, mdns.ErrSig):
 		return fmt.Errorf("rfc2136: %s: the server's TSIG signature did not verify (BADSIG); the secret or algorithm differs", op)
 	case errors.Is(err, mdns.ErrSecret):
-		return tsigErrorFromCode(op, mdns.RcodeBadKey)
+		return tsigErrorFromCode(op, keyName, mdns.RcodeBadKey)
 	}
 	return fmt.Errorf("rfc2136: %s: TSIG verification failed: %v", op, err)
 }
@@ -293,11 +287,11 @@ func toRR(r dns.Record) (mdns.RR, error) {
 	case "CNAME":
 		hdr.Rrtype = mdns.TypeCNAME
 		return &mdns.CNAME{Hdr: hdr, Target: fqdn(r.Value)}, nil
-	case "TXT":
-		hdr.Rrtype = mdns.TypeTXT
-		return &mdns.TXT{Hdr: hdr, Txt: []string{r.Value}}, nil
 	}
-	return nil, fmt.Errorf("rfc2136: record type %q is not supported (A, AAAA, CNAME, TXT)", r.Type)
+	// TXT values can be several strings and up to 65535 bytes; rebuilding one
+	// from a flat string would not match what is stored (prerequisites, exact
+	// removal), and TXT is out of scope for this tool, so TXT is read-only.
+	return nil, fmt.Errorf("rfc2136: record type %q is not supported for writes (A, AAAA, CNAME)", r.Type)
 }
 
 func fromRR(rr mdns.RR) (dns.Record, bool) {
@@ -336,7 +330,7 @@ func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, 
 	defer nc.Close()
 	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
 	defer stop()
-	t := &mdns.Transfer{Conn: &mdns.Conn{Conn: nc}, ReadTimeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.cr.secret.Reveal()}}
+	t := &mdns.Transfer{Conn: &mdns.Conn{Conn: nc}, ReadTimeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret().Reveal()}}
 	ch, err := t.In(m, p.addr)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -486,8 +480,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return p.update(ctx, "delete record "+r.Name, zone, func(m *mdns.Msg) { m.Remove([]mdns.RR{rr}) })
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
-func (p *Provider) String() string   { return "rfc2136.Provider" }
-func (p *Provider) GoString() string { return "rfc2136.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "rfc2136.Provider <redacted>" }
+func (p Provider) GoString() string           { return "rfc2136.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "rfc2136.Provider") }

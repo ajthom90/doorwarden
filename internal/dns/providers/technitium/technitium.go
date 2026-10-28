@@ -77,18 +77,14 @@ type Config struct {
 type Provider struct {
 	c     *httpx.Client
 	user  string
-	cr    *creds
 	fixed bool // token configured; cannot re-login
-	mu    sync.Mutex
-}
 
-// creds keeps the password and tokens off the Provider struct itself, so a
-// dereferenced copy of the provider cannot print them. token is guarded by
-// Provider.mu.
-type creds struct {
-	dns.Redacted
-	password secrets.Secret
-	token    secrets.Secret
+	// credentials are reachable only through these closures
+	password   func() secrets.Secret
+	getToken   func() secrets.Secret
+	setToken   func(secrets.Secret)
+	clearToken func(stale secrets.Secret)
+	loginMu    *sync.Mutex // single-flight login
 }
 
 // New validates cfg and builds a provider.
@@ -103,8 +99,10 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("technitium: %w", err)
 	}
-	c.Secrets = []secrets.Secret{cfg.Token, cfg.Password}
-	return &Provider{c: c, user: cfg.Username, cr: &creds{password: cfg.Password, token: cfg.Token}, fixed: cfg.Token != ""}, nil
+	c.AddSecret(cfg.Token, cfg.Password)
+	get, set, clr := dns.SecretCell(cfg.Token)
+	return &Provider{c: c, user: cfg.Username, fixed: cfg.Token != "", password: dns.StaticSecret(cfg.Password),
+		getToken: get, setToken: set, clearToken: clr, loginMu: &sync.Mutex{}}, nil
 }
 
 func (p *Provider) Type() string                   { return Type }
@@ -146,8 +144,15 @@ func (p *Provider) post(ctx context.Context, path string, form url.Values) (*env
 	return nil, fmt.Errorf("technitium: server error: %s", msg)
 }
 
-func (p *Provider) login(ctx context.Context) error {
-	env, err := p.post(ctx, "/api/user/login", url.Values{"user": {p.user}, "pass": {p.cr.password.Reveal()}, "includeInfo": {"false"}})
+// login obtains a session token unless another goroutine already did while we
+// waited (stale is the token the caller found invalid, or empty).
+func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+	if cur := p.getToken(); cur != "" && cur != stale {
+		return nil
+	}
+	env, err := p.post(ctx, "/api/user/login", url.Values{"user": {p.user}, "pass": {p.password().Reveal()}, "includeInfo": {"false"}})
 	if errors.Is(err, errInvalidToken) {
 		return errors.New("technitium: login failed: invalid credentials")
 	}
@@ -157,26 +162,20 @@ func (p *Provider) login(ctx context.Context) error {
 	if env.Token == "" {
 		return errors.New("technitium: login response carried no token")
 	}
-	p.mu.Lock()
-	p.cr.token = secrets.Secret(env.Token)
-	p.mu.Unlock()
 	p.c.AddSecret(secrets.Secret(env.Token))
+	p.setToken(secrets.Secret(env.Token))
 	return nil
 }
 
 // call performs an authenticated API call, logging in first or again as needed.
 func (p *Provider) call(ctx context.Context, path string, form url.Values) (*envelope, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		p.mu.Lock()
-		tok := p.cr.token
-		p.mu.Unlock()
+		tok := p.getToken()
 		if tok == "" {
-			if err := p.login(ctx); err != nil {
+			if err := p.login(ctx, ""); err != nil {
 				return nil, err
 			}
-			p.mu.Lock()
-			tok = p.cr.token
-			p.mu.Unlock()
+			tok = p.getToken()
 		}
 		f := url.Values{"token": {tok.Reveal()}}
 		for k, v := range form {
@@ -187,9 +186,7 @@ func (p *Provider) call(ctx context.Context, path string, form url.Values) (*env
 			if p.fixed {
 				return nil, errors.New("technitium: the API token was rejected (invalid-token)")
 			}
-			p.mu.Lock()
-			p.cr.token = ""
-			p.mu.Unlock()
+			p.clearToken(tok)
 			continue
 		}
 		return env, err
@@ -427,8 +424,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return err
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
-func (p *Provider) String() string   { return "technitium.Provider" }
-func (p *Provider) GoString() string { return "technitium.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "technitium.Provider <redacted>" }
+func (p Provider) GoString() string           { return "technitium.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "technitium.Provider") }

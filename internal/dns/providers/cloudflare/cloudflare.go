@@ -55,19 +55,12 @@ type Config struct {
 	BaseURL string
 }
 
-// creds keeps the token off the Provider struct itself, so a dereferenced copy
-// of the provider cannot print it.
-type creds struct {
-	dns.Redacted
-	tok secrets.Secret
-}
-
 // Provider implements dns.Provider.
 type Provider struct {
-	c  *httpx.Client
-	cr *creds
+	c    *httpx.Client
+	auth func() http.Header // builds the Authorization header; the token lives only in this closure
 
-	mu    sync.Mutex
+	mu    *sync.Mutex
 	zones map[string]string // zone name -> id
 }
 
@@ -84,13 +77,13 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.APIToken == "" {
 		return nil, errors.New("cloudflare: config field \"api_token\" is required")
 	}
-	c.Secrets = []secrets.Secret{cfg.APIToken}
-	return &Provider{c: c, cr: &creds{tok: cfg.APIToken}, zones: map[string]string{}}, nil
+	c.AddSecret(cfg.APIToken)
+	tok := cfg.APIToken
+	return &Provider{c: c, auth: func() http.Header { return http.Header{"Authorization": {"Bearer " + tok.Reveal()}} },
+		zones: map[string]string{}, mu: &sync.Mutex{}}, nil
 }
 
-func (p *Provider) hdr() http.Header {
-	return http.Header{"Authorization": {"Bearer " + p.cr.tok.Reveal()}}
-}
+func (p *Provider) hdr() http.Header { return p.auth() }
 
 func (p *Provider) Type() string                   { return Type }
 func (p *Provider) Capabilities() dns.Capabilities { return staticCaps }
@@ -414,7 +407,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return nil
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider.
-func (p *Provider) String() string   { return "cloudflare.Provider" }
-func (p *Provider) GoString() string { return "cloudflare.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "cloudflare.Provider <redacted>" }
+func (p Provider) GoString() string           { return "cloudflare.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "cloudflare.Provider") }

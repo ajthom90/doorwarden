@@ -74,20 +74,14 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	c  *httpx.Client
-	cr *creds
+	c *httpx.Client
 
-	loginMu sync.Mutex // single-flight login: no concurrent sessions leak
-	mu      sync.Mutex
-}
-
-// creds keeps the password and session id off the Provider struct itself, so a
-// dereferenced copy of the provider cannot print them. sid is guarded by
-// Provider.mu.
-type creds struct {
-	dns.Redacted
-	password secrets.Secret
-	sid      secrets.Secret
+	// credentials are reachable only through these closures
+	password func() secrets.Secret
+	getSID   func() secrets.Secret
+	setSID   func(secrets.Secret)
+	clearSID func(stale secrets.Secret)
+	loginMu  *sync.Mutex // single-flight login: no concurrent sessions leak
 }
 
 // New validates cfg and builds a provider.
@@ -102,8 +96,9 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pihole: %w", err)
 	}
-	c.Secrets = []secrets.Secret{cfg.Password}
-	return &Provider{c: c, cr: &creds{password: cfg.Password}}, nil
+	c.AddSecret(cfg.Password)
+	get, set, clr := dns.SecretCell("")
+	return &Provider{c: c, password: dns.StaticSecret(cfg.Password), getSID: get, setSID: set, clearSID: clr, loginMu: &sync.Mutex{}}, nil
 }
 
 func (p *Provider) Type() string                   { return Type }
@@ -122,18 +117,12 @@ func (p *Provider) mapErr(op string, err error) error {
 	return fmt.Errorf("pihole: %s: %w", op, err)
 }
 
-func (p *Provider) currentSID() secrets.Secret {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.cr.sid
-}
-
 // login establishes a session unless another goroutine already did while we
 // waited (stale is the session id the caller found invalid, or empty).
 func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
 	p.loginMu.Lock()
 	defer p.loginMu.Unlock()
-	if cur := p.currentSID(); cur != "" && cur != stale {
+	if cur := p.getSID(); cur != "" && cur != stale {
 		return nil
 	}
 	var out struct {
@@ -143,15 +132,13 @@ func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
 			Message string `json:"message"`
 		} `json:"session"`
 	}
-	if _, err := p.c.Do(ctx, "POST", "/api/auth", nil, nil, map[string]string{"password": p.cr.password.Reveal()}, &out); err != nil {
+	if _, err := p.c.Do(ctx, "POST", "/api/auth", nil, nil, map[string]string{"password": p.password().Reveal()}, &out); err != nil {
 		return p.mapErr("login", err)
 	}
 	if !out.Session.Valid || out.Session.SID == "" {
 		return errors.New("pihole: login failed: password rejected or two-factor authentication is enabled (use an application password)")
 	}
-	p.mu.Lock()
-	p.cr.sid = secrets.Secret(out.Session.SID)
-	p.mu.Unlock()
+	p.setSID(secrets.Secret(out.Session.SID))
 	p.c.AddSecret(secrets.Secret(out.Session.SID))
 	return nil
 }
@@ -159,21 +146,17 @@ func (p *Provider) login(ctx context.Context, stale secrets.Secret) error {
 // do performs an authenticated call, logging in on demand and once more on 401.
 func (p *Provider) do(ctx context.Context, op, method, path string, body, out any) error {
 	for attempt := 0; ; attempt++ {
-		sid := p.currentSID()
+		sid := p.getSID()
 		if sid == "" {
 			if err := p.login(ctx, ""); err != nil {
 				return err
 			}
-			sid = p.currentSID()
+			sid = p.getSID()
 		}
 		_, err := p.c.Do(ctx, method, path, nil, http.Header{"X-Ftl-Sid": {sid.Reveal()}}, body, out)
 		var se *httpx.StatusError
 		if errors.As(err, &se) && se.Status == 401 && attempt == 0 {
-			p.mu.Lock()
-			if p.cr.sid == sid {
-				p.cr.sid = ""
-			}
-			p.mu.Unlock()
+			p.clearSID(sid)
 			continue
 		}
 		if err != nil {
@@ -195,10 +178,8 @@ var _ io.Closer = (*Provider)(nil)
 // hook, so whoever owns the Provider should call it when it implements
 // io.Closer (Pi-hole limits concurrent sessions).
 func (p *Provider) Close() error {
-	p.mu.Lock()
-	sid := p.cr.sid
-	p.cr.sid = ""
-	p.mu.Unlock()
+	sid := p.getSID()
+	p.clearSID(sid)
 	if sid == "" {
 		return nil
 	}
@@ -477,8 +458,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return nil
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
-func (p *Provider) String() string   { return "pihole.Provider" }
-func (p *Provider) GoString() string { return "pihole.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "pihole.Provider <redacted>" }
+func (p Provider) GoString() string           { return "pihole.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "pihole.Provider") }

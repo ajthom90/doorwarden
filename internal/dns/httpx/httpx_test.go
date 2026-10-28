@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/dns/httpx"
-	"github.com/ajthom90/doorwarden/internal/secrets"
 )
 
 func TestSizeLimit(t *testing.T) {
@@ -33,7 +32,7 @@ func TestStatusErrorScrubbed(t *testing.T) {
 	}))
 	defer srv.Close()
 	c, _ := httpx.New(srv.URL, false, 0)
-	c.Secrets = []secrets.Secret{"hunter2"}
+	c.AddSecret("hunter2")
 	_, err := c.Do(context.Background(), "GET", "/", nil, nil, nil, nil)
 	var se *httpx.StatusError
 	if !errors.As(err, &se) || strings.Contains(err.Error(), "hunter2") {

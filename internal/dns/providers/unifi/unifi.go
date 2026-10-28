@@ -79,20 +79,13 @@ type Config struct {
 	AllowInsecureHTTP  bool
 }
 
-// creds keeps the API key off the Provider struct itself, so a dereferenced
-// copy of the provider cannot print it.
-type creds struct {
-	dns.Redacted
-	key secrets.Secret
-}
-
 // Provider implements dns.Provider.
 type Provider struct {
 	c        *httpx.Client
-	cr       *creds
+	auth     func() http.Header // builds the X-API-KEY header; the key lives only in this closure
 	wildcard bool
 
-	mu     sync.Mutex
+	mu     *sync.Mutex
 	siteID string
 }
 
@@ -108,11 +101,13 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unifi: %w", err)
 	}
-	c.Secrets = []secrets.Secret{cfg.APIKey}
-	return &Provider{c: c, cr: &creds{key: cfg.APIKey}, wildcard: cfg.Wildcard, siteID: cfg.SiteID}, nil
+	c.AddSecret(cfg.APIKey)
+	key := cfg.APIKey
+	return &Provider{c: c, auth: func() http.Header { return http.Header{"X-Api-Key": {key.Reveal()}} },
+		wildcard: cfg.Wildcard, siteID: cfg.SiteID, mu: &sync.Mutex{}}, nil
 }
 
-func (p *Provider) hdr() http.Header { return http.Header{"X-Api-Key": {p.cr.key.Reveal()}} }
+func (p *Provider) hdr() http.Header { return p.auth() }
 
 func (p *Provider) Type() string { return Type }
 
@@ -458,8 +453,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	return nil
 }
 
-// String and GoString keep credentials out of any formatted output of the
-// provider (unexported struct fields are printed raw by fmt, bypassing the
-// redaction of secrets.Secret).
-func (p *Provider) String() string   { return "unifi.Provider" }
-func (p *Provider) GoString() string { return "unifi.Provider" }
+// String, GoString and Format print only the type: a Provider holds no
+// secret-bearing value (credentials live in closures, see dns.RedactedFormat),
+// and these methods keep a copy of the struct from being dumped field by field.
+func (p Provider) String() string             { return "unifi.Provider <redacted>" }
+func (p Provider) GoString() string           { return "unifi.Provider <redacted>" }
+func (p Provider) Format(f fmt.State, _ rune) { dns.RedactedFormat(f, "unifi.Provider") }
