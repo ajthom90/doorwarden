@@ -26,6 +26,9 @@ type OwnershipStore interface {
 	AddOwnedRecord(ctx context.Context, r store.DNSRecord) error
 	ListOwnedRecords(ctx context.Context, provider, zone string) ([]store.DNSRecord, error)
 	DeleteOwnedRecord(ctx context.Context, provider, zone, name, typ string) error
+	// SetOwnedRemoval sets or clears removed_after of the row, only if its
+	// owner key equals owner (store.ErrOwnedRecordNotFound otherwise).
+	SetOwnedRemoval(ctx context.Context, provider, zone, name, typ, owner string, at *time.Time) error
 }
 
 // ActivitySink receives user-visible activity entries (*store.Store
@@ -73,7 +76,8 @@ type DNSExecutorConfig struct {
 
 type dnsZone struct{ name, provider, mode string }
 
-// DNSExecutor applies DNSEnsure and DNSDelete actions. It only ever updates
+// DNSExecutor applies DNSEnsure, DNSDelete, DNSScheduleRemoval and
+// DNSCancelRemoval actions. It only ever updates
 // or deletes provider records that have an ownership row whose owner key
 // equals the action's Owner, and it only creates a record after its own
 // listing of the zone showed that nothing else holds the name.
@@ -109,7 +113,15 @@ type dnsZone struct{ name, provider, mode string }
 // (owner key "zone:...", or a "*." name) is never deleted: such an action is
 // refused with ErrDNSRefused (Action has no Force flag; a later UI path must
 // use its own call). dns.ErrNotFound or nil from the provider forgets the
-// row; any other error keeps it.
+// row; any other error keeps it (the row, still past its RemovedAfter, makes
+// the next Plan emit the DNSDelete again).
+//
+// DNSScheduleRemoval / DNSCancelRemoval: no provider call. The row for
+// (provider, zone, name, type) gets RemovedAfter = Action.RemovedAfter
+// (required for schedule) or nil, only if its owner key equals
+// Action.Owner (store.SetOwnedRemoval). No such row (gone, or owned by
+// another key) is a no-op. The wildcard record is refused with
+// ErrDNSRefused, like its delete.
 //
 // Every action must name a zone configured with records mode wildcard or
 // per-host, that zone's records provider, and a record name equal to the
@@ -222,15 +234,15 @@ type dnsBatch struct {
 	listings map[string]*listing
 }
 
-// Apply implements Executor; kinds other than DNSEnsure and DNSDelete are
-// ignored.
+// Apply implements Executor; kinds other than DNSEnsure, DNSDelete,
+// DNSScheduleRemoval and DNSCancelRemoval are ignored.
 func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	b := &dnsBatch{e: e, listings: map[string]*listing{}}
 	var errs []error
 	for _, a := range actions {
-		if a.Kind != DNSEnsure && a.Kind != DNSDelete {
+		if !isDNSKind(a.Kind) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -245,6 +257,16 @@ func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) 
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func isDNSKind(k ActionKind) bool {
+	return k == DNSEnsure || k == DNSDelete || k == DNSScheduleRemoval || k == DNSCancelRemoval
+}
+
+// isWildcardTarget reports whether t is the zone's wildcard record (or names
+// a "zone:" owner), which is never deleted or scheduled automatically.
+func isWildcardTarget(t dnsTarget) bool {
+	return strings.HasPrefix(strings.ToLower(t.owner), "zone:") || strings.HasPrefix(t.name, "*.")
 }
 
 // describe renders "<provider>/<zone> <name> <type>" for error prefixes.
@@ -301,8 +323,11 @@ func (b *dnsBatch) apply(ctx context.Context, a Action) error {
 		b.e.activity(ctx, "warn", fmt.Sprintf("refused %s %s: %v", a.Kind, describe(a), err))
 		return err
 	}
-	if a.Kind == DNSDelete {
+	switch a.Kind {
+	case DNSDelete:
 		return b.delete(ctx, t)
+	case DNSScheduleRemoval, DNSCancelRemoval:
+		return b.setRemoval(ctx, t, a)
 	}
 	return b.ensure(ctx, t)
 }
@@ -598,8 +623,43 @@ func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record
 	return fmt.Errorf("%s: %w", msg, perr)
 }
 
+// setRemoval persists (DNSScheduleRemoval) or clears (DNSCancelRemoval) the
+// owned row's RemovedAfter, owner-guarded, without any provider call.
+func (b *dnsBatch) setRemoval(ctx context.Context, t dnsTarget, a Action) error {
+	if isWildcardTarget(t) {
+		b.e.activity(ctx, "warn", fmt.Sprintf("refused %s for %s at %s/%s: the wildcard record is never removed automatically",
+			a.Kind, t, t.provider, t.zone))
+		return fmt.Errorf("%w: the wildcard record is never removed automatically", ErrDNSRefused)
+	}
+	var at *time.Time
+	if a.Kind == DNSScheduleRemoval {
+		if a.RemovedAfter == nil {
+			return fmt.Errorf("%w: DNSScheduleRemoval without RemovedAfter", ErrDNSRefused)
+		}
+		v := *a.RemovedAfter
+		at = &v
+	}
+	err := b.e.st.SetOwnedRemoval(ctx, t.provider, t.zone, t.name, t.typ, t.owner, at)
+	if errors.Is(err, store.ErrOwnedRecordNotFound) {
+		b.e.log.InfoContext(ctx, "no ownership row for this owner; nothing to (un)schedule", "kind", string(a.Kind),
+			"provider", t.provider, "zone", t.zone, "name", t.name, "type", t.typ, "owner", t.owner)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if at != nil {
+		b.e.activity(ctx, "info", fmt.Sprintf("scheduled removal of %s at %s/%s (owner %s) after %s: %s",
+			t, t.provider, t.zone, t.owner, at.UTC().Format(time.RFC3339), a.Reason))
+	} else {
+		b.e.activity(ctx, "info", fmt.Sprintf("cancelled the scheduled removal of %s at %s/%s (owner %s): %s",
+			t, t.provider, t.zone, t.owner, a.Reason))
+	}
+	return nil
+}
+
 func (b *dnsBatch) delete(ctx context.Context, t dnsTarget) error {
-	if strings.HasPrefix(strings.ToLower(t.owner), "zone:") || strings.HasPrefix(t.name, "*.") {
+	if isWildcardTarget(t) {
 		b.e.activity(ctx, "warn", fmt.Sprintf("refused to delete %s at %s/%s: the wildcard record is never deleted automatically",
 			t, t.provider, t.zone))
 		return fmt.Errorf("%w: the wildcard record is never deleted automatically", ErrDNSRefused)
@@ -681,8 +741,17 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 	}
 	var msg string
 	switch {
-	case a.Kind == DNSDelete && (strings.HasPrefix(strings.ToLower(t.owner), "zone:") || strings.HasPrefix(t.name, "*.")):
-		msg = fmt.Sprintf("dry run: would refuse to delete wildcard record %s at %s", t, where)
+	case (a.Kind == DNSDelete || a.Kind == DNSScheduleRemoval || a.Kind == DNSCancelRemoval) && isWildcardTarget(t):
+		msg = fmt.Sprintf("dry run: would refuse %s of wildcard record %s at %s", a.Kind, t, where)
+	case (a.Kind == DNSScheduleRemoval || a.Kind == DNSCancelRemoval) && (row == nil || row.OwnerKey != t.owner):
+		msg = fmt.Sprintf("dry run: nothing to change for %s %s at %s (no row owned by %s)", a.Kind, t, where, t.owner)
+	case a.Kind == DNSScheduleRemoval && a.RemovedAfter == nil:
+		msg = fmt.Sprintf("dry run: would refuse %s %s at %s: no RemovedAfter", a.Kind, t, where)
+	case a.Kind == DNSScheduleRemoval:
+		msg = fmt.Sprintf("dry run: would schedule removal of %s %s at %s (owner %s) after %s", t, row.Value, where, t.owner,
+			a.RemovedAfter.UTC().Format(time.RFC3339))
+	case a.Kind == DNSCancelRemoval:
+		msg = fmt.Sprintf("dry run: would cancel the scheduled removal of %s at %s (owner %s)", t, where, t.owner)
 	case a.Kind == DNSDelete && row == nil:
 		msg = fmt.Sprintf("dry run: nothing to delete for %s at %s (not owned)", t, where)
 	case a.Kind == DNSDelete && row.OwnerKey != t.owner:

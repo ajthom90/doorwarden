@@ -30,18 +30,27 @@ const (
 	// ScheduleRemoval: a previously published service is gone; the caller
 	// must persist Action.RemovedAfter for it.
 	ScheduleRemoval ActionKind = "ScheduleRemoval"
-	DNSEnsure       ActionKind = "DNSEnsure"
-	CertEnsure      ActionKind = "CertEnsure"
-	RouteWrite      ActionKind = "RouteWrite"
-	RouteRemove     ActionKind = "RouteRemove"
-	DNSDelete       ActionKind = "DNSDelete"
+	// DNSCancelRemoval: an owned per-host record with a scheduled removal is
+	// wanted again; the DNS executor clears the ownership row's
+	// RemovedAfter (owner-guarded, no provider call).
+	DNSCancelRemoval ActionKind = "DNSCancelRemoval"
+	// DNSScheduleRemoval: an owned per-host record is an orphan; the DNS
+	// executor persists Action.RemovedAfter on its ownership row
+	// (owner-guarded, no provider call). DNSDelete follows once now is after
+	// it.
+	DNSScheduleRemoval ActionKind = "DNSScheduleRemoval"
+	DNSEnsure          ActionKind = "DNSEnsure"
+	CertEnsure         ActionKind = "CertEnsure"
+	RouteWrite         ActionKind = "RouteWrite"
+	RouteRemove        ActionKind = "RouteRemove"
+	DNSDelete          ActionKind = "DNSDelete"
 )
 
 // KindOrder is the order Plan emits kinds in: reports first, then
 // bookkeeping, then creations (DNS and certs before the routes that use
 // them), then removals (route before its DNS record).
 var KindOrder = []ActionKind{Invalid, Conflict, Skip, CancelRemoval, ScheduleRemoval,
-	DNSEnsure, CertEnsure, RouteWrite, RouteRemove, DNSDelete}
+	DNSCancelRemoval, DNSScheduleRemoval, DNSEnsure, CertEnsure, RouteWrite, RouteRemove, DNSDelete}
 
 // Informational reports whether k only reports and changes nothing.
 func Informational(k ActionKind) bool { return k == Invalid || k == Conflict || k == Skip }
@@ -66,7 +75,8 @@ type Action struct {
 	// Provider is the records provider config key (zones[].records.provider).
 	Provider string
 	// Record is the desired record for DNSEnsure (ID set to the owned
-	// record's provider ID when updating) or the owned record for DNSDelete.
+	// record's provider ID when updating) or the stored owned record for
+	// DNSDelete, DNSScheduleRemoval and DNSCancelRemoval.
 	Record *dns.Record
 	// Owner is the ownership owner_key the DNS executor must store/match:
 	// the service key for per-host records, WildcardOwnerKey(zone) for the
@@ -75,7 +85,7 @@ type Action struct {
 	// Names are the certificate names for CertEnsure; Issuer its issuer key.
 	Names  []string
 	Issuer string
-	// RemovedAfter is set on ScheduleRemoval.
+	// RemovedAfter is set on ScheduleRemoval and DNSScheduleRemoval.
 	RemovedAfter *time.Time
 }
 

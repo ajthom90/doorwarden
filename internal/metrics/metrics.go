@@ -24,7 +24,7 @@ const other = "other"
 var (
 	serviceStates = []string{"discovered", "pending", "published", "conflict", "error", "stopped", "removed"}
 	reconcileRes  = []string{"ok", "error", "dry_run"}
-	actionKinds   = []string{"DNSEnsure", "DNSDelete", "CertEnsure", "RouteWrite", "RouteRemove", "Conflict", "Skip", "Invalid", "ScheduleRemoval", "CancelRemoval"}
+	actionKinds   = []string{"DNSEnsure", "DNSDelete", "CertEnsure", "RouteWrite", "RouteRemove", "Conflict", "Skip", "Invalid", "ScheduleRemoval", "CancelRemoval", "DNSScheduleRemoval", "DNSCancelRemoval"}
 	dnsOps        = []string{"ensure", "delete", "list"}
 	opResults     = []string{"ok", "error"}
 	renewResults  = []string{"ok", "error"}
