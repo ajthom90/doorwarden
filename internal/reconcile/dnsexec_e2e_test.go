@@ -38,8 +38,7 @@ func newWorld(t *testing.T, mode string) *world {
 		t.Fatal(err)
 	}
 	re := NewRouteExecutor(w.st, now)
-	m := NewMultiExecutor(nil).Handle(DNSEnsure, de).Handle(DNSDelete, de).
-		Handle(DNSScheduleRemoval, de).Handle(DNSCancelRemoval, de)
+	m := RegisterDNSExecutor(NewMultiExecutor(nil), de)
 	for _, k := range []ActionKind{RouteWrite, RouteRemove, ScheduleRemoval, CancelRemoval} {
 		m.Handle(k, re)
 	}

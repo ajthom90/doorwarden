@@ -38,7 +38,7 @@ func TestLabelSetsMatchRealConstants(t *testing.T) {
 	// added to the const block but not to KindOrder)
 	for _, k := range []reconcile.ActionKind{reconcile.Invalid, reconcile.Conflict, reconcile.Skip, reconcile.CancelRemoval,
 		reconcile.ScheduleRemoval, reconcile.DNSEnsure, reconcile.CertEnsure, reconcile.RouteWrite, reconcile.RouteRemove, reconcile.DNSDelete,
-		reconcile.DNSScheduleRemoval, reconcile.DNSCancelRemoval} {
+		reconcile.DNSScheduleRemoval, reconcile.DNSCancelRemoval, reconcile.DNSReassign} {
 		found := false
 		for _, o := range kinds {
 			found = found || o == string(k)

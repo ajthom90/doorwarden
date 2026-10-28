@@ -125,7 +125,7 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 		}
 	}
 	p.planRemovals(present, losers)
-	p.planOrphans(entries)
+	p.planOrphans(entries, winners)
 
 	sortActions(p.out)
 	return p.out, winners

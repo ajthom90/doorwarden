@@ -12,6 +12,7 @@ import (
 
 	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/dns"
+	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/store"
 )
 
@@ -31,6 +32,10 @@ type OwnershipStore interface {
 	// SetOwnedRemoval sets or clears removed_after of the row, only if its
 	// owner key equals owner (store.ErrOwnedRecordNotFound otherwise).
 	SetOwnedRemoval(ctx context.Context, provider, zone, name, typ, owner string, at *time.Time) error
+	// ReassignOwnedRecord moves the row from oldOwner to newOwner and clears
+	// its removed_after (store.ErrOwnedRecordNotFound when oldOwner does not
+	// own it).
+	ReassignOwnedRecord(ctx context.Context, provider, zone, name, typ, oldOwner, newOwner string) error
 }
 
 // ActivitySink receives user-visible activity entries (*store.Store
@@ -248,8 +253,7 @@ type dnsBatch struct {
 	listings map[string]*listing
 }
 
-// Apply implements Executor; kinds other than DNSEnsure, DNSDelete,
-// DNSScheduleRemoval and DNSCancelRemoval are ignored.
+// Apply implements Executor; kinds not in DNSActionKinds are ignored.
 func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -273,8 +277,27 @@ func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) 
 	return errors.Join(errs...)
 }
 
+// DNSActionKinds are every kind the DNS executor applies. Register the DNS
+// executor for all of them (RegisterDNSExecutor); a missing one makes
+// MultiExecutor fail that batch with ErrNoExecutor.
+var DNSActionKinds = []ActionKind{DNSEnsure, DNSDelete, DNSScheduleRemoval, DNSCancelRemoval, DNSReassign}
+
+// RegisterDNSExecutor registers e for every kind in DNSActionKinds and
+// returns m.
+func RegisterDNSExecutor(m *MultiExecutor, e Executor) *MultiExecutor {
+	for _, k := range DNSActionKinds {
+		m.Handle(k, e)
+	}
+	return m
+}
+
 func isDNSKind(k ActionKind) bool {
-	return k == DNSEnsure || k == DNSDelete || k == DNSScheduleRemoval || k == DNSCancelRemoval
+	for _, d := range DNSActionKinds {
+		if k == d {
+			return true
+		}
+	}
+	return false
 }
 
 // isWildcardTarget reports whether t is the zone's wildcard record (or names
@@ -342,6 +365,8 @@ func (b *dnsBatch) apply(ctx context.Context, a Action) error {
 		return b.delete(ctx, t, a)
 	case DNSScheduleRemoval, DNSCancelRemoval:
 		return b.setRemoval(ctx, t, a)
+	case DNSReassign:
+		return b.reassign(ctx, t, a)
 	}
 	return b.ensure(ctx, t)
 }
@@ -684,6 +709,70 @@ func (b *dnsBatch) setRemoval(ctx context.Context, t dnsTarget, a Action) error 
 	return nil
 }
 
+// reassignRefusal returns why a DNSReassign must be refused outright, or "".
+func reassignRefusal(t dnsTarget, a Action) string {
+	no := strings.TrimSpace(a.NewOwner)
+	switch {
+	case isWildcardTarget(t):
+		return "the wildcard record's owner never changes"
+	case no == "" || no != a.NewOwner:
+		return "no valid new owner key"
+	case strings.HasPrefix(strings.ToLower(no), "zone:"):
+		return "a zone owner key may own only the wildcard record"
+	case no == t.owner:
+		return "new owner equals the current owner"
+	case a.Svc == nil || a.Svc.Key != no:
+		return "the action does not carry the new owner's service"
+	case a.Svc.State != model.StatePublished:
+		return "the new owner is not Published"
+	case t.value == "":
+		return "the action names no stored value"
+	}
+	return ""
+}
+
+// reassign transfers t's ownership row from t.owner to a.NewOwner (no
+// provider call), only if the row still has the owner and value the plan
+// saw.
+func (b *dnsBatch) reassign(ctx context.Context, t dnsTarget, a Action) error {
+	if why := reassignRefusal(t, a); why != "" {
+		b.e.activity(ctx, "warn", fmt.Sprintf("refused to reassign %s at %s/%s from %s to %q: %s", t, t.provider, t.zone, t.owner, a.NewOwner, why))
+		return fmt.Errorf("%w: %s", ErrDNSRefused, why)
+	}
+	row, err := b.e.ownedRow(ctx, t)
+	if err != nil {
+		return err
+	}
+	if why := reassignStale(row, t); why != "" {
+		b.e.log.InfoContext(ctx, "not reassigning: the stored row changed since the plan", "provider", t.provider, "zone", t.zone,
+			"name", t.name, "type", t.typ, "owner", t.owner, "new_owner", a.NewOwner, "why", why)
+		return nil
+	}
+	err = b.e.st.ReassignOwnedRecord(ctx, t.provider, t.zone, t.name, t.typ, t.owner, a.NewOwner)
+	if errors.Is(err, store.ErrOwnedRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	b.e.activity(ctx, "info", fmt.Sprintf("reassigned %s %s at %s/%s from %s to %s (record unchanged): %s",
+		t, row.Value, t.provider, t.zone, t.owner, a.NewOwner, a.Reason))
+	return nil
+}
+
+// reassignStale returns why a DNSReassign no longer matches row, or "".
+func reassignStale(row *store.DNSRecord, t dnsTarget) string {
+	switch {
+	case row == nil:
+		return "no ownership row"
+	case row.OwnerKey != t.owner:
+		return "owned by " + row.OwnerKey
+	case !sameValue(row.Value, t.value):
+		return "value is now " + row.Value
+	}
+	return ""
+}
+
 // removalStale returns why a DNSScheduleRemoval/DNSCancelRemoval no longer
 // matches the stored row (row nil when there is none), or "" when it does.
 func removalStale(row *store.DNSRecord, t dnsTarget, k ActionKind) string {
@@ -835,6 +924,12 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 	}
 	var msg string
 	switch {
+	case a.Kind == DNSReassign && reassignRefusal(t, a) != "":
+		msg = fmt.Sprintf("dry run: would refuse to reassign %s at %s: %s", t, where, reassignRefusal(t, a))
+	case a.Kind == DNSReassign && reassignStale(row, t) != "":
+		msg = fmt.Sprintf("dry run: nothing to reassign for %s at %s (%s)", t, where, reassignStale(row, t))
+	case a.Kind == DNSReassign:
+		msg = fmt.Sprintf("dry run: would reassign %s %s at %s from %s to %s (no provider change)", t, row.Value, where, t.owner, a.NewOwner)
 	case (a.Kind == DNSDelete || a.Kind == DNSScheduleRemoval || a.Kind == DNSCancelRemoval) && isWildcardTarget(t):
 		msg = fmt.Sprintf("dry run: would refuse %s of wildcard record %s at %s", a.Kind, t, where)
 	case (a.Kind == DNSScheduleRemoval || a.Kind == DNSCancelRemoval) && (row == nil || row.OwnerKey != t.owner):

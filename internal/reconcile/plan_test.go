@@ -478,17 +478,25 @@ func TestPlanRemovalGraceDefaultsWhenUnset(t *testing.T) {
 // until it is removed; the winner then creates its own (one cycle later).
 func TestPlanRemovalSkipsDNSDeleteWhenHostnameTakenOver(t *testing.T) {
 	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
-	obs := Observed{
-		Owned: []store.DNSRecord{owned("example.test", "app.example.test", "A", target, "docker:old")},
-		Known: knownMap(known("docker:old", "example.test", "app.example.test", tp(t0.Add(-time.Hour)))),
-	}
-	got := Plan([]model.Service{pub("docker:new", "app", "example.test", 80)}, obs, cfg, t0)
-	assertNone(t, got, DNSDelete, DNSEnsure)
-	if s := ofKind(got, DNSScheduleRemoval); len(s) != 1 || s[0].Owner != "docker:old" || !s[0].RemovedAfter.Equal(t0.Add(-time.Hour)) {
-		t.Fatalf("got %v", sums(got))
-	}
-	if len(ofKind(got, RouteRemove)) != 1 || len(ofKind(got, RouteWrite)) != 1 {
-		t.Fatalf("got %v", sums(got))
+	for _, val := range []string{target, "192.0.2.99"} {
+		obs := Observed{
+			Owned: []store.DNSRecord{owned("example.test", "app.example.test", "A", val, "docker:old")},
+			Known: knownMap(known("docker:old", "example.test", "app.example.test", tp(t0.Add(-time.Hour)))),
+		}
+		got := Plan([]model.Service{pub("docker:new", "app", "example.test", 80)}, obs, cfg, t0)
+		assertNone(t, got, DNSDelete, DNSEnsure)
+		if val == target {
+			// the winner wants exactly this record: ownership moves, no DNS gap
+			if r := reassigns(got); len(r) != 1 || r[0] != "app.example.test A docker:old->docker:new" {
+				t.Fatalf("got %v", sums(got))
+			}
+			assertNone(t, got, DNSScheduleRemoval)
+		} else if s := ofKind(got, DNSScheduleRemoval); len(s) != 1 || s[0].Owner != "docker:old" || !s[0].RemovedAfter.Equal(t0.Add(-time.Hour)) {
+			t.Fatalf("got %v", sums(got))
+		}
+		if len(ofKind(got, RouteRemove)) != 1 || len(ofKind(got, RouteWrite)) != 1 {
+			t.Fatalf("got %v", sums(got))
+		}
 	}
 }
 

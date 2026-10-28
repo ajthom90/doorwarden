@@ -15,6 +15,8 @@ import (
 // orphanKinds are the DNS removal-lifecycle kinds the orphan rule emits.
 var orphanKinds = []ActionKind{DNSScheduleRemoval, DNSCancelRemoval, DNSDelete}
 
+// (DNSReassign is checked separately, with reassigns.)
+
 func orphanActs(as []Action) []string {
 	var out []string
 	for _, a := range as {
@@ -300,24 +302,32 @@ func TestOrphanHostnameConflicts(t *testing.T) {
 		assertOrphans(t, got)
 		assertNone(t, got, DNSEnsure)
 	})
-	t.Run("loser renamed away: orphan", func(t *testing.T) {
+	t.Run("loser renamed away: the winner takes the record over", func(t *testing.T) {
 		obs := Observed{Foreign: listed("example.test"), Owned: rows}
 		got := Plan([]model.Service{winner, pub("docker:b", "web", "example.test", 81)}, obs, phCfg(), t0)
-		assertOrphans(t, got, "DNSScheduleRemoval example.test app.example.test docker:b [app.example.test A 192.0.2.10]")
+		assertOrphans(t, got)
+		if r := reassigns(got); len(r) != 1 || r[0] != "app.example.test A docker:b->static:a" {
+			t.Fatalf("plan %v", sums(got))
+		}
 		if e := ofKind(got, DNSEnsure); len(e) != 1 || e[0].Record.Name != "web.example.test" {
 			t.Fatalf("plan %v", sums(got))
 		}
 	})
-	t.Run("absent loser taken over: orphan, winner gets no DNSEnsure for the same row", func(t *testing.T) {
+	t.Run("absent loser taken over: same value reassigned, other value an orphan; never a DNSEnsure for the row", func(t *testing.T) {
 		for _, val := range []string{target, "192.0.2.99"} {
 			r := []store.DNSRecord{owned("example.test", "app.example.test", "A", val, "docker:b")}
 			obs := Observed{Foreign: listed("example.test"), Owned: r,
 				Known: knownMap(known("docker:b", "example.test", "app.example.test", nil))}
 			got := Plan([]model.Service{pub("docker:a", "app", "example.test", 80)}, obs, phCfg(), t0)
-			if len(ofKind(got, RouteRemove)) != 1 || len(ofKind(got, DNSScheduleRemoval)) != 1 {
+			want := DNSScheduleRemoval
+			if val == target {
+				want = DNSReassign
+			}
+			if len(ofKind(got, RouteRemove)) != 1 || len(ofKind(got, want)) != 1 {
 				t.Fatalf("plan %v", sums(got))
 			}
 			assertNone(t, got, DNSEnsure)
+			checkRowOnce(t, got)
 		}
 	})
 }

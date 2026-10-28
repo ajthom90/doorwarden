@@ -123,10 +123,27 @@ func (p *planner) ownerSourceUnknown(owner string, ev map[string]map[string]bool
 	return false
 }
 
+// reassignTarget returns the present owner an orphan row (owner no longer
+// wants it) is handed over to, or nil: the hostname's winner, when it is a
+// present, cleanly Published service other than owner that wants exactly
+// this row (same provider, zone, name and type) and the stored value equals
+// the zone's desired value. A loser that also wants the row never gets it.
+func reassignTarget(owners map[string]*ownerWants, winners map[string]claimant, owner, name, rk, value string, z *zoneInfo) *ownerWants {
+	w, ok := winners[name]
+	if !ok || w.key == owner || w.phantom || !w.published || !w.routable {
+		return nil
+	}
+	to := owners[w.key]
+	if to == nil || to.protected || !to.wants[rk] || to.svc.State != model.StatePublished || !sameValue(value, z.value) {
+		return nil
+	}
+	return to
+}
+
 // planOrphans is the single DNS deletion path: it schedules, cancels and
 // executes the removal of owned per-host records whose owner no longer
 // wants them (see the package documentation, "Orphan DNS records").
-func (p *planner) planOrphans(entries []entry) {
+func (p *planner) planOrphans(entries []entry, winners map[string]claimant) {
 	owners := p.presentOwners(entries)
 	ev := p.sourceEvidence(entries)
 	ensured := map[string]bool{}
@@ -193,6 +210,14 @@ func (p *planner) planOrphans(entries []entry) {
 		}
 		if z.mode == "wildcard" && !wildcardOwned[zn] {
 			continue // (d) leftover per-host rows wait until the wildcard record exists
+		}
+		if to := reassignTarget(owners, winners, owner, name, rk, o.Value, z); to != nil {
+			// the hostname's winner wants exactly this record: hand it over
+			// instead of deleting and re-creating it (no DNS gap)
+			base.Kind, base.Key, base.Svc, base.NewOwner = DNSReassign, to.svc.Key, copySvc(to.svc), to.svc.Key
+			base.Reason = fmt.Sprintf("%s no longer wants this record and %s serves %s with the same value", owner, to.svc.Key, name)
+			p.emit(base)
+			continue
 		}
 		var reason string
 		deadline := p.now.Add(p.grace)

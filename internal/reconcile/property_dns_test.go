@@ -112,7 +112,7 @@ func propWanted(c dnsPropCase, s model.Service, o store.DNSRecord) bool {
 }
 
 func TestPropertyDNSOrphanInvariants(t *testing.T) {
-	var scheduled, deleted, cancelled, completeChecked int
+	var scheduled, deleted, cancelled, reassigned, completeChecked int
 	for seed := int64(0); seed < dnsPropSeeds; seed++ {
 		r := rand.New(rand.NewSource(seed))
 		c := genDNSProp(r)
@@ -137,10 +137,13 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 		checkNoEnsureAndRemoval(t, acts)
 		got := map[string]ActionKind{}
 		for _, a := range acts {
-			if a.Kind != DNSScheduleRemoval && a.Kind != DNSDelete && a.Kind != DNSCancelRemoval {
+			if a.Kind != DNSScheduleRemoval && a.Kind != DNSDelete && a.Kind != DNSCancelRemoval && a.Kind != DNSReassign {
 				continue
 			}
 			o := rowOf(a)
+			if prev, dup := got[o.Zone+" "+o.Name+" "+o.Type]; dup {
+				fail("two lifecycle actions for one row: %s and %s", prev, sum(a))
+			}
 			got[o.Zone+" "+o.Name+" "+o.Type] = a.Kind
 			if a.Owner != o.OwnerKey || a.Record.ID != o.ProviderRecordID || a.Record.Value != o.Value {
 				fail("%s does not carry the stored row: %s", a.Kind, sum(a))
@@ -162,6 +165,19 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 			}
 			if wanted {
 				fail("%s for a wanted row", a.Kind)
+			}
+			if a.Kind == DNSReassign {
+				reassigned++
+				ns, ok := present[a.NewOwner]
+				if !ok || a.NewOwner == o.OwnerKey || a.Key != a.NewOwner || a.Svc == nil || a.Svc.Key != a.NewOwner {
+					fail("reassign to an absent or inconsistent new owner: %s", sum(a))
+				}
+				if !propWanted(c, ns, o) || ns.State != model.StatePublished || c.unavailable[ns.Source] {
+					fail("reassign to a new owner that does not want the row: %s", sum(a))
+				}
+				if ns.Zone == "example.test" && c.cfg.Zones[0].TargetIP != o.Value {
+					fail("reassign with a value the new owner does not want: %s", sum(a))
+				}
 			}
 			if isPresent && (s.State != model.StatePublished || s.Backend.Port == 0 || len(s.Options.Middlewares) > 0 || s.Zone == "missing.test") {
 				fail("%s for a present non-Published or invalid owner", a.Kind)
@@ -197,7 +213,8 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 		}
 		// Completeness: every wanted scheduled row is cancelled, and a plain
 		// orphan (absent owner, no outage at all, per-host zone, our
-		// provider) is scheduled or deleted on time.
+		// provider) is scheduled or deleted on time, or reassigned when a
+		// present service wants exactly that row.
 		for _, o := range c.obs.Owned {
 			k := o.Zone + " " + o.Name + " " + o.Type
 			s, isPresent := present[o.OwnerKey]
@@ -210,6 +227,9 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 				continue
 			}
 			completeChecked++
+			if got[k] == DNSReassign {
+				continue // checked above: the new owner wants the row
+			}
 			switch {
 			case o.RemovedAfter == nil && got[k] != DNSScheduleRemoval:
 				fail("orphan %s not scheduled", k)
@@ -234,8 +254,8 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("scheduled %d, deleted %d, cancelled %d, complete-checked %d", scheduled, deleted, cancelled, completeChecked)
-	for n, v := range map[string]int{"scheduled": scheduled, "deleted": deleted, "cancelled": cancelled, "complete-checked": completeChecked} {
+	t.Logf("scheduled %d, deleted %d, cancelled %d, reassigned %d, complete-checked %d", scheduled, deleted, cancelled, reassigned, completeChecked)
+	for n, v := range map[string]int{"scheduled": scheduled, "deleted": deleted, "cancelled": cancelled, "reassigned": reassigned, "complete-checked": completeChecked} {
 		if v == 0 {
 			t.Errorf("%s is 0: the check never ran", n)
 		}

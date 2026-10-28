@@ -39,18 +39,25 @@ const (
 	// (owner-guarded, no provider call). DNSDelete follows once now is after
 	// it.
 	DNSScheduleRemoval ActionKind = "DNSScheduleRemoval"
-	DNSEnsure          ActionKind = "DNSEnsure"
-	CertEnsure         ActionKind = "CertEnsure"
-	RouteWrite         ActionKind = "RouteWrite"
-	RouteRemove        ActionKind = "RouteRemove"
-	DNSDelete          ActionKind = "DNSDelete"
+	// DNSReassign: an owned per-host record whose owner no longer wants it is
+	// wanted, with exactly the stored value, by the present Published
+	// hostname winner Action.NewOwner: the DNS executor transfers the
+	// ownership row from Action.Owner to NewOwner and clears its
+	// RemovedAfter (owner-guarded, no provider call), so the record is never
+	// deleted and re-created.
+	DNSReassign ActionKind = "DNSReassign"
+	DNSEnsure   ActionKind = "DNSEnsure"
+	CertEnsure  ActionKind = "CertEnsure"
+	RouteWrite  ActionKind = "RouteWrite"
+	RouteRemove ActionKind = "RouteRemove"
+	DNSDelete   ActionKind = "DNSDelete"
 )
 
 // KindOrder is the order Plan emits kinds in: reports first, then
 // bookkeeping, then creations (DNS and certs before the routes that use
 // them), then removals (route before its DNS record).
 var KindOrder = []ActionKind{Invalid, Conflict, Skip, CancelRemoval, ScheduleRemoval,
-	DNSCancelRemoval, DNSScheduleRemoval, DNSEnsure, CertEnsure, RouteWrite, RouteRemove, DNSDelete}
+	DNSCancelRemoval, DNSScheduleRemoval, DNSReassign, DNSEnsure, CertEnsure, RouteWrite, RouteRemove, DNSDelete}
 
 // Informational reports whether k only reports and changes nothing.
 func Informational(k ActionKind) bool { return k == Invalid || k == Conflict || k == Skip }
@@ -76,12 +83,15 @@ type Action struct {
 	Provider string
 	// Record is the desired record for DNSEnsure (ID set to the owned
 	// record's provider ID when updating) or the stored owned record for
-	// DNSDelete, DNSScheduleRemoval and DNSCancelRemoval.
+	// DNSDelete, DNSScheduleRemoval, DNSCancelRemoval and DNSReassign.
 	Record *dns.Record
 	// Owner is the ownership owner_key the DNS executor must store/match:
 	// the service key for per-host records, WildcardOwnerKey(zone) for the
-	// wildcard record.
+	// wildcard record. For DNSReassign it is the current (old) owner.
 	Owner string
+	// NewOwner is the owner key a DNSReassign transfers the row to (the
+	// service key of Svc).
+	NewOwner string
 	// Names are the certificate names for CertEnsure; Issuer its issuer key.
 	Names  []string
 	Issuer string
