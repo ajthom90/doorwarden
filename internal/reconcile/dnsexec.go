@@ -157,6 +157,24 @@ type dnsZone struct{ name, provider, mode string }
 // types and zones are normalized (lowercase, no trailing dot; uppercase
 // type) before every provider and store call. TTL is passed through.
 //
+// dns.ErrUnconfirmed (the provider accepted a write, or may have applied
+// it, but could not confirm it): a CreateRecord answering it with a record
+// that names the target (same name and type) counts as created: the
+// ownership row is written from that record (its provider ID may be empty),
+// the action succeeds, a warn activity says "write accepted but
+// unconfirmed; will verify on a later cycle" and LastWarnings lists it; the
+// next cycles' drift check verifies the record exists (see Repair). This
+// holds for a plain create, a re-create, the create step of a replace and a
+// restore. An UpdateRecord answering it with such a record keeps the row's
+// OLD value (storing the returned provider ID, if any) so the next plan
+// repeats the update; the update is idempotent if it landed. Without a
+// usable record the outcome is ambiguous: the error is returned, no row is
+// written or changed, an error activity says so, and a replace does not
+// restore the old value (the new one may exist). A DeleteRecord answering
+// it keeps the ownership row and its schedule (the next plan deletes again);
+// a rollback delete answering it reports that the record may remain without
+// an owner.
+//
 // Each provider call runs under CallTimeout. A failing action does not stop
 // the batch; errors are joined, each prefixed with
 // "<kind> <provider>/<zone> <name> <type>". Cancellation of ctx stops the
@@ -179,7 +197,8 @@ type DNSExecutor struct {
 	now       func() time.Time
 	timeout   time.Duration
 
-	mu sync.Mutex // serializes Apply (the Runner already does)
+	mu       sync.Mutex // serializes Apply (the Runner already does)
+	warnings []DNSWarning
 }
 
 // NewDNSExecutor validates the configuration against the constructed
@@ -267,6 +286,9 @@ func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	b := &dnsBatch{e: e, listings: map[string]*listing{}}
+	if !dryRun {
+		e.warnings = nil
+	}
 	var errs []error
 	for _, a := range actions {
 		if !isDNSKind(a.Kind) {
@@ -434,6 +456,9 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 		b.forget(t, stored)
 		return b.create(ctx, t, row)
 	}
+	if errors.Is(err, dns.ErrUnconfirmed) {
+		return b.updateUnconfirmed(ctx, t, row, got, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -460,6 +485,34 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 		return fmt.Errorf("updated %s to %s (new provider id %q) but could not update its ownership row: %w", t, t.value, id, err)
 	}
 	b.e.activity(ctx, "info", fmt.Sprintf("updated %s at %s/%s: %s -> %s (owner %s, provider id %q)", t, t.provider, t.zone, row.Value, t.value, t.owner, id))
+	return nil
+}
+
+// updateUnconfirmed handles an UpdateRecord that answered
+// dns.ErrUnconfirmed. With a record naming t the row KEEPS its old value (its
+// provider ID becomes the returned one, when there is one), so the next plan
+// sees the value still differs and sends the same update again: idempotent
+// if it landed, completing it if it did not. Recording the new value instead
+// would hide an update that never landed (the value is then never checked
+// again). Without such a record nothing changes and the error is returned.
+func (b *dnsBatch) updateUnconfirmed(ctx context.Context, t dnsTarget, row *store.DNSRecord, got dns.Record, uerr error) error {
+	delete(b.listings, t.provider+"/"+t.zone) // which value is live is unknown
+	w, ok := unconfirmedRecord(t, got)
+	if !ok {
+		b.ambiguous(ctx, "update", t, t.value, uerr, fmt.Sprintf("the ownership row keeps value %s; the next cycle updates again", row.Value))
+		return uerr
+	}
+	if w.ID != "" && w.ID != row.ProviderRecordID {
+		nr := *row
+		nr.Zone, nr.Name, nr.Type, nr.ProviderRecordID = t.zone, t.name, t.typ, w.ID
+		if err := b.e.persist(ctx, nr); err != nil {
+			b.e.activity(ctx, "error", fmt.Sprintf("updating %s at %s/%s to %s is unconfirmed (new provider id %q) and its ownership row could not be updated: %v",
+				t, t.provider, t.zone, w.Value, w.ID, err))
+			return fmt.Errorf("unconfirmed update of %s (new provider id %q): ownership row not updated: %w", t, w.ID, err)
+		}
+	}
+	b.unconfirmed(ctx, "update", t, w, uerr, fmt.Sprintf("updating %s at %s/%s: %s -> %s (owner %s, provider id %q); the row keeps %s until a later cycle repeats the update",
+		t, t.provider, t.zone, row.Value, w.Value, t.owner, w.ID, row.Value))
 	return nil
 }
 
@@ -528,13 +581,24 @@ func (b *dnsBatch) replace(ctx context.Context, t dnsTarget, row *store.DNSRecor
 	}
 	if ownPresent {
 		err := b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
-		if err != nil && !errors.Is(err, dns.ErrNotFound) {
+		if err != nil && (errors.Is(err, dns.ErrUnconfirmed) || !errors.Is(err, dns.ErrNotFound)) {
+			if errors.Is(err, dns.ErrUnconfirmed) {
+				delete(b.listings, t.provider+"/"+t.zone) // it may or may not be gone
+			}
 			return fmt.Errorf("deleting the old record (value %s, id %q) failed: %w", stored.Value, stored.ID, err)
 		}
 		b.forget(t, stored)
 	}
 	created, err := b.doCreate(ctx, t, row)
 	if err == nil || created || !ownPresent || errors.Is(err, ErrForeignRecord) {
+		return err
+	}
+	if errors.Is(err, dns.ErrUnconfirmed) {
+		// The new value may exist: re-creating the old one could leave two
+		// values at the name. The row is left as it is (old value); the next
+		// cycle re-checks the name with a fresh listing.
+		b.e.activity(ctx, "error", fmt.Sprintf("replacing %s at %s/%s: old value %s deleted, creating %s is unconfirmed (%v); not restoring the old value",
+			t, t.provider, t.zone, row.Value, t.value, err))
 		return err
 	}
 	return b.restore(ctx, t, row, err)
@@ -547,6 +611,14 @@ func (b *dnsBatch) restore(ctx context.Context, t dnsTarget, row *store.DNSRecor
 	old := dns.Record{Name: t.name, Type: t.typ, Value: row.Value, TTL: t.ttl}
 	var got dns.Record
 	rerr := b.e.call(bctx, func(c context.Context) (err error) { got, err = t.p.CreateRecord(c, t.zone, old); return })
+	var uerr error
+	if errors.Is(rerr, dns.ErrUnconfirmed) {
+		if w, ok := unconfirmedRecord(dnsTarget{name: t.name, typ: t.typ, value: row.Value, ttl: t.ttl}, got); ok {
+			got, uerr, rerr = w, rerr, nil
+		} else {
+			delete(b.listings, t.provider+"/"+t.zone)
+		}
+	}
 	if rerr != nil {
 		msg := fmt.Sprintf("replacing %s at %s/%s: old value %s deleted, creating %s failed (%v) and restoring %s failed (%v); no record until the next cycle re-creates it",
 			t, t.provider, t.zone, row.Value, t.value, cerr, row.Value, rerr)
@@ -564,6 +636,9 @@ func (b *dnsBatch) restore(ctx context.Context, t dnsTarget, row *store.DNSRecor
 	}
 	b.e.activity(ctx, "error", fmt.Sprintf("replacing %s at %s/%s: creating %s failed (%v); old value %s restored (provider id %q)",
 		t, t.provider, t.zone, t.value, cerr, row.Value, got.ID))
+	if uerr != nil {
+		b.unconfirmed(ctx, "restore", t, got, uerr, fmt.Sprintf("restored %s %s at %s/%s (provider id %q)", t, row.Value, t.provider, t.zone, got.ID))
+	}
 	return fmt.Errorf("creating %s failed: %w; old value %s restored (provider id %q)", t.value, cerr, row.Value, got.ID)
 }
 
@@ -614,20 +689,35 @@ func (b *dnsBatch) doCreate(ctx context.Context, t dnsTarget, base *store.DNSRec
 		b.e.activity(ctx, "warn", fmt.Sprintf("conflict: not creating %s at %s/%s: a foreign record appeared", t, t.provider, t.zone))
 		return false, fmt.Errorf("%w: %w", ErrForeignRecord, err)
 	}
+	rec := dns.Record{ID: got.ID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
+	var uerr error
+	if errors.Is(err, dns.ErrUnconfirmed) {
+		w, ok := unconfirmedRecord(t, got)
+		if !ok {
+			delete(b.listings, t.provider+"/"+t.zone) // the record may exist now
+			b.ambiguous(ctx, "create", t, t.value, err, "NO ownership row was written; if the record exists it shows as foreign until adopted or removed")
+			return false, err
+		}
+		rec, uerr, err = w, err, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	rec := dns.Record{ID: got.ID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
 	b.remember(t, rec)
-	row := store.DNSRecord{Provider: t.provider, Zone: t.zone, Name: t.name, Type: t.typ, Value: t.value,
-		ProviderRecordID: got.ID, OwnerKey: t.owner, CreatedAt: b.e.now()}
+	row := store.DNSRecord{Provider: t.provider, Zone: t.zone, Name: t.name, Type: t.typ, Value: rec.Value,
+		ProviderRecordID: rec.ID, OwnerKey: t.owner, CreatedAt: b.e.now()}
 	if base != nil {
 		row.CreatedAt, row.RemovedAfter = base.CreatedAt, base.RemovedAfter
 	}
 	if err := b.e.persist(ctx, row); err != nil {
 		return true, b.rollback(ctx, t, rec, base, err)
 	}
-	b.e.activity(ctx, "info", fmt.Sprintf("created %s %s at %s/%s (owner %s, provider id %q)", t, t.value, t.provider, t.zone, t.owner, got.ID))
+	what := fmt.Sprintf("created %s %s at %s/%s (owner %s, provider id %q)", t, rec.Value, t.provider, t.zone, t.owner, rec.ID)
+	if uerr != nil {
+		b.unconfirmed(ctx, "create", t, rec, uerr, what)
+		return true, nil
+	}
+	b.e.activity(ctx, "info", what)
 	return true, nil
 }
 
@@ -649,7 +739,7 @@ func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record
 			}
 			if (created.ID != "" && r.ProviderRecordID == created.ID) || (normName(r.Name) == t.name && normType(r.Type) == t.typ) {
 				msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership (%v); left in place because an ownership row of %s now references it",
-					t, t.value, t.provider, t.zone, created.ID, perr, r.OwnerKey)
+					t, created.Value, t.provider, t.zone, created.ID, perr, r.OwnerKey)
 				e.activity(ctx, "error", msg)
 				return errors.New(msg)
 			}
@@ -658,15 +748,24 @@ func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record
 	// Delete by the returned ID only; a provider that returned no ID gets the
 	// exact (name, type, value) just created, which the Delete contract never
 	// matches against a record with another value.
-	del := dns.Record{ID: created.ID, Name: t.name, Type: t.typ, Value: t.value}
-	if derr := e.call(bctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, del) }); derr != nil {
+	del := dns.Record{ID: created.ID, Name: t.name, Type: t.typ, Value: created.Value}
+	derr := e.call(bctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, del) })
+	if errors.Is(derr, dns.ErrUnconfirmed) {
+		// never claim the rollback happened, and keep the record in the
+		// batch listing: it may still exist, owned by nobody
+		msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership (%v); the rollback delete was not confirmed, so the record may still exist without an owner: delete or adopt it by hand",
+			t, created.Value, t.provider, t.zone, created.ID, perr)
+		e.activity(ctx, "error", msg)
+		return fmt.Errorf("%s: %w", msg, derr)
+	}
+	if derr != nil {
 		msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership (%v) and the rollback delete failed (%v): delete or adopt it by hand",
-			t, t.value, t.provider, t.zone, created.ID, perr, derr)
+			t, created.Value, t.provider, t.zone, created.ID, perr, derr)
 		e.activity(ctx, "error", msg)
 		return errors.New(msg)
 	}
 	b.forget(t, created)
-	msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership; rolled back", t, t.value, t.provider, t.zone, created.ID)
+	msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership; rolled back", t, created.Value, t.provider, t.zone, created.ID)
 	e.activity(ctx, "error", fmt.Sprintf("%s (%v)", msg, perr))
 	return fmt.Errorf("%s: %w", msg, perr)
 }
@@ -845,6 +944,13 @@ func (b *dnsBatch) delete(ctx context.Context, t dnsTarget, a Action) error {
 	stored := dns.Record{ID: row.ProviderRecordID, Name: normName(row.Name), Type: normType(row.Type), Value: row.Value}
 	if stored.ID != "" || strings.TrimSpace(stored.Value) != "" {
 		err = b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
+		if errors.Is(err, dns.ErrUnconfirmed) {
+			// The record may or may not be gone yet: keep the row (and its
+			// schedule), so the next plan emits the DNSDelete again.
+			b.e.activity(ctx, "warn", fmt.Sprintf("deleting %s %s at %s/%s (provider id %q) was not confirmed; keeping its ownership row, the next cycle deletes it again: %v",
+				t, stored.Value, t.provider, t.zone, stored.ID, err))
+			return err
+		}
 		if err != nil && !errors.Is(err, dns.ErrNotFound) {
 			return err
 		}
@@ -1147,4 +1253,51 @@ func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st O
 		foreign[key] = out
 	}
 	return owned, foreign, errs
+}
+
+// DNSWarning is a typed, non-failing outcome of the last Apply: a provider
+// write that was accepted but not confirmed (dns.ErrUnconfirmed).
+type DNSWarning struct {
+	// Op is "create", "update" or "restore".
+	Op                                    string
+	Provider, Zone, Name, Type, Value, ID string
+	Err                                   error
+}
+
+// LastWarnings returns the warnings of the last non-dry Apply.
+func (e *DNSExecutor) LastWarnings() []DNSWarning {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]DNSWarning(nil), e.warnings...)
+}
+
+// unconfirmedRecord returns the record a write that answered
+// dns.ErrUnconfirmed says it wrote, normalized, when that record names t
+// (same name and type; Value defaults to t.value). ok is false when the
+// provider returned no record, or one naming something else (a provider
+// bug): then the outcome is ambiguous and nothing may be recorded from it.
+func unconfirmedRecord(t dnsTarget, got dns.Record) (dns.Record, bool) {
+	if normName(got.Name) == "" || normName(got.Name) != t.name || normType(got.Type) != t.typ {
+		return dns.Record{}, false
+	}
+	r := dns.Record{ID: strings.TrimSpace(got.ID), Name: t.name, Type: t.typ, Value: strings.TrimSpace(got.Value), TTL: t.ttl}
+	if r.Value == "" {
+		r.Value = t.value
+	}
+	return r, true
+}
+
+// unconfirmed records a typed warning and a warn activity for a write that
+// was accepted but not confirmed.
+func (b *dnsBatch) unconfirmed(ctx context.Context, op string, t dnsTarget, r dns.Record, err error, what string) {
+	b.e.warnings = append(b.e.warnings, DNSWarning{Op: op, Provider: t.provider, Zone: t.zone, Name: t.name, Type: t.typ,
+		Value: r.Value, ID: r.ID, Err: err})
+	b.e.activity(ctx, "warn", fmt.Sprintf("%s; write accepted but unconfirmed; will verify on a later cycle (%v)", what, err))
+}
+
+// ambiguous reports a write whose outcome is unknown and for which the
+// provider returned no usable record: nothing is recorded from it.
+func (b *dnsBatch) ambiguous(ctx context.Context, op string, t dnsTarget, value string, err error, consequence string) {
+	b.e.activity(ctx, "error", fmt.Sprintf("%s of %s %s at %s/%s: OUTCOME UNKNOWN and the provider returned no record describing it (%v); %s",
+		op, t, value, t.provider, t.zone, err, consequence))
 }
