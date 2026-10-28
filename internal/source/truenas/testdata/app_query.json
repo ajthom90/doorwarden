@@ -1,0 +1,190 @@
+{
+  "jsonrpc": "2.0",
+  "result": [
+    {
+      "name": "example-app-1",
+      "id": "example-app-1",
+      "state": "RUNNING",
+      "upgrade_available": false,
+      "latest_version": "1.0.0",
+      "latest_app_version": "1.0.0",
+      "image_updates_available": false,
+      "custom_app": false,
+      "migrated": false,
+      "human_version": "1.0.0_1.0.0",
+      "version": "1.0.0",
+      "metadata": {
+        "name": "example",
+        "train": "community"
+      },
+      "active_workloads": {
+        "containers": 1,
+        "used_ports": [],
+        "container_details": [],
+        "volumes": [],
+        "images": [],
+        "networks": [],
+        "used_host_ips": []
+      },
+      "notes": null,
+      "action_required": false,
+      "portals": {
+        "Web UI": "http://0.0.0.0:30001/"
+      }
+    },
+    {
+      "name": "example-app-2",
+      "id": "example-app-2",
+      "state": "RUNNING",
+      "upgrade_available": false,
+      "latest_version": "1.0.0",
+      "latest_app_version": "1.0.0",
+      "image_updates_available": false,
+      "custom_app": false,
+      "migrated": false,
+      "human_version": "1.0.0_1.0.0",
+      "version": "1.0.0",
+      "metadata": {
+        "name": "example",
+        "train": "community"
+      },
+      "active_workloads": {
+        "containers": 1,
+        "used_ports": [],
+        "container_details": [],
+        "volumes": [],
+        "images": [],
+        "networks": [],
+        "used_host_ips": []
+      },
+      "notes": null,
+      "action_required": false,
+      "portals": {}
+    },
+    {
+      "name": "example-app-3",
+      "id": "example-app-3",
+      "state": "RUNNING",
+      "upgrade_available": false,
+      "latest_version": "1.0.0",
+      "latest_app_version": "1.0.0",
+      "image_updates_available": false,
+      "custom_app": false,
+      "migrated": false,
+      "human_version": "1.0.0_1.0.0",
+      "version": "1.0.0",
+      "metadata": {
+        "name": "example",
+        "train": "community"
+      },
+      "active_workloads": {
+        "containers": 1,
+        "used_ports": [],
+        "container_details": [],
+        "volumes": [],
+        "images": [],
+        "networks": [],
+        "used_host_ips": []
+      },
+      "notes": null,
+      "action_required": false,
+      "portals": {
+        "HTTPS": "https://0.0.0.0:30003/",
+        "HTTP": "http://0.0.0.0:30004/"
+      }
+    },
+    {
+      "name": "example-app-4",
+      "id": "example-app-4",
+      "state": "RUNNING",
+      "upgrade_available": false,
+      "latest_version": "1.0.0",
+      "latest_app_version": "1.0.0",
+      "image_updates_available": false,
+      "custom_app": false,
+      "migrated": false,
+      "human_version": "1.0.0_1.0.0",
+      "version": "1.0.0",
+      "metadata": {
+        "name": "example",
+        "train": "community"
+      },
+      "active_workloads": {
+        "containers": 1,
+        "used_ports": [],
+        "container_details": [],
+        "volumes": [],
+        "images": [],
+        "networks": [],
+        "used_host_ips": []
+      },
+      "notes": null,
+      "action_required": false,
+      "portals": {
+        "Admin": "http://0.0.0.0:30006/admin",
+        "Web UI": "http://0.0.0.0:30005/web"
+      }
+    },
+    {
+      "name": "example-app-5",
+      "id": "example-app-5",
+      "state": "STOPPED",
+      "upgrade_available": false,
+      "latest_version": "1.0.0",
+      "latest_app_version": "1.0.0",
+      "image_updates_available": false,
+      "custom_app": false,
+      "migrated": false,
+      "human_version": "1.0.0_1.0.0",
+      "version": "1.0.0",
+      "metadata": {
+        "name": "example",
+        "train": "community"
+      },
+      "active_workloads": {
+        "containers": 0,
+        "used_ports": [],
+        "container_details": [],
+        "volumes": [],
+        "images": [],
+        "networks": [],
+        "used_host_ips": []
+      },
+      "notes": null,
+      "action_required": false,
+      "portals": {
+        "Web UI": "http://0.0.0.0:30007/"
+      }
+    },
+    {
+      "name": "example-app-6",
+      "id": "example-app-6",
+      "state": "STOPPED",
+      "upgrade_available": false,
+      "latest_version": "1.0.0",
+      "latest_app_version": "1.0.0",
+      "image_updates_available": false,
+      "custom_app": false,
+      "migrated": false,
+      "human_version": "1.0.0_1.0.0",
+      "version": "1.0.0",
+      "metadata": {
+        "name": "example",
+        "train": "community"
+      },
+      "active_workloads": {
+        "containers": 0,
+        "used_ports": [],
+        "container_details": [],
+        "volumes": [],
+        "images": [],
+        "networks": [],
+        "used_host_ips": []
+      },
+      "notes": null,
+      "action_required": false,
+      "portals": {}
+    }
+  ],
+  "id": 1
+}
