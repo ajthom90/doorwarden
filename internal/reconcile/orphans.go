@@ -210,7 +210,10 @@ func (p *planner) planOrphans(entries []entry) {
 			base.Kind, base.Reason, base.RemovedAfter = DNSScheduleRemoval, reason, &deadline
 			p.emit(base)
 		case p.now.After(*o.RemovedAfter):
-			base.Kind, base.Reason = DNSDelete, reason+"; grace period expired"
+			// the delete names the schedule it was planned for: the executor
+			// refuses unless the stored row still has it
+			ra := *o.RemovedAfter
+			base.Kind, base.Reason, base.RemovedAfter = DNSDelete, reason+"; grace period expired", &ra
 			p.emit(base)
 		}
 	}

@@ -381,6 +381,7 @@ func TestDNSExecBatchListingTracksOwnWrites(t *testing.T) {
 	r2 := perHostRig(t)
 	rec := r2.seed(t, "app.example.test", "A", ip1)
 	r2.addRow(t, "app.example.test", "A", ip1, rec.ID, "docker:a")
+	r2.due(t, "app.example.test", "docker:a")
 	// the first create caches the listing (which still shows app) before the delete
 	if err := r2.apply(t, false, ensure("x.example.test", ip1, "docker:x"), del("app.example.test", ip1, rec.ID, "docker:a"),
 		ensure("app.example.test", ip2, "docker:b")); err != nil {

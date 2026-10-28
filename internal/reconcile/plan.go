@@ -267,14 +267,14 @@ func (p *planner) planLoser(e entry, l loss) {
 	old := normName(k.Hostname)
 	switch {
 	case p.mayRemoveLoserRoute(e.svc, l.winner):
-		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key,
+		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key, Cause: CauseTakeover,
 			Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
 	case p.renamedAway(e, old):
 		// It no longer declares its old hostname and nothing else claims
 		// that name on its behalf: keeping the row would leave an orphan
 		// that a newcomer at the old name shares with it. It is served
 		// under neither name until it wins its new one.
-		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key,
+		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key, Cause: CauseRename,
 			Svc: copySvc(e.svc), Reason: "service now declares " + e.host + " (held by " + l.winner.key +
 				"); its old route for " + old + " is removed"})
 	}
@@ -513,7 +513,7 @@ func (p *planner) planRemovals(present map[string]bool, losers map[string]loss) 
 			// source rank takes over its hostname now: remove its route
 			// without waiting for the grace period (its owned DNS record is
 			// an orphan, removed after the grace period by planOrphans).
-			p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key,
+			p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key, Cause: CauseTakeover,
 				Reason: "service no longer discovered and hostname " + host + " now belongs to published " + l.winner.key})
 			continue
 		}
@@ -526,7 +526,9 @@ func (p *planner) planRemovals(present map[string]bool, losers map[string]loss) 
 		if !p.now.After(*k.RemovedAfter) {
 			continue // still within grace
 		}
-		p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key, Reason: "grace period expired"})
+		ra := *k.RemovedAfter
+		p.emit(Action{Kind: RouteRemove, Zone: zn, Host: host, Key: k.Key, Cause: CauseRemovalGrace, RemovedAfter: &ra,
+			Reason: "grace period expired"})
 	}
 }
 

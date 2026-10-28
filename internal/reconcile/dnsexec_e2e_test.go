@@ -24,17 +24,20 @@ type world struct {
 	st     *store.Store
 	fk     *fake.Fake
 	runner *Runner
+	// clock is the executors' now: each cycle sets it to the plan's time.
+	clock time.Time
 }
 
 func newWorld(t *testing.T, mode string) *world {
 	t.Helper()
-	w := &world{t: t, cfg: dnsCfg(dnsZoneCfg(dz, mode)), st: openStore(t), fk: fake.New(true)}
+	w := &world{t: t, cfg: dnsCfg(dnsZoneCfg(dz, mode)), st: openStore(t), fk: fake.New(true), clock: t0}
+	now := func() time.Time { return w.clock }
 	de, err := NewDNSExecutor(DNSExecutorConfig{Config: w.cfg, Providers: map[string]dns.Provider{dzp: w.fk},
-		Store: w.st, Activity: w.st, Now: fixedNow(t0)})
+		Store: w.st, Activity: w.st, Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	re := NewRouteExecutor(w.st, fixedNow(t0))
+	re := NewRouteExecutor(w.st, now)
 	m := NewMultiExecutor(nil).Handle(DNSEnsure, de).Handle(DNSDelete, de).
 		Handle(DNSScheduleRemoval, de).Handle(DNSCancelRemoval, de)
 	for _, k := range []ActionKind{RouteWrite, RouteRemove, ScheduleRemoval, CancelRemoval} {
@@ -58,7 +61,13 @@ func (w *world) observe(ctx context.Context) Observed {
 func (w *world) cycle(now time.Time, desired ...model.Service) ([]Action, error) {
 	w.t.Helper()
 	ctx := context.Background()
-	return w.runner.Reconcile(ctx, desired, w.observe(ctx), now)
+	return w.reconcileAt(now, desired, w.observe(ctx))
+}
+
+// reconcileAt plans from obs (possibly stale) and applies at now.
+func (w *world) reconcileAt(now time.Time, desired []model.Service, obs Observed) ([]Action, error) {
+	w.clock = now
+	return w.runner.Reconcile(context.Background(), desired, obs, now)
 }
 
 func (w *world) mustCycle(now time.Time, desired ...model.Service) []Action {
@@ -392,7 +401,7 @@ func TestDNSE2ESourceOutageNeverRemovesDNS(t *testing.T) {
 	down := func(now time.Time) []Action {
 		obs := w.observe(ctx)
 		obs.Unavailable = map[string]bool{"docker": true}
-		acts, err := w.runner.Reconcile(ctx, nil, obs, now)
+		acts, err := w.reconcileAt(now, nil, obs)
 		if err != nil {
 			t.Fatal(err)
 		}

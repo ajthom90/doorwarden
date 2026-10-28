@@ -203,7 +203,7 @@ func TestRouteExecutorRemovalScheduleAndIgnoredKinds(t *testing.T) {
 	}
 	// RouteRemove deletes; repeated is fine.
 	for i := 0; i < 2; i++ {
-		if err := ex.Apply(ctx, []Action{{Kind: RouteRemove, Key: "docker:app"}}, false); err != nil {
+		if err := ex.Apply(ctx, []Action{{Kind: RouteRemove, Key: "docker:app", Cause: CauseTakeover}}, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -497,6 +497,9 @@ func (f failingStore) UpsertRoute(context.Context, store.Route) error           
 func (f failingStore) DeleteRoute(context.Context, string) error                 { return f.err }
 func (f failingStore) SetRouteRemoval(context.Context, string, *time.Time) error { return f.err }
 func (f failingStore) ListRoutes(context.Context) ([]store.Route, error)         { return nil, f.err }
+func (f failingStore) DeleteRouteIfDue(context.Context, string, time.Time) (bool, error) {
+	return false, f.err
+}
 
 func TestE2ENonPublishedNeverRewritesRoute(t *testing.T) {
 	e := newE2E(t)

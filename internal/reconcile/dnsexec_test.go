@@ -143,9 +143,21 @@ func ensure(name, value, owner string) Action {
 		Record: &dns.Record{Name: name, Type: "A", Value: value}}
 }
 
+// del is a DNSDelete planned for dueRA, the schedule (*r).due sets.
 func del(name, value, id, owner string) Action {
 	return Action{Kind: DNSDelete, Zone: dz, Host: name, Key: owner, Provider: dzp, Owner: owner,
-		Record: &dns.Record{ID: id, Name: name, Type: "A", Value: value}}
+		Record: &dns.Record{ID: id, Name: name, Type: "A", Value: value}, RemovedAfter: tp(dueRA)}
+}
+
+// dueRA is a removal schedule that is due at t0 (the rig's clock).
+var dueRA = t0.Add(-time.Hour)
+
+// due schedules the row's removal at dueRA, so a del() of it may run.
+func (r *dnsRig) due(t *testing.T, name, owner string) {
+	t.Helper()
+	if err := r.st.SetOwnedRemoval(context.Background(), dzp, dz, name, "A", owner, tp(dueRA)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ---- construction ----
@@ -498,6 +510,7 @@ func TestDNSExecDeleteOwnedByStoredIDAndValue(t *testing.T) {
 	keep := r.seed(t, "other.example.test", "A", ipFX)
 	rec := r.seed(t, "app.example.test", "A", ip1)
 	r.addRow(t, "app.example.test", "A", ip1, rec.ID, "docker:app")
+	r.due(t, "app.example.test", "docker:app")
 	skip := len(r.fk.Calls())
 	// the action's ID/value are wrong on purpose: the stored row is used
 	if err := r.apply(t, false, del("app.example.test", ipFX, keep.ID, "docker:app")); err != nil {
@@ -521,6 +534,7 @@ func TestDNSExecDeleteEmptyStoredIDUsesStoredValue(t *testing.T) {
 	// the user replaced our record with their own value; we only know our value
 	theirs := r.seed(t, "app.example.test", "A", ipFX)
 	r.addRow(t, "app.example.test", "A", ip1, "", "docker:app")
+	r.due(t, "app.example.test", "docker:app")
 	skip := len(r.fk.Calls())
 	if err := r.apply(t, false, del("app.example.test", ipFX, "", "docker:app")); err != nil {
 		t.Fatal(err)
@@ -591,6 +605,7 @@ func TestDNSExecDeleteProviderFailureKeepsRow(t *testing.T) {
 	r := perHostRig(t)
 	rec := r.seed(t, "app.example.test", "A", ip1)
 	r.addRow(t, "app.example.test", "A", ip1, rec.ID, "docker:app")
+	r.due(t, "app.example.test", "docker:app")
 	r.fk.FailNext("DeleteRecord", errors.New("api down"))
 	if err := r.apply(t, false, del("app.example.test", ip1, rec.ID, "docker:app")); err == nil {
 		t.Fatal("want error")
@@ -736,6 +751,7 @@ func TestDNSExecDryRunWritesNothing(t *testing.T) {
 	r := perHostRig(t)
 	rec := r.seed(t, "old.example.test", "A", ip1)
 	r.addRow(t, "old.example.test", "A", ip1, rec.ID, "docker:old")
+	r.due(t, "old.example.test", "docker:old")
 	r.addRow(t, "upd.example.test", "A", ip1, "fake-77", "docker:upd")
 	skip := len(r.fk.Calls())
 	err := r.apply(t, true,

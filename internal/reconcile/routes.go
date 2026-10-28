@@ -16,6 +16,9 @@ import (
 type RouteStore interface {
 	UpsertRoute(ctx context.Context, r store.Route) error
 	DeleteRoute(ctx context.Context, key string) error
+	// DeleteRouteIfDue deletes key's route only if its removed_after is set
+	// and strictly before notAfter.
+	DeleteRouteIfDue(ctx context.Context, key string, notAfter time.Time) (bool, error)
 	SetRouteRemoval(ctx context.Context, key string, at *time.Time) error
 	ListRoutes(ctx context.Context) ([]store.Route, error)
 }
@@ -34,7 +37,13 @@ type RouteStore interface {
 //     failing model.ValidateBackend (store.ErrInvalidRoute) is an error and
 //     nothing is written. A scheduled removal is preserved.
 //   - RouteRemove deletes the route (absent is not an error). It is the ONLY
-//     way a route leaves the set.
+//     way a route leaves the set. With Cause CauseRemovalGrace (or no Cause)
+//     the route is deleted only if its stored removed_after is still set
+//     and in the past at now (store.DeleteRouteIfDue): a plan computed from
+//     a stale Observed never removes a route whose removal a newer cycle
+//     cancelled (or re-scheduled to a later time); otherwise nothing
+//     happens. CauseTakeover and CauseRename removals are decided on the
+//     current claimants and labels and are applied as planned.
 //   - ScheduleRemoval persists Action.RemovedAfter (required);
 //     CancelRemoval clears it. For a key without a route both do nothing
 //     (store.ErrRouteNotFound is swallowed): there is nothing to remove.
@@ -83,7 +92,11 @@ func (e *routeExecutor) apply(ctx context.Context, a Action) error {
 		}
 		return e.st.UpsertRoute(ctx, r)
 	case RouteRemove:
-		return e.st.DeleteRoute(ctx, a.Key)
+		if a.Cause == CauseTakeover || a.Cause == CauseRename {
+			return e.st.DeleteRoute(ctx, a.Key)
+		}
+		_, err := e.st.DeleteRouteIfDue(ctx, a.Key, e.now())
+		return err
 	case ScheduleRemoval:
 		if a.RemovedAfter == nil {
 			return errors.New("ScheduleRemoval without RemovedAfter")

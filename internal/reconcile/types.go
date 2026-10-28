@@ -85,9 +85,34 @@ type Action struct {
 	// Names are the certificate names for CertEnsure; Issuer its issuer key.
 	Names  []string
 	Issuer string
-	// RemovedAfter is set on ScheduleRemoval and DNSScheduleRemoval.
+	// RemovedAfter is set on ScheduleRemoval and DNSScheduleRemoval (the new
+	// deadline), on DNSDelete (the row's schedule the delete was planned for;
+	// the executor refuses unless the stored row still has exactly that
+	// schedule and it is due) and on a RouteRemove with CauseRemovalGrace
+	// (informational).
 	RemovedAfter *time.Time
+	// Cause says why a RouteRemove was planned (see RemovalCause).
+	Cause RemovalCause
 }
+
+// RemovalCause is why a RouteRemove was planned.
+type RemovalCause string
+
+const (
+	// CauseRemovalGrace: the service is gone and its grace period expired.
+	// The route executor deletes the route only if its stored removed_after
+	// is still set and in the past (store.DeleteRouteIfDue), so a stale plan
+	// never removes a route whose removal a newer cycle cancelled. An empty
+	// Cause is treated the same way.
+	CauseRemovalGrace RemovalCause = "removal-grace"
+	// CauseTakeover: a Published, routable service of the same or a higher
+	// source rank takes the hostname over. Decided on the current
+	// claimants; the executor trusts the plan.
+	CauseTakeover RemovalCause = "takeover"
+	// CauseRename: a hostname loser renamed away from its persisted
+	// hostname. Decided on current labels; the executor trusts the plan.
+	CauseRename RemovalCause = "rename"
+)
 
 // KnownService is what the caller remembers about a service that was
 // previously published (from the services table).

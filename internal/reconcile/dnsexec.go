@@ -25,7 +25,9 @@ const DefaultDNSCallTimeout = 30 * time.Second
 type OwnershipStore interface {
 	AddOwnedRecord(ctx context.Context, r store.DNSRecord) error
 	ListOwnedRecords(ctx context.Context, provider, zone string) ([]store.DNSRecord, error)
-	DeleteOwnedRecord(ctx context.Context, provider, zone, name, typ string) error
+	// DeleteOwnedRecordIfDue deletes the row only if it is owned by owner and
+	// its removed_after is set and strictly before notAfter.
+	DeleteOwnedRecordIfDue(ctx context.Context, provider, zone, name, typ, owner string, notAfter time.Time) (bool, error)
 	// SetOwnedRemoval sets or clears removed_after of the row, only if its
 	// owner key equals owner (store.ErrOwnedRecordNotFound otherwise).
 	SetOwnedRemoval(ctx context.Context, provider, zone, name, typ, owner string, at *time.Time) error
@@ -109,19 +111,31 @@ type dnsZone struct{ name, provider, mode string }
 //
 // DNSDelete: only a row for (provider, zone, name, type) whose owner key
 // equals Action.Owner is deleted, using the STORED ID, name, type and value
-// (never the action's). No row: no-op, no provider call. The wildcard record
-// (owner key "zone:...", or a "*." name) is never deleted: such an action is
-// refused with ErrDNSRefused (Action has no Force flag; a later UI path must
-// use its own call). dns.ErrNotFound or nil from the provider forgets the
-// row; any other error keeps it (the row, still past its RemovedAfter, makes
-// the next Plan emit the DNSDelete again).
+// (never the action's). No row: no-op, no provider call. The plan may be
+// stale (Observed is gathered outside the Runner's lock), so the row is
+// re-read and the delete runs only if the row still has exactly the
+// schedule the action was planned for (Action.RemovedAfter, required) and
+// that schedule is due at the executor's now; otherwise nothing happens
+// (an info activity says why). The provider delete comes first, then the
+// row is deleted with store.DeleteOwnedRecordIfDue (owner and due schedule
+// re-checked in the DELETE itself). If that finds the row changed in
+// between, the record is already gone at the provider: the row is kept,
+// its value and provider ID are blanked so the next plan's DNSEnsure
+// re-creates the record, and an error activity says so. The wildcard
+// record (owner key "zone:...", or a "*." name) is never deleted: such an
+// action is refused with ErrDNSRefused (Action has no Force flag; a later
+// UI path must use its own call). dns.ErrNotFound or nil from the provider
+// forgets the row; any other error keeps it (the row, still past its
+// RemovedAfter, makes the next Plan emit the DNSDelete again).
 //
 // DNSScheduleRemoval / DNSCancelRemoval: no provider call. The row for
 // (provider, zone, name, type) gets RemovedAfter = Action.RemovedAfter
 // (required for schedule) or nil, only if its owner key equals
-// Action.Owner (store.SetOwnedRemoval). No such row (gone, or owned by
-// another key) is a no-op. The wildcard record is refused with
-// ErrDNSRefused, like its delete.
+// Action.Owner (store.SetOwnedRemoval). The row is re-read first and
+// nothing changes unless it still matches what the plan saw: same owner,
+// same value, and unscheduled (schedule; an existing schedule is never
+// moved) or scheduled (cancel). No such row is a no-op. The wildcard record
+// is refused with ErrDNSRefused, like its delete.
 //
 // Every action must name a zone configured with records mode wildcard or
 // per-host, that zone's records provider, and a record name equal to the
@@ -325,7 +339,7 @@ func (b *dnsBatch) apply(ctx context.Context, a Action) error {
 	}
 	switch a.Kind {
 	case DNSDelete:
-		return b.delete(ctx, t)
+		return b.delete(ctx, t, a)
 	case DNSScheduleRemoval, DNSCancelRemoval:
 		return b.setRemoval(ctx, t, a)
 	}
@@ -639,7 +653,19 @@ func (b *dnsBatch) setRemoval(ctx context.Context, t dnsTarget, a Action) error 
 		v := *a.RemovedAfter
 		at = &v
 	}
-	err := b.e.st.SetOwnedRemoval(ctx, t.provider, t.zone, t.name, t.typ, t.owner, at)
+	// The plan may be stale: re-read the row and act only on the state the
+	// plan saw (same owner and value; unscheduled for a schedule, scheduled
+	// for a cancel). Otherwise the next plan decides again.
+	row, err := b.e.ownedRow(ctx, t)
+	if err != nil {
+		return err
+	}
+	if why := removalStale(row, t, a.Kind); why != "" {
+		b.e.log.InfoContext(ctx, "not changing the removal schedule: the stored row changed since the plan", "kind", string(a.Kind),
+			"provider", t.provider, "zone", t.zone, "name", t.name, "type", t.typ, "owner", t.owner, "why", why)
+		return nil
+	}
+	err = b.e.st.SetOwnedRemoval(ctx, t.provider, t.zone, t.name, t.typ, t.owner, at)
 	if errors.Is(err, store.ErrOwnedRecordNotFound) {
 		b.e.log.InfoContext(ctx, "no ownership row for this owner; nothing to (un)schedule", "kind", string(a.Kind),
 			"provider", t.provider, "zone", t.zone, "name", t.name, "type", t.typ, "owner", t.owner)
@@ -658,11 +684,49 @@ func (b *dnsBatch) setRemoval(ctx context.Context, t dnsTarget, a Action) error 
 	return nil
 }
 
-func (b *dnsBatch) delete(ctx context.Context, t dnsTarget) error {
+// removalStale returns why a DNSScheduleRemoval/DNSCancelRemoval no longer
+// matches the stored row (row nil when there is none), or "" when it does.
+func removalStale(row *store.DNSRecord, t dnsTarget, k ActionKind) string {
+	switch {
+	case row == nil:
+		return "no ownership row"
+	case row.OwnerKey != t.owner:
+		return "owned by " + row.OwnerKey
+	case !sameValue(row.Value, t.value):
+		return "value is now " + row.Value
+	case k == DNSScheduleRemoval && row.RemovedAfter != nil:
+		return "already scheduled for " + row.RemovedAfter.UTC().Format(time.RFC3339) + "; not moving it"
+	case k == DNSCancelRemoval && row.RemovedAfter == nil:
+		return "not scheduled"
+	}
+	return ""
+}
+
+// deleteStale returns why a DNSDelete planned for schedule planned must not
+// run against row (owned by the action's owner) at now, or "" when the row
+// still has exactly that schedule and it is due. Times compare in whole
+// seconds, the store's precision (as store.DeleteOwnedRecordIfDue does).
+func deleteStale(row *store.DNSRecord, planned, now time.Time) string {
+	switch {
+	case row.RemovedAfter == nil:
+		return "its removal is not scheduled (cancelled since the plan)"
+	case row.RemovedAfter.Unix() != planned.Unix():
+		return fmt.Sprintf("its removal is now scheduled for %s; the delete was planned for %s",
+			row.RemovedAfter.UTC().Format(time.RFC3339), planned.UTC().Format(time.RFC3339))
+	case row.RemovedAfter.Unix() >= now.Unix():
+		return "its removal is not due until " + row.RemovedAfter.UTC().Format(time.RFC3339)
+	}
+	return ""
+}
+
+func (b *dnsBatch) delete(ctx context.Context, t dnsTarget, a Action) error {
 	if isWildcardTarget(t) {
 		b.e.activity(ctx, "warn", fmt.Sprintf("refused to delete %s at %s/%s: the wildcard record is never deleted automatically",
 			t, t.provider, t.zone))
 		return fmt.Errorf("%w: the wildcard record is never deleted automatically", ErrDNSRefused)
+	}
+	if a.RemovedAfter == nil {
+		return fmt.Errorf("%w: DNSDelete without the schedule it was planned for (RemovedAfter)", ErrDNSRefused)
 	}
 	row, err := b.e.ownedRow(ctx, t)
 	if err != nil {
@@ -675,17 +739,47 @@ func (b *dnsBatch) delete(ctx context.Context, t dnsTarget) error {
 		b.e.activity(ctx, "warn", fmt.Sprintf("refused to delete %s at %s/%s: owned by %s, not %s", t, t.provider, t.zone, row.OwnerKey, t.owner))
 		return fmt.Errorf("%w: owned by %s, not %s", ErrOwnerConflict, row.OwnerKey, t.owner)
 	}
+	now := b.e.now()
+	if why := deleteStale(row, *a.RemovedAfter, now); why != "" {
+		b.e.activity(ctx, "info", fmt.Sprintf("not deleting %s at %s/%s (owner %s): %s", t, t.provider, t.zone, t.owner, why))
+		return nil
+	}
 	stored := dns.Record{ID: row.ProviderRecordID, Name: normName(row.Name), Type: normType(row.Type), Value: row.Value}
 	err = b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
 	if err != nil && !errors.Is(err, dns.ErrNotFound) {
 		return err
 	}
 	b.forget(t, stored)
-	if err := b.e.st.DeleteOwnedRecord(context.WithoutCancel(ctx), t.provider, t.zone, t.name, t.typ); err != nil {
+	bctx := context.WithoutCancel(ctx)
+	deleted, err := b.e.st.DeleteOwnedRecordIfDue(bctx, t.provider, t.zone, t.name, t.typ, t.owner, now)
+	if err != nil {
 		return fmt.Errorf("deleted %s (provider id %q) but could not forget its ownership row: %w", t, stored.ID, err)
+	}
+	if !deleted {
+		return b.rowChangedAfterDelete(bctx, t, stored)
 	}
 	b.e.activity(ctx, "info", fmt.Sprintf("deleted %s %s at %s/%s (owner %s, provider id %q)", t, stored.Value, t.provider, t.zone, t.owner, stored.ID))
 	return nil
+}
+
+// rowChangedAfterDelete handles a row that changed (removal cancelled or
+// re-scheduled, or re-owned) between its provider delete and the
+// conditional row delete: the record is gone at the provider but the row
+// says it is wanted. The row's value and provider ID are blanked (keeping
+// owner and schedule), so the next plan sees a different value and its
+// DNSEnsure re-creates the record through the guarded create path.
+func (b *dnsBatch) rowChangedAfterDelete(ctx context.Context, t dnsTarget, stored dns.Record) error {
+	msg := fmt.Sprintf("DELETED %s %s at %s/%s (provider id %q) BUT ITS OWNERSHIP ROW CHANGED meanwhile (removal cancelled, re-scheduled or re-owned); the row is kept and the next cycle re-creates the record",
+		t, stored.Value, t.provider, t.zone, stored.ID)
+	if cur, err := b.e.ownedRow(ctx, t); err == nil && cur != nil && cur.Value == stored.Value && cur.ProviderRecordID == stored.ID {
+		nr := *cur
+		nr.Value, nr.ProviderRecordID = "", ""
+		if perr := b.e.persist(ctx, nr); perr != nil {
+			msg += fmt.Sprintf(" (marking the row for re-creation failed: %v)", perr)
+		}
+	}
+	b.e.activity(ctx, "error", msg)
+	return errors.New("row changed during the delete: " + msg)
 }
 
 // listing returns the batch's cached listing of t's zone, listing once.
@@ -747,6 +841,8 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 		msg = fmt.Sprintf("dry run: nothing to change for %s %s at %s (no row owned by %s)", a.Kind, t, where, t.owner)
 	case a.Kind == DNSScheduleRemoval && a.RemovedAfter == nil:
 		msg = fmt.Sprintf("dry run: would refuse %s %s at %s: no RemovedAfter", a.Kind, t, where)
+	case (a.Kind == DNSScheduleRemoval || a.Kind == DNSCancelRemoval) && removalStale(row, t, a.Kind) != "":
+		msg = fmt.Sprintf("dry run: nothing to change for %s %s at %s (%s)", a.Kind, t, where, removalStale(row, t, a.Kind))
 	case a.Kind == DNSScheduleRemoval:
 		msg = fmt.Sprintf("dry run: would schedule removal of %s %s at %s (owner %s) after %s", t, row.Value, where, t.owner,
 			a.RemovedAfter.UTC().Format(time.RFC3339))
@@ -756,6 +852,10 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 		msg = fmt.Sprintf("dry run: nothing to delete for %s at %s (not owned)", t, where)
 	case a.Kind == DNSDelete && row.OwnerKey != t.owner:
 		msg = fmt.Sprintf("dry run: would refuse to delete %s at %s: owned by %s", t, where, row.OwnerKey)
+	case a.Kind == DNSDelete && a.RemovedAfter == nil:
+		msg = fmt.Sprintf("dry run: would refuse to delete %s at %s: the action names no schedule", t, where)
+	case a.Kind == DNSDelete && deleteStale(row, *a.RemovedAfter, e.now()) != "":
+		msg = fmt.Sprintf("dry run: would not delete %s at %s: %s", t, where, deleteStale(row, *a.RemovedAfter, e.now()))
 	case a.Kind == DNSDelete:
 		msg = fmt.Sprintf("dry run: would delete %s %s at %s (provider id %q)", t, row.Value, where, row.ProviderRecordID)
 	case t.value == "":
