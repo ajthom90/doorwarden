@@ -14,9 +14,9 @@
 //	doorwarden.middlewares  comma-separated list
 //
 // Containers that are not running are still returned, with State stopped, so
-// a stop or restart never removes anything downstream. Because Docker reports
-// no ports for a stopped container, its backend port is only known when the
-// doorwarden.port label is set.
+// a stop or restart never removes anything downstream. Stopped and error
+// services carry no backend (Host empty, Port 0; only Scheme and SkipVerify
+// are set); see source.Source for the consumer contract.
 //
 // Invalid labels or an unresolvable backend yield a Service with State error;
 // the reason is available from Warnings (reset on every List call).
@@ -149,10 +149,22 @@ func (s *Source) List(ctx context.Context) ([]model.Service, error) {
 	var out []model.Service
 	var warns []string
 	for _, c := range cs {
-		if c.Labels["doorwarden.enable"] != "true" || len(c.Names) == 0 {
+		cname := containerName(c.Names)
+		if cname == "" {
 			continue
 		}
-		svc, warn := s.convert(c)
+		if v, ok := c.Labels["doorwarden.enable"]; ok {
+			t := strings.ToLower(strings.TrimSpace(v))
+			if t != "true" {
+				if _, err := strconv.ParseBool(t); err != nil {
+					warns = append(warns, fmt.Sprintf("container %q: invalid doorwarden.enable %q; skipped", cname, v))
+				}
+				continue
+			}
+		} else {
+			continue
+		}
+		svc, warn := s.convert(cname, c)
 		if warn != "" {
 			warns = append(warns, warn)
 		}
@@ -177,28 +189,39 @@ func parseBool(labels map[string]string, key string) (bool, error) {
 	return b, nil
 }
 
-func (s *Source) convert(c apiContainer) (model.Service, string) {
-	cname := strings.TrimPrefix(c.Names[0], "/")
+// containerName picks the Names entry with exactly one leading slash and no
+// others (skipping legacy "/parent/alias" link names). Empty if none.
+func containerName(names []string) string {
+	for _, n := range names {
+		if len(n) > 1 && n[0] == '/' && !strings.Contains(n[1:], "/") {
+			return n[1:]
+		}
+	}
+	return ""
+}
+
+func (s *Source) convert(cname string, c apiContainer) (model.Service, string) {
 	l := c.Labels
 	svc := model.Service{Key: "docker:" + cname, Source: s.cfg.Name, Name: cname,
 		Zone: l["doorwarden.zone"], State: model.StateDiscovered}
-	if n := l["doorwarden.name"]; n != "" {
+	if n := strings.TrimSpace(l["doorwarden.name"]); n != "" {
 		svc.Name = n
 	}
 	svc.Backend.Scheme = "http"
 
 	fail := func(err error) (model.Service, string) {
 		svc.State = model.StateError
+		svc.Backend.Host, svc.Backend.Port = "", 0
 		return svc, fmt.Sprintf("container %q: %v", cname, err)
 	}
 
-	switch sc := l["doorwarden.scheme"]; sc {
+	switch sc := strings.ToLower(strings.TrimSpace(l["doorwarden.scheme"])); sc {
 	case "", "http", "https":
 		if sc != "" {
 			svc.Backend.Scheme = sc
 		}
 	default:
-		return fail(fmt.Errorf("invalid doorwarden.scheme %q (want http or https)", sc))
+		return fail(fmt.Errorf("invalid doorwarden.scheme %q (want http or https)", l["doorwarden.scheme"]))
 	}
 	var err error
 	if svc.Backend.SkipVerify, err = parseBool(l, "doorwarden.skip-verify"); err != nil {
@@ -253,8 +276,9 @@ func (s *Source) convert(c apiContainer) (model.Service, string) {
 	svc.Backend.Port = port
 
 	if stopped {
+		// Backend is unknown while stopped: only Scheme/SkipVerify are set.
 		svc.State = model.StateStopped
-		svc.Backend.Host = s.cfg.TargetIP
+		svc.Backend.Host, svc.Backend.Port = "", 0
 		return svc, ""
 	}
 	if n, ok := c.NetworkSettings.Networks[s.cfg.Network]; s.cfg.Network != "" && ok && n.IPAddress != "" {

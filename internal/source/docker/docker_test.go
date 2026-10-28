@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ajthom90/doorwarden/internal/model"
@@ -166,9 +170,105 @@ func TestInvalidLabels(t *testing.T) {
 }
 
 func TestStoppedRetained(t *testing.T) {
-	srv := fake(t, []ctr{container("whoami", "exited", lbl("doorwarden.enable", "true", "doorwarden.port", "80"), nil, nil)})
+	for _, tc := range []struct {
+		labels map[string]string
+		cfg    Config
+		nets   map[string]string
+	}{
+		{lbl("doorwarden.enable", "true"), Config{TargetIP: "192.0.2.10"}, nil},
+		{lbl("doorwarden.enable", "true", "doorwarden.port", "80", "doorwarden.scheme", "https", "doorwarden.skip-verify", "true"), Config{TargetIP: "192.0.2.10"}, nil},
+		{lbl("doorwarden.enable", "true", "doorwarden.port", "80"), Config{TargetIP: "192.0.2.10", Network: "proxy"}, map[string]string{"proxy": "198.51.100.7"}},
+	} {
+		srv := fake(t, []ctr{container("whoami", "exited", tc.labels, nil, tc.nets)})
+		got := list(t, newSrc(t, srv, tc.cfg))
+		if len(got) != 1 || got[0].State != model.StateStopped || got[0].Key != "docker:whoami" {
+			t.Fatalf("got %+v", got)
+		}
+		b := got[0].Backend
+		if b.Host != "" || b.Port != 0 {
+			t.Fatalf("backend not empty: %+v", b)
+		}
+	}
+	srv := fake(t, []ctr{container("whoami", "exited", lbl("doorwarden.enable", "true", "doorwarden.scheme", "https", "doorwarden.skip-verify", "true"), nil, nil)})
+	if b := list(t, newSrc(t, srv, Config{}))[0].Backend; b != (model.Backend{Scheme: "https", SkipVerify: true}) {
+		t.Fatalf("got %+v", b)
+	}
+}
+
+func TestErrorStateHasNoBackend(t *testing.T) {
+	srv := fake(t, []ctr{
+		container("amb", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8080), port(443, 8443)}, nil),
+		container("bad", "running", lbl("doorwarden.enable", "true", "doorwarden.port", "x"), []map[string]any{port(80, 8080)}, nil),
+	})
+	for _, g := range list(t, newSrc(t, srv, Config{TargetIP: "192.0.2.10"})) {
+		if g.State != model.StateError || g.Backend.Host != "" || g.Backend.Port != 0 {
+			t.Fatalf("got %+v", g)
+		}
+	}
+}
+
+func TestEnableAndSchemeNormalization(t *testing.T) {
+	srv := fake(t, []ctr{
+		container("a", "running", lbl("doorwarden.enable", " TRUE ", "doorwarden.scheme", " HTTPS ", "doorwarden.name", "  Nice  "), []map[string]any{port(80, 8080)}, nil),
+		container("b", "running", lbl("doorwarden.enable", "maybe"), []map[string]any{port(80, 8081)}, nil),
+		container("c", "running", lbl("doorwarden.enable", "false"), []map[string]any{port(80, 8082)}, nil),
+	})
+	s := newSrc(t, srv, Config{TargetIP: "192.0.2.10"})
+	got := list(t, s)
+	if len(got) != 1 || got[0].Backend.Scheme != "https" || got[0].Name != "Nice" {
+		t.Fatalf("got %+v", got)
+	}
+	if w := s.Warnings(); len(w) != 1 || !strings.Contains(w[0], "\"b\"") {
+		t.Fatalf("warnings %v", w)
+	}
+}
+
+func TestContainerNameSelection(t *testing.T) {
+	l := lbl("doorwarden.enable", "true")
+	a := container("x", "running", l, []map[string]any{port(80, 8080)}, nil)
+	a["Names"] = []string{"/parent/alias", "/real"}
+	b := container("x", "running", l, []map[string]any{port(80, 8081)}, nil)
+	b["Names"] = []string{"/parent/alias"}
+	c := container("x", "running", l, []map[string]any{port(80, 8082)}, nil)
+	c["Names"] = []string{}
+	got := list(t, newSrc(t, fake(t, []ctr{a, b, c}), Config{TargetIP: "192.0.2.10"}))
+	if len(got) != 1 || got[0].Key != "docker:real" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestUDPPortIgnored(t *testing.T) {
+	udp := port(53, 5353)
+	udp["Type"] = "udp"
+	srv := fake(t, []ctr{container("whoami", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8080), udp}, nil)})
 	got := list(t, newSrc(t, srv, Config{TargetIP: "192.0.2.10"}))
-	if len(got) != 1 || got[0].State != model.StateStopped || got[0].Key != "docker:whoami" {
+	if got[0].State != model.StateDiscovered || got[0].Backend.Port != 8080 {
+		t.Fatalf("got %+v", got[0])
+	}
+}
+
+func TestUnixSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("", "dw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "d.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skip("unix sockets unavailable:", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]ctr{container("whoami", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8080)}, nil)})
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	s, err := New(Config{Endpoint: "unix://" + sock, TargetIP: "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := list(t, s)
+	if len(got) != 1 || got[0].Backend.Port != 8080 {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -226,10 +326,11 @@ func TestKeyStableAcrossRecreate(t *testing.T) {
 }
 
 func TestWarningsReset(t *testing.T) {
-	bad := true
+	var bad atomic.Bool
+	bad.Store(true)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		l := lbl("doorwarden.enable", "true")
-		if bad {
+		if bad.Load() {
 			l["doorwarden.port"] = "x"
 		}
 		_ = json.NewEncoder(w).Encode([]ctr{container("whoami", "running", l, []map[string]any{port(80, 8080)}, nil)})
@@ -240,7 +341,7 @@ func TestWarningsReset(t *testing.T) {
 	if len(s.Warnings()) != 1 {
 		t.Fatal(s.Warnings())
 	}
-	bad = false
+	bad.Store(false)
 	list(t, s)
 	if len(s.Warnings()) != 0 {
 		t.Fatal(s.Warnings())
