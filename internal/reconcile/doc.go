@@ -346,14 +346,19 @@
 // destructive or bookkeeping action re-checks the stored state before it
 // acts, and does nothing (logged) when it differs from what the plan saw:
 //   - DNSDelete carries its planned RemovedAfter; the executor re-reads the
-//     row and deletes only if it has the same owner, value and RemovedAfter,
-//     and that is due (strictly before now, in whole seconds). It deletes at
-//     the provider first, then the row with store.DeleteOwnedRecordIfDue. If
-//     the row changed between the two (a cancel, reschedule or reassign won
-//     the race) the record is gone but the row is not: the executor logs an
-//     error activity, blanks the row's stored value and provider ID, and the
-//     next plan's DNSEnsure re-creates the record (bounded gap, never a
-//     permanent loss).
+//     row and deletes only if it has the same owner and RemovedAfter, and
+//     that is due (strictly before now, in whole seconds). The value is NOT
+//     compared: the provider delete always uses the STORED row's ID and
+//     value, never the action's, so a stale value in the action cannot
+//     target another record. It deletes at the provider first, then the row
+//     with store.DeleteOwnedRecordIfDue. If the row changed between the two
+//     (a cancel, reschedule or reassign won the race), or that row delete
+//     fails, the record is gone but the row is not: the executor logs an
+//     error activity and blanks the row's stored value and provider ID. A
+//     returning owner's plan then sees another value and its DNSEnsure
+//     re-creates the record (bounded gap, never a permanent loss; drift
+//     repair covers any other case), and a DNSDelete of a blank row forgets
+//     it without a provider call.
 //   - DNSScheduleRemoval acts only on an unscheduled row, DNSCancelRemoval
 //     only on a scheduled one, and DNSReassign only on a row that still has
 //     the old owner; all require the same owner and value.
@@ -369,7 +374,8 @@
 // (its RouteWrite is a no-op in the route executor). The re-checks above are
 // read-then-write, not one transaction; the final row write in each is
 // owner- and schedule-guarded in SQL. store.DeleteOwnedRecord (unconditional)
-// is for the UI/admin only; reconcile never calls it.
+// is for the UI/admin only; reconcile never calls it (its only row deletion
+// is store.DeleteOwnedRecordIfDue).
 //
 // # Execution
 //

@@ -218,23 +218,6 @@ func TestDeleteOwnedRecordIfDue(t *testing.T) {
 	}
 }
 
-func TestDeleteOwnedRecordOwned(t *testing.T) {
-	s, _ := openTemp(t)
-	ctx := context.Background()
-	if err := s.AddOwnedRecord(ctx, rec("cf", "example.test", "app.example.test", "A", "192.0.2.1", "docker:app")); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := s.DeleteOwnedRecordOwned(ctx, "cf", "example.test", "app.example.test", "A", "docker:other"); ok || err != nil {
-		t.Fatalf("other owner: %v %v", ok, err)
-	}
-	if ok, err := s.DeleteOwnedRecordOwned(ctx, "cf", "example.test", "App.Example.Test.", "a", "docker:app"); !ok || err != nil {
-		t.Fatalf("owner: %v %v", ok, err)
-	}
-	if got, _ := s.ListOwnedRecords(ctx, "cf", "example.test"); len(got) != 0 {
-		t.Fatalf("rows %+v", got)
-	}
-}
-
 func TestReassignOwnedRecordOwnerGuarded(t *testing.T) {
 	s, _ := openTemp(t)
 	ctx := context.Background()

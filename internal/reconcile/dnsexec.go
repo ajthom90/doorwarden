@@ -86,8 +86,8 @@ type DNSExecutorConfig struct {
 
 type dnsZone struct{ name, provider, mode string }
 
-// DNSExecutor applies DNSEnsure, DNSDelete, DNSScheduleRemoval and
-// DNSCancelRemoval actions. It only ever updates
+// DNSExecutor applies every kind in DNSActionKinds: DNSEnsure, DNSDelete,
+// DNSScheduleRemoval, DNSCancelRemoval and DNSReassign. It only ever updates
 // or deletes provider records that have an ownership row whose owner key
 // equals the action's Owner, and it only creates a record after its own
 // listing of the zone showed that nothing else holds the name.
@@ -135,6 +135,12 @@ type dnsZone struct{ name, provider, mode string }
 // UI path must use its own call). dns.ErrNotFound or nil from the provider
 // forgets the row; any other error keeps it (the row, still past its
 // RemovedAfter, makes the next Plan emit the DNSDelete again).
+//
+// DNSReassign: no provider call. The row is moved from Action.Owner to
+// Action.NewOwner and its RemovedAfter cleared (store.ReassignOwnedRecord,
+// guarded by the old owner), only if the stored row still has the old owner
+// and the action's value, and only to a valid, Published, non-"zone:" new
+// owner carried in Action.Svc; the wildcard record is refused.
 //
 // DNSScheduleRemoval / DNSCancelRemoval: no provider call. The row for
 // (provider, zone, name, type) gets RemovedAfter = Action.RemovedAfter
@@ -837,21 +843,60 @@ func (b *dnsBatch) delete(ctx context.Context, t dnsTarget, a Action) error {
 		return nil
 	}
 	stored := dns.Record{ID: row.ProviderRecordID, Name: normName(row.Name), Type: normType(row.Type), Value: row.Value}
-	err = b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
-	if err != nil && !errors.Is(err, dns.ErrNotFound) {
-		return err
+	if stored.ID != "" || strings.TrimSpace(stored.Value) != "" {
+		err = b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
+		if err != nil && !errors.Is(err, dns.ErrNotFound) {
+			return err
+		}
+		b.forget(t, stored)
 	}
-	b.forget(t, stored)
+	// else: a blanked row (its record is already known to be gone, see
+	// rowChangedAfterDelete): never send a delete without an ID or a value.
 	bctx := context.WithoutCancel(ctx)
 	deleted, err := b.e.st.DeleteOwnedRecordIfDue(bctx, t.provider, t.zone, t.name, t.typ, t.owner, now)
 	if err != nil {
-		return fmt.Errorf("deleted %s (provider id %q) but could not forget its ownership row: %w", t, stored.ID, err)
+		return b.rowNotForgotten(bctx, t, stored, err)
 	}
 	if !deleted {
 		return b.rowChangedAfterDelete(bctx, t, stored)
 	}
 	b.e.activity(ctx, "info", fmt.Sprintf("deleted %s %s at %s/%s (owner %s, provider id %q)", t, stored.Value, t.provider, t.zone, t.owner, stored.ID))
 	return nil
+}
+
+// rowNotForgotten handles a store error from the conditional row delete
+// after the provider delete: the record is gone but the row still claims it.
+// Like rowChangedAfterDelete the row's value and provider ID are blanked
+// (best effort: the store just failed), so neither a returning owner (whose
+// plan then sees another value and re-creates through the guarded path) nor
+// the next DNSDelete (which then forgets the row without a provider call)
+// relies on a record that no longer exists.
+func (b *dnsBatch) rowNotForgotten(ctx context.Context, t dnsTarget, stored dns.Record, serr error) error {
+	msg := fmt.Sprintf("DELETED %s %s at %s/%s (provider id %q) BUT COULD NOT FORGET ITS OWNERSHIP ROW (%v)",
+		t, stored.Value, t.provider, t.zone, stored.ID, serr)
+	if stored.ID != "" || stored.Value != "" {
+		b.blankRow(ctx, t, stored, &msg)
+	}
+	b.e.activity(ctx, "error", msg)
+	return fmt.Errorf("deleted %s (provider id %q) but could not forget its ownership row: %w", t, stored.ID, serr)
+}
+
+// blankRow clears the value and provider ID of t's row (keeping owner and
+// schedule) if it still names stored, appending a failure note to msg.
+func (b *dnsBatch) blankRow(ctx context.Context, t dnsTarget, stored dns.Record, msg *string) {
+	cur, err := b.e.ownedRow(ctx, t)
+	if err != nil {
+		*msg += fmt.Sprintf(" (marking the row for re-creation failed: %v)", err)
+		return
+	}
+	if cur == nil || cur.Value != stored.Value || cur.ProviderRecordID != stored.ID {
+		return
+	}
+	nr := *cur
+	nr.Value, nr.ProviderRecordID = "", ""
+	if perr := b.e.persist(ctx, nr); perr != nil {
+		*msg += fmt.Sprintf(" (marking the row for re-creation failed: %v)", perr)
+	}
 }
 
 // rowChangedAfterDelete handles a row that changed (removal cancelled or
@@ -863,13 +908,7 @@ func (b *dnsBatch) delete(ctx context.Context, t dnsTarget, a Action) error {
 func (b *dnsBatch) rowChangedAfterDelete(ctx context.Context, t dnsTarget, stored dns.Record) error {
 	msg := fmt.Sprintf("DELETED %s %s at %s/%s (provider id %q) BUT ITS OWNERSHIP ROW CHANGED meanwhile (removal cancelled, re-scheduled or re-owned); the row is kept and the next cycle re-creates the record",
 		t, stored.Value, t.provider, t.zone, stored.ID)
-	if cur, err := b.e.ownedRow(ctx, t); err == nil && cur != nil && cur.Value == stored.Value && cur.ProviderRecordID == stored.ID {
-		nr := *cur
-		nr.Value, nr.ProviderRecordID = "", ""
-		if perr := b.e.persist(ctx, nr); perr != nil {
-			msg += fmt.Sprintf(" (marking the row for re-creation failed: %v)", perr)
-		}
-	}
+	b.blankRow(ctx, t, stored, &msg)
 	b.e.activity(ctx, "error", msg)
 	return errors.New("row changed during the delete: " + msg)
 }

@@ -108,8 +108,7 @@ func (s *Store) ListAllOwnedRecords(ctx context.Context) ([]DNSRecord, error) {
 // DeleteOwnedRecord forgets ownership of a record (no error if absent),
 // whoever owns it. Matching is exact on (provider, zone, normalized name,
 // normalized type). It is for UI/admin paths only (an explicit user
-// decision); the reconciler uses the conditional DeleteOwnedRecordIfDue and
-// DeleteOwnedRecordOwned.
+// decision); the reconciler uses only the conditional DeleteOwnedRecordIfDue.
 func (s *Store) DeleteOwnedRecord(ctx context.Context, provider, zone, name, typ string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ?`, provider, zone, normName(name), normType(typ))
 	return err
@@ -124,19 +123,6 @@ func (s *Store) DeleteOwnedRecordIfDue(ctx context.Context, provider, zone, name
 	res, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ?
 		AND owner_key = ? AND removed_after IS NOT NULL AND removed_after < ?`,
 		provider, zone, normName(name), normType(typ), owner, toUnix(notAfter))
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	return n > 0, err
-}
-
-// DeleteOwnedRecordOwned deletes the row for (provider, zone, normalized
-// name, normalized type) only if it is owned by owner; deleted reports
-// whether a row was deleted.
-func (s *Store) DeleteOwnedRecordOwned(ctx context.Context, provider, zone, name, typ, owner string) (deleted bool, err error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM dns_records WHERE provider = ? AND zone = ? AND name = ? AND type = ? AND owner_key = ?`,
-		provider, zone, normName(name), normType(typ), owner)
 	if err != nil {
 		return false, err
 	}
