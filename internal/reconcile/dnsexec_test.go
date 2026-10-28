@@ -290,7 +290,7 @@ func TestDNSExecEnsureWithoutUpdateCapReplacesOwnRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs := r.fk.Calls()[skip:]
-	if got := strings.Join(ops(r.fk, skip), ","); got != "DeleteRecord,ListRecords,CreateRecord" || cs[0].Record.ID != rec.ID {
+	if got := strings.Join(ops(r.fk, skip), ","); got != "ListRecords,DeleteRecord,CreateRecord" || cs[1].Record.ID != rec.ID {
 		t.Fatalf("calls %+v", cs)
 	}
 	rows := r.rows(t)

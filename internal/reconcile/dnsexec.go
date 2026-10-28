@@ -283,8 +283,14 @@ func (e *DNSExecutor) resolve(a Action) (dnsTarget, error) {
 	if t.owner == "" {
 		return dnsTarget{}, fmt.Errorf("%w: action has no owner key", ErrDNSRefused)
 	}
-	if strings.HasPrefix(t.owner, "zone:") && t.owner != WildcardOwnerKey(zn) {
-		return dnsTarget{}, fmt.Errorf("%w: owner %q is not this zone's owner key", ErrDNSRefused, t.owner)
+	// The wildcard record and the zone owner key go together: "*.zone" must be
+	// owned by exactly WildcardOwnerKey(zone), and a "zone:" owner (prefix
+	// compared case-insensitively) may own only "*.zone".
+	if strings.HasPrefix(strings.ToLower(t.owner), "zone:") || strings.HasPrefix(t.name, "*.") {
+		if t.owner != WildcardOwnerKey(zn) || t.name != "*."+zn {
+			return dnsTarget{}, fmt.Errorf("%w: record %s with owner %q: the wildcard record *.%s must be owned by exactly %q",
+				ErrDNSRefused, t.name, t.owner, zn, WildcardOwnerKey(zn))
+		}
 	}
 	return t, nil
 }
@@ -339,20 +345,13 @@ func (b *dnsBatch) ensure(ctx context.Context, t dnsTarget) error {
 }
 
 func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord) error {
-	stored := dns.Record{ID: row.ProviderRecordID, Name: normName(row.Name), Type: normType(row.Type), Value: row.Value}
-	if !t.p.Capabilities().Update {
-		// Replace our own record: delete it by its stored identity, forget
-		// it, then create the new value through the guarded path.
-		err := b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
-		if err != nil && !errors.Is(err, dns.ErrNotFound) {
-			return fmt.Errorf("provider has no in-place update; deleting the old record (id %q) failed: %w", stored.ID, err)
-		}
-		b.forget(t, stored)
-		if err := b.e.st.DeleteOwnedRecord(context.WithoutCancel(ctx), t.provider, t.zone, t.name, t.typ); err != nil {
-			return fmt.Errorf("old record deleted at the provider but its ownership row was kept: %w", err)
-		}
-		return b.create(ctx, t, nil)
+	if row.ProviderRecordID == "" || !t.p.Capabilities().Update {
+		// Never UpdateRecord without a stored ID: an ID-less update targets
+		// (name, type) and would overwrite (and so adopt) whatever record
+		// holds the name now, ours or not.
+		return b.replace(ctx, t, row)
 	}
+	stored := dns.Record{ID: row.ProviderRecordID, Name: t.name, Type: t.typ, Value: row.Value}
 	rec := dns.Record{ID: row.ProviderRecordID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
 	var got dns.Record
 	err := b.e.call(ctx, func(c context.Context) (err error) { got, err = t.p.UpdateRecord(c, t.zone, rec); return })
@@ -365,25 +364,141 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 	if err != nil {
 		return err
 	}
-	if got.ID == "" {
-		got.ID = row.ProviderRecordID
-	}
 	b.forget(t, stored)
-	b.remember(t, dns.Record{ID: got.ID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl})
-	nr := *row
-	nr.Zone, nr.Name, nr.Type, nr.Value, nr.ProviderRecordID = t.zone, t.name, t.typ, t.value, got.ID
-	if err := b.e.persist(ctx, nr); err != nil {
-		// The provider holds the new value under the same owned identity;
-		// the next cycle repeats the (idempotent) update by the stored ID.
-		b.e.activity(ctx, "error", fmt.Sprintf("updated %s at %s/%s (provider id %q) but could not update its ownership row: %v",
-			t, t.provider, t.zone, got.ID, err))
-		return fmt.Errorf("updated %s (provider id %q) but could not update its ownership row: %w", t, got.ID, err)
+	id := got.ID
+	if id == "" {
+		// The provider may have replaced the record (new ID) without saying
+		// so: look the record up again rather than keep a possibly stale ID.
+		id = b.findID(ctx, t)
+		if id == "" {
+			b.e.activity(ctx, "warn", fmt.Sprintf("updated %s at %s/%s but could not determine its provider id; stored without id (later changes use the replace path)",
+				t, t.provider, t.zone))
+		}
+	} else {
+		b.remember(t, dns.Record{ID: id, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl})
 	}
-	b.e.activity(ctx, "info", fmt.Sprintf("updated %s at %s/%s: %s -> %s (owner %s)", t, t.provider, t.zone, row.Value, t.value, t.owner))
+	nr := *row
+	nr.Zone, nr.Name, nr.Type, nr.Value, nr.ProviderRecordID = t.zone, t.name, t.typ, t.value, id
+	if err := b.e.persist(ctx, nr); err != nil {
+		// The old ID state cannot be restored (the provider may have rotated
+		// it): tell the operator exactly which record and ID to fix.
+		b.e.activity(ctx, "error", fmt.Sprintf("UPDATED %s at %s/%s to %s (new provider id %q) BUT COULD NOT UPDATE ITS OWNERSHIP ROW (still value %s, id %q): %v",
+			t, t.provider, t.zone, t.value, id, row.Value, row.ProviderRecordID, err))
+		return fmt.Errorf("updated %s to %s (new provider id %q) but could not update its ownership row: %w", t, t.value, id, err)
+	}
+	b.e.activity(ctx, "info", fmt.Sprintf("updated %s at %s/%s: %s -> %s (owner %s, provider id %q)", t, t.provider, t.zone, row.Value, t.value, t.owner, id))
 	return nil
 }
 
-// blocks reports whether listed record r prevents creating t.
+// findID re-lists t's zone (refreshing the batch cache) and returns the ID of
+// the single record with t's exact name, type and value, or "" when it cannot
+// be determined.
+func (b *dnsBatch) findID(ctx context.Context, t dnsTarget) string {
+	delete(b.listings, t.provider+"/"+t.zone)
+	l := b.listing(ctx, t)
+	if l.err != nil {
+		return ""
+	}
+	id, n := "", 0
+	for _, r := range l.recs {
+		if normName(r.Name) == t.name && normType(r.Type) == t.typ && sameValue(r.Value, t.value) {
+			id, n = r.ID, n+1
+		}
+	}
+	if n != 1 {
+		return ""
+	}
+	return id
+}
+
+// isOwn reports whether listed record r is our stored record: by ID when both
+// have one, otherwise by exact value.
+func isOwn(r, stored dns.Record) bool {
+	if stored.ID != "" && r.ID != "" {
+		return r.ID == stored.ID
+	}
+	return sameValue(r.Value, stored.Value)
+}
+
+// replace changes an owned record's value without UpdateRecord (empty stored
+// ID, or no in-place update on this provider instance). All checks run
+// before anything is deleted: the listing must be available, and at t's name
+// nothing but our stored record may exist (another value of the same type,
+// or a CNAME, is a Conflict and nothing changes). Then our record is deleted
+// by its stored identity (ID, or exact name/type/STORED value), the new
+// value is created and the same ownership row is updated in place. If the
+// create fails the old value is re-created (best effort, loudly) so the
+// service keeps DNS; if that fails too the row is kept and the next cycle
+// re-creates through the guarded path.
+func (b *dnsBatch) replace(ctx context.Context, t dnsTarget, row *store.DNSRecord) error {
+	stored := dns.Record{ID: row.ProviderRecordID, Name: t.name, Type: t.typ, Value: row.Value}
+	l := b.listing(ctx, t)
+	if l.err != nil {
+		b.e.activity(ctx, "warn", fmt.Sprintf("not changing %s at %s/%s: listing the zone failed, so foreign records are unknown: %v",
+			t, t.provider, t.zone, l.err))
+		return fmt.Errorf("%w: %w", ErrListingUnavailable, l.err)
+	}
+	ownPresent := false
+	for _, r := range l.recs {
+		if normName(r.Name) != t.name {
+			continue
+		}
+		if normType(r.Type) == t.typ && isOwn(r, stored) {
+			ownPresent = true
+			continue
+		}
+		if blocks(r, t) {
+			b.e.activity(ctx, "warn", fmt.Sprintf("conflict: not changing %s at %s/%s: foreign record %s %s %s (id %q) exists next to ours; adopt or remove it",
+				t, t.provider, t.zone, normName(r.Name), normType(r.Type), r.Value, r.ID))
+			return fmt.Errorf("%w: %s %s %s (id %q)", ErrForeignRecord, normName(r.Name), normType(r.Type), r.Value, r.ID)
+		}
+	}
+	if ownPresent {
+		err := b.e.call(ctx, func(c context.Context) error { return t.p.DeleteRecord(c, t.zone, stored) })
+		if err != nil && !errors.Is(err, dns.ErrNotFound) {
+			return fmt.Errorf("deleting the old record (value %s, id %q) failed: %w", stored.Value, stored.ID, err)
+		}
+		b.forget(t, stored)
+	}
+	created, err := b.doCreate(ctx, t, row)
+	if err == nil || created || !ownPresent || errors.Is(err, ErrForeignRecord) {
+		return err
+	}
+	return b.restore(ctx, t, row, err)
+}
+
+// restore re-creates the old value of row after its replacement could not be
+// created, and points the row at the restored record.
+func (b *dnsBatch) restore(ctx context.Context, t dnsTarget, row *store.DNSRecord, cerr error) error {
+	bctx := context.WithoutCancel(ctx)
+	old := dns.Record{Name: t.name, Type: t.typ, Value: row.Value, TTL: t.ttl}
+	var got dns.Record
+	rerr := b.e.call(bctx, func(c context.Context) (err error) { got, err = t.p.CreateRecord(c, t.zone, old); return })
+	if rerr != nil {
+		msg := fmt.Sprintf("replacing %s at %s/%s: old value %s deleted, creating %s failed (%v) and restoring %s failed (%v); no record until the next cycle re-creates it",
+			t, t.provider, t.zone, row.Value, t.value, cerr, row.Value, rerr)
+		b.e.activity(ctx, "error", msg)
+		return errors.New(msg)
+	}
+	b.remember(t, dns.Record{ID: got.ID, Name: t.name, Type: t.typ, Value: row.Value, TTL: t.ttl})
+	nr := *row
+	nr.Zone, nr.Name, nr.Type, nr.ProviderRecordID = t.zone, t.name, t.typ, got.ID
+	if perr := b.e.persist(ctx, nr); perr != nil {
+		msg := fmt.Sprintf("replacing %s at %s/%s: creating %s failed (%v); old value %s restored (new provider id %q) but its ownership row could not be updated: %v",
+			t, t.provider, t.zone, t.value, cerr, row.Value, got.ID, perr)
+		b.e.activity(ctx, "error", msg)
+		return errors.New(msg)
+	}
+	b.e.activity(ctx, "error", fmt.Sprintf("replacing %s at %s/%s: creating %s failed (%v); old value %s restored (provider id %q)",
+		t, t.provider, t.zone, t.value, cerr, row.Value, got.ID))
+	return fmt.Errorf("creating %s failed: %w; old value %s restored (provider id %q)", t.value, cerr, row.Value, got.ID)
+}
+
+// blocks reports whether listed record r prevents creating t: same name and
+// the same type, or a CNAME on either side. Deliberately not blocking: a
+// record of another type at the name (so our AAAA may sit next to a foreign
+// A, a dual-stack split, and our A next to foreign TXT/MX). NS delegations
+// (a foreign NS at or above the name inside the zone) are not considered.
 func blocks(r dns.Record, t dnsTarget) bool {
 	if normName(r.Name) != t.name {
 		return false
@@ -410,29 +525,37 @@ func (b *dnsBatch) create(ctx context.Context, t dnsTarget, base *store.DNSRecor
 			t, t.provider, t.zone, normName(r.Name), normType(r.Type), r.Value, r.ID))
 		return fmt.Errorf("%w: %s %s %s (id %q)", ErrForeignRecord, normName(r.Name), normType(r.Type), r.Value, r.ID)
 	}
+	_, err := b.doCreate(ctx, t, base)
+	return err
+}
+
+// doCreate creates t at the provider (the caller ran the foreign-record
+// checks) and records ownership, rolling back on failure. created reports
+// whether the provider create succeeded.
+func (b *dnsBatch) doCreate(ctx context.Context, t dnsTarget, base *store.DNSRecord) (created bool, err error) {
 	want := dns.Record{Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
 	var got dns.Record
-	err := b.e.call(ctx, func(c context.Context) (err error) { got, err = t.p.CreateRecord(c, t.zone, want); return })
+	err = b.e.call(ctx, func(c context.Context) (err error) { got, err = t.p.CreateRecord(c, t.zone, want); return })
 	if errors.Is(err, dns.ErrRecordExists) {
 		delete(b.listings, t.provider+"/"+t.zone) // the cached listing is stale
 		b.e.activity(ctx, "warn", fmt.Sprintf("conflict: not creating %s at %s/%s: a foreign record appeared", t, t.provider, t.zone))
-		return fmt.Errorf("%w: %w", ErrForeignRecord, err)
+		return false, fmt.Errorf("%w: %w", ErrForeignRecord, err)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
-	created := dns.Record{ID: got.ID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
-	b.remember(t, created)
+	rec := dns.Record{ID: got.ID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
+	b.remember(t, rec)
 	row := store.DNSRecord{Provider: t.provider, Zone: t.zone, Name: t.name, Type: t.typ, Value: t.value,
 		ProviderRecordID: got.ID, OwnerKey: t.owner, CreatedAt: b.e.now()}
 	if base != nil {
 		row.CreatedAt, row.RemovedAfter = base.CreatedAt, base.RemovedAfter
 	}
 	if err := b.e.persist(ctx, row); err != nil {
-		return b.rollback(ctx, t, created, base, err)
+		return true, b.rollback(ctx, t, rec, base, err)
 	}
 	b.e.activity(ctx, "info", fmt.Sprintf("created %s %s at %s/%s (owner %s, provider id %q)", t, t.value, t.provider, t.zone, t.owner, got.ID))
-	return nil
+	return true, nil
 }
 
 // rollback deletes a record just created whose ownership could not be
@@ -447,8 +570,9 @@ func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record
 	// rollback: the listing proved the name was free before the create.
 	if rows, err := e.st.ListOwnedRecords(bctx, t.provider, t.zone); err == nil {
 		for _, r := range rows {
-			if base != nil && r.OwnerKey == base.OwnerKey && r.ProviderRecordID == base.ProviderRecordID && r.ProviderRecordID != created.ID {
-				continue // our own stale row (re-create after ErrNotFound): it points at the gone record
+			if base != nil && r.OwnerKey == base.OwnerKey && normName(r.Name) == t.name && normType(r.Type) == t.typ &&
+				r.ProviderRecordID == base.ProviderRecordID && r.Value == base.Value {
+				continue // our own unchanged row (re-create/replace): it points at the old record, not this one
 			}
 			if (created.ID != "" && r.ProviderRecordID == created.ID) || (normName(r.Name) == t.name && normType(r.Type) == t.typ) {
 				msg := fmt.Sprintf("created %s %s at %s/%s (provider id %q) but could not record ownership (%v); left in place because an ownership row of %s now references it",
@@ -475,7 +599,7 @@ func (b *dnsBatch) rollback(ctx context.Context, t dnsTarget, created dns.Record
 }
 
 func (b *dnsBatch) delete(ctx context.Context, t dnsTarget) error {
-	if strings.HasPrefix(t.owner, "zone:") || strings.HasPrefix(t.name, "*.") {
+	if strings.HasPrefix(strings.ToLower(t.owner), "zone:") || strings.HasPrefix(t.name, "*.") {
 		b.e.activity(ctx, "warn", fmt.Sprintf("refused to delete %s at %s/%s: the wildcard record is never deleted automatically",
 			t, t.provider, t.zone))
 		return fmt.Errorf("%w: the wildcard record is never deleted automatically", ErrDNSRefused)
@@ -557,7 +681,7 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 	}
 	var msg string
 	switch {
-	case a.Kind == DNSDelete && (strings.HasPrefix(t.owner, "zone:") || strings.HasPrefix(t.name, "*.")):
+	case a.Kind == DNSDelete && (strings.HasPrefix(strings.ToLower(t.owner), "zone:") || strings.HasPrefix(t.name, "*.")):
 		msg = fmt.Sprintf("dry run: would refuse to delete wildcard record %s at %s", t, where)
 	case a.Kind == DNSDelete && row == nil:
 		msg = fmt.Sprintf("dry run: nothing to delete for %s at %s (not owned)", t, where)
@@ -574,6 +698,8 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 		msg = fmt.Sprintf("dry run: would refuse (conflict) %s at %s: owned by %s", t, where, row.OwnerKey)
 	case sameValue(row.Value, t.value):
 		msg = fmt.Sprintf("dry run: %s at %s already up to date", t, where)
+	case row.ProviderRecordID == "" || !t.p.Capabilities().Update:
+		msg = fmt.Sprintf("dry run: would replace %s at %s: %s -> %s (delete + create; pre-checks not performed in dry run)", t, where, row.Value, t.value)
 	default:
 		msg = fmt.Sprintf("dry run: would update %s at %s: %s -> %s (provider id %q)", t, where, row.Value, t.value, row.ProviderRecordID)
 	}
