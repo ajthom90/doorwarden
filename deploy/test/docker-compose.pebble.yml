@@ -12,7 +12,7 @@ name: doorwarden-pebble
 services:
   pebble:
     image: ghcr.io/letsencrypt/pebble:2.10.1
-    command: -config test/config/pebble-config.json -strict -dnsserver 10.231.50.3:8053
+    command: -config test/config/pebble-config.json -strict -dnsserver 192.0.2.3:8053
     environment:
       PEBBLE_VA_NOSLEEP: "1"
       # No random nonce rejection / authz reuse: deterministic tests.
@@ -23,12 +23,12 @@ services:
       - "15000:15000"
     networks:
       acmenet:
-        ipv4_address: 10.231.50.2
+        ipv4_address: 192.0.2.2
   pebble-eab:
     image: ghcr.io/letsencrypt/pebble:2.10.1
     # Upstream test config: externalAccountBindingRequired with the
     # well-known public test MAC keys kid-1..kid-3.
-    command: -config test/config/pebble-config-external-account-bindings.json -strict -dnsserver 10.231.50.3:8053
+    command: -config test/config/pebble-config-external-account-bindings.json -strict -dnsserver 192.0.2.3:8053
     environment:
       PEBBLE_VA_NOSLEEP: "1"
       PEBBLE_WFE_NONCEREJECT: "0"
@@ -37,19 +37,19 @@ services:
       - "14001:14000"
     networks:
       acmenet:
-        ipv4_address: 10.231.50.4
+        ipv4_address: 192.0.2.4
   challtestsrv:
     image: ghcr.io/letsencrypt/pebble-challtestsrv:2.10.1
-    command: -defaultIPv6 "" -defaultIPv4 10.231.50.3
+    command: -defaultIPv6 "" -defaultIPv4 192.0.2.3
     ports:
       - "8055:8055"
     networks:
       acmenet:
-        ipv4_address: 10.231.50.3
+        ipv4_address: 192.0.2.3
 networks:
   acmenet:
     driver: bridge
     ipam:
       driver: default
       config:
-        - subnet: 10.231.50.0/24
+        - subnet: 192.0.2.0/24
