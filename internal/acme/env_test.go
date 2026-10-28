@@ -117,7 +117,12 @@ func TestRealLegoProviderConstruction(t *testing.T) {
 	if _, err := h.m.dnsChallengeProvider("cf"); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Providers["cf"] = config.ProviderCfg{Type: "cloudflare", Extra: map[string]any{"api_token": "not-mapped-secret"}}
+	// The api_token alias alone is enough for the real constructor.
+	cfg.Providers["cf"] = config.ProviderCfg{Type: "cloudflare", Extra: map[string]any{"api_token": "alias-token-value"}}
+	if _, err := h.m.dnsChallengeProvider("cf"); err != nil {
+		t.Fatalf("api_token alias not mapped: %v", err)
+	}
+	cfg.Providers["cf"] = config.ProviderCfg{Type: "cloudflare", Extra: map[string]any{"zone_hint": "not-mapped-secret"}}
 	_, err := h.m.dnsChallengeProvider("cf")
 	if err == nil {
 		t.Fatal("want missing credentials error")
@@ -125,7 +130,7 @@ func TestRealLegoProviderConstruction(t *testing.T) {
 	if contains(err.Error(), "not-mapped-secret") {
 		t.Fatal("setting value leaked into the error")
 	}
-	if !contains(h.logs.String(), "api_token") || contains(h.logs.String(), "not-mapped-secret") {
+	if !contains(h.logs.String(), "zone_hint") || contains(h.logs.String(), "not-mapped-secret") {
 		t.Fatalf("ignored key should be logged by name only: %s", h.logs.String())
 	}
 }

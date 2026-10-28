@@ -134,7 +134,7 @@ func testConfig() *config.Config {
 			{Name: "noissuer.test", TargetIP: "192.0.2.10"},
 		},
 		Providers: map[string]config.ProviderCfg{
-			"cf":  {Type: "cloudflare", Extra: map[string]any{"cf_dns_api_token": "cf-secret-token", "api_token": "ignored"}},
+			"cf":  {Type: "cloudflare", Extra: map[string]any{"cf_dns_api_token": "cf-secret-token", "zone_hint": "ignored"}},
 			"r53": {Type: "route53", Extra: map[string]any{"AWS_ACCESS_KEY_ID": "AKIDEXAMPLE", "AWS_SECRET_ACCESS_KEY": "r53-secret", "AWS_REGION": "us-east-1"}},
 		},
 		Issuers:  map[string]config.Issuer{"le": {Directory: "staging", Email: "admin@example.test"}},

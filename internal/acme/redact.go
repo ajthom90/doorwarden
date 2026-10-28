@@ -583,6 +583,9 @@ var keyTokenRe = regexp.MustCompile(`[A-Za-z0-9+/=_-]{16,}`)
 // form), or its name (setting key or lego variable) looks like one.
 // Additional settings (TTLs, timeouts, base URLs) are not secrets.
 func isCredentialSetting(cat ChallengeProvider, key, envName string) bool {
+	if a, ok := settingAliases[cat.Name][settingKey(key)]; ok && a.Credential {
+		return true
+	}
 	if envName != "" {
 		for _, c := range cat.Credentials {
 			if envName == c || envName == c+"_FILE" {
@@ -594,9 +597,9 @@ func isCredentialSetting(cat ChallengeProvider, key, envName string) bool {
 }
 
 // registerSetting registers one provider setting's secret value(s): for a
-// file setting the file's contents, otherwise the value itself (unless it
-// is a plain endpoint URL). It returns false when a value is too short to
-// redact.
+// file setting the file's contents, otherwise, for a credential setting,
+// the value and (for a URL) its secret-bearing parts. It returns false when
+// a value is too short to redact.
 func (m *Manager) registerSetting(cat ChallengeProvider, key, envName, value string) bool {
 	if value == "" {
 		return true

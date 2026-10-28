@@ -61,23 +61,51 @@ func clonePrv(p ChallengeProvider) ChallengeProvider {
 	return p
 }
 
+// settingAlias maps a setting key that is not a lego variable name to the
+// variable it feeds, per provider type.
+type settingAlias struct {
+	Env        string
+	Credential bool
+}
+
+// settingAliases are the per-type alias keys. cloudflare's api_token is the
+// record provider's key in a shared providers: entry; it feeds lego's
+// primary token variable CLOUDFLARE_DNS_API_TOKEN (lego reads it before the
+// documented CF_DNS_API_TOKEN, so it wins when both are set).
+var settingAliases = map[string]map[string]settingAlias{
+	"cloudflare": {"API_TOKEN": {Env: "CLOUDFLARE_DNS_API_TOKEN", Credential: true}},
+}
+
+// settingKey normalizes a setting key: upper case, '-' read as '_'.
+func settingKey(k string) string {
+	return strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(k), "-", "_"))
+}
+
 // envForSettings maps provider settings to lego environment variables. A
-// setting key matches a documented variable case-insensitively with '-'
-// read as '_' (cf_dns_api_token => CF_DNS_API_TOKEN); <VAR>_FILE is accepted
-// for every documented VAR. Other keys (for example the record-provider
-// settings of a shared providers: entry) are returned in ignored, sorted;
-// their values are never returned or logged.
+// setting key matches a documented variable (ChallengeProvider.EnvVars, the
+// primary names lego documents) case-insensitively with '-' read as '_'
+// (cf_dns_api_token => CF_DNS_API_TOKEN); <VAR>_FILE is accepted for every
+// documented VAR; settingAliases adds a few per-type keys. Legacy aliases
+// lego also reads (for example RFC2136_* for rfc2136, whose documented
+// names are DNSUPDATE_*) are not accepted. Other keys (for example the
+// record-provider settings of a shared providers: entry) are returned in
+// ignored, sorted; their values are never returned or logged.
 func envForSettings(p ChallengeProvider, settings map[string]string) (env map[string]string, ignored []string) {
 	known := make(map[string]bool, len(p.EnvVars)*2)
 	for _, v := range p.EnvVars {
 		known[v] = true
 		known[v+"_FILE"] = true
 	}
+	aliases := settingAliases[p.Name]
 	env = map[string]string{}
 	for k, v := range settings {
-		n := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(k), "-", "_"))
+		n := settingKey(k)
 		if known[n] {
 			env[n] = v
+			continue
+		}
+		if a, ok := aliases[n]; ok {
+			env[a.Env] = v
 			continue
 		}
 		ignored = append(ignored, k)
