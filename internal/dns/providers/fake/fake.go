@@ -150,6 +150,10 @@ func (f *Fake) UpdateRecord(_ context.Context, zone string, r dns.Record) (dns.R
 	if i < 0 {
 		return dns.Record{}, dns.ErrNotFound
 	}
+	if cur := f.zones[zone][i]; cur.Name != r.Name || cur.Type != r.Type {
+		return dns.Record{}, fmt.Errorf("fake: update of record %q: name/type mismatch (%s %s vs stored %s %s): %w",
+			r.ID, r.Name, r.Type, cur.Name, cur.Type, dns.ErrNotFound)
+	}
 	r.ID = f.zones[zone][i].ID
 	f.zones[zone][i] = r
 	return r, nil

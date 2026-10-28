@@ -34,6 +34,10 @@ var (
 // value. DeleteRecord targets ID if set, otherwise exact (name, type, value);
 // a Delete whose ID or Value matches nothing stored is a no-op returning nil
 // and must never delete a record with a different value.
+//
+// If ID is set it wins: on Delete Name/Type/Value are ignored; on Update
+// Name/Type must match the stored record (a mismatch is an error, never a
+// silent rename).
 type Record struct {
 	ID    string
 	Name  string

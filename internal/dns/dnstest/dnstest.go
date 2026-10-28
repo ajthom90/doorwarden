@@ -4,8 +4,9 @@ package dnstest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -41,9 +42,13 @@ func find(recs []dns.Record, name, typ string) (dns.Record, bool) {
 // every call; each created record is deleted again on cleanup (best effort).
 func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 	if o.Zone == "" {
-		o.Zone = "example.test"
+		t.Fatal("dnstest.RunWith: Options.Zone is required (use Run for the example.test defaults)")
 	}
-	prefix := fmt.Sprintf("dwt%d", time.Now().UnixNano()%1_000_000_000)
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		t.Fatalf("dnstest: random prefix: %v", err)
+	}
+	prefix := "dwt" + hex.EncodeToString(rnd[:])
 	zone := o.Zone
 	name := func(label, z string) string { return prefix + "-" + label + "." + z }
 
@@ -129,9 +134,18 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 		}
 		create(t, p, zone, rec)
 		rec.Value = "192.0.2.11" // no ID: targets (name, type)
-		if _, err := p.UpdateRecord(ctx(t), zone, rec); err != nil {
+		upd, err := p.UpdateRecord(ctx(t), zone, rec)
+		if err != nil {
 			t.Fatal(err)
 		}
+		// Clean up the updated record by its own name/type/value too, so
+		// providers that return no ID (or whose create-time handle is stale)
+		// do not leak it.
+		t.Cleanup(func() {
+			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = p.DeleteRecord(c, zone, dns.Record{ID: upd.ID, Name: rec.Name, Type: rec.Type, Value: rec.Value})
+		})
 		if r, ok := find(list(t, p, zone), rec.Name, "A"); !ok || r.Value != "192.0.2.11" {
 			t.Fatalf("after update: %+v", r)
 		}
@@ -162,6 +176,18 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 			t.Skip("provider does not support Update")
 		}
 		if _, err := p.UpdateRecord(ctx(t), zone, mk("nope")); !errors.Is(err, dns.ErrNotFound) {
+			t.Fatalf("want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("UpdateUnknownID", func(t *testing.T) {
+		p := factory(t)
+		if !p.Capabilities().Update {
+			t.Skip("provider does not support Update")
+		}
+		r := mk("unkid")
+		r.ID = "doorwarden-no-such-id"
+		if _, err := p.UpdateRecord(ctx(t), zone, r); !errors.Is(err, dns.ErrNotFound) {
 			t.Fatalf("want ErrNotFound, got %v", err)
 		}
 	})
