@@ -43,7 +43,16 @@ type orderEvent struct {
 	Pending bool   `json:"pending,omitempty"`
 }
 
-type kvStore struct{ st *store.Store }
+// settingsBackend is the part of the store kv state goes through (tests
+// substitute a failing one).
+type settingsBackend interface {
+	GetSetting(ctx context.Context, key string) (string, bool, error)
+	SetSetting(ctx context.Context, key, value string) error
+}
+
+var _ settingsBackend = (*store.Store)(nil)
+
+type kvStore struct{ st settingsBackend }
 
 func (k kvStore) getJSON(ctx context.Context, key string, v any) (bool, error) {
 	s, ok, err := k.st.GetSetting(ctx, key)

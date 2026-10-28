@@ -199,7 +199,11 @@ type Manager struct {
 	// obtain places one ACME order (lego by default; replaced in tests).
 	obtain func(ctx context.Context, o order) (obtained, error)
 
-	stateMu   sync.Mutex // kv read-modify-write
+	stateMu sync.Mutex // kv read-modify-write; also guards memNext
+	// memNext is this process's fallback backoff for sets whose attempt
+	// record could not be persisted (unwritable store): it keeps the
+	// process from re-ordering in a loop when nothing can be stored.
+	memNext   map[string]time.Time
 	accountMu sync.Mutex // account key creation / registration
 	flightMu  sync.Mutex
 	inflight  map[string]bool
@@ -243,7 +247,7 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 		now: mc.Now, jitter: mc.Jitter, httpClient: mc.HTTPClient, providerByName: mc.ProviderByName,
 		http01: mc.HTTP01Provider, dnsOpts: mc.DNS01Options, settingValue: mc.SettingValue,
 		notifier: mc.Notifier, onChange: mc.OnChange, issueTimeout: mc.IssueTimeout, log: mc.Logger,
-		wanted: mc.Wanted, inflight: map[string]bool{},
+		wanted: mc.Wanted, inflight: map[string]bool{}, memNext: map[string]time.Time{},
 	}
 	if m.now == nil {
 		m.now = time.Now
@@ -640,7 +644,11 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 			// provider keeps its settings there for the whole order.
 			cerr := m.withChallengeProvider(z, ch, func(prov challenge.Provider) {
 				o.Provider = prov
-				m.beginAttempt(bg, issuer, id)
+				if derr := m.beginAttempt(bg, issuer, id); derr != nil {
+					// Nothing could be persisted: never contact the CA.
+					r = Result{CertID: id, Zone: normName(z.Name), Names: append([]string(nil), names...), Err: derr, NextAttempt: derr.Until}
+					return
+				}
 				started = true
 				ob, err := m.obtain(ctx, o)
 				m.endAttempt(bg, issuer, id, err == nil)
@@ -679,7 +687,11 @@ func (m *Manager) notify(ctx context.Context, ev *Event) {
 // and a pending order event is appended. A crash mid-order thus leaves a
 // deferred set and an order that counts toward the guards; endAttempt and
 // recordSuccess resolve both when the order returns.
-func (m *Manager) beginAttempt(ctx context.Context, issuer, id string) {
+//
+// If the attempt record cannot be stored the order must not be placed
+// (nothing would remember it after a crash): beginAttempt then returns a
+// DeferredError and sets this process's in-memory backoff for the set.
+func (m *Manager) beginAttempt(ctx context.Context, issuer, id string) *DeferredError {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 	now := m.now()
@@ -691,24 +703,32 @@ func (m *Manager) beginAttempt(ctx context.Context, issuer, id string) {
 		a.NextAttempt = a.ParkedUntil
 	}
 	if err := m.kv.putJSON(ctx, attemptKey(id), a); err != nil {
-		m.log.Warn("acme: persist attempt start", "cert", id, "err", err)
+		m.memNext[id] = a.NextAttempt
+		m.log.Error("acme: state store unwritable; order not placed", "cert", id, "err", err)
+		return &DeferredError{Until: a.NextAttempt, Reason: m.red.redact("state store unwritable: " + err.Error())}
 	}
+	delete(m.memNext, id)
 	evs := m.loadOrders(ctx, issuer, now)
 	evs = append(evs, orderEvent{T: now.Unix(), Set: id, Pending: true})
 	if err := m.kv.putJSON(ctx, ordersKey(issuer), evs); err != nil {
 		m.log.Warn("acme: record order", "issuer", issuer, "err", err)
 	}
+	return nil
 }
 
-// endAttempt resolves id's pending order event.
+// endAttempt resolves id's pending order event. Older pending events of
+// the same set (left by a crash) are resolved too, as OK: such an order may
+// have produced a certificate, so it keeps counting toward the duplicate
+// guard, but it no longer reads as running.
 func (m *Manager) endAttempt(ctx context.Context, issuer, id string, ok bool) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 	evs := m.loadOrders(ctx, issuer, m.now())
+	latest := true
 	for i := len(evs) - 1; i >= 0; i-- {
 		if evs[i].Set == id && evs[i].Pending {
-			evs[i].Pending, evs[i].OK = false, ok
-			break
+			evs[i].Pending, evs[i].OK = false, ok || !latest
+			latest = false
 		}
 	}
 	if err := m.kv.putJSON(ctx, ordersKey(issuer), evs); err != nil {
@@ -737,7 +757,10 @@ func (m *Manager) guard(ctx context.Context, issuer, id string, names []string, 
 	defer m.stateMu.Unlock()
 	var a attemptState
 	if _, err := m.kv.getJSON(ctx, attemptKey(id), &a); err != nil {
-		return &DeferredError{Until: now.Add(backoffBase), Reason: "state unreadable: " + err.Error()}
+		return &DeferredError{Until: now.Add(backoffBase), Reason: m.red.redact("state unreadable: " + err.Error())}
+	}
+	if t := m.memNext[id]; !force && t.After(now) {
+		return &DeferredError{Until: t, Reason: "backing off: the state store was not writable at the last attempt", LastError: a.LastError}
 	}
 	if a.ParkedUntil.After(now) {
 		return &DeferredError{Until: a.ParkedUntil, Reason: "rate limited by the CA", LastError: a.LastError}
@@ -903,14 +926,19 @@ func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer strin
 	_, _ = m.kv.getJSON(ctx, attemptKey(id), &a)
 	if !started || a.Failures == 0 {
 		a.Failures++
-		a.NextAttempt = now.Add(backoffDelay(a.Failures, m.jitter()))
 	}
+	// Backoff runs from the failure, not from the order start: an order
+	// slower than its backoff step (DNS propagation, a hanging API) must
+	// still be followed by the full wait.
+	a.NextAttempt = now.Add(backoffDelay(a.Failures, m.jitter()))
 	a.LastError = msg
 	if park > 0 {
 		a.ParkedUntil = now.Add(park)
-		if a.ParkedUntil.After(a.NextAttempt) {
-			a.NextAttempt = a.ParkedUntil
-		}
+	}
+	if a.ParkedUntil.After(a.NextAttempt) {
+		a.NextAttempt = a.ParkedUntil
+	}
+	if park > 0 {
 		var acct time.Time
 		_, _ = m.kv.getJSON(ctx, accountParkKey(issuer), &acct)
 		if a.ParkedUntil.After(acct) {
@@ -920,7 +948,10 @@ func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer strin
 		}
 	}
 	if err := m.kv.putJSON(ctx, attemptKey(id), a); err != nil {
-		m.log.Warn("acme: persist backoff", "cert", id, "err", err)
+		m.memNext[id] = a.NextAttempt
+		m.log.Error("acme: persist backoff; backing off in memory only", "cert", id, "err", err)
+	} else {
+		delete(m.memNext, id)
 	}
 	if validationFailure(cause) {
 		for _, n := range names {
@@ -977,6 +1008,7 @@ func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer strin
 	if err := m.kv.putJSON(ctx, attemptKey(id), attemptState{}); err != nil {
 		m.log.Warn("acme: reset backoff", "cert", id, "err", err)
 	}
+	delete(m.memNext, id)
 	m.stateMu.Unlock()
 	m.log.Info("acme: certificate issued", "cert", id, "zone", row.Zone, "names", strings.Join(names, ","),
 		"not_after", leaf.NotAfter, "staging", dir.Staging)
@@ -1186,8 +1218,10 @@ func (m *Manager) renew(ctx context.Context) []Result {
 }
 
 // pruneState deletes kv bookkeeping that can no longer matter: attempt
-// state and expiry notices of certificate ids with no row (unless an order
-// for that id is running: a first issuance has no row yet), expiry notices
+// state of certificate ids with no row, unless an order for that id is
+// running here, its issuer still has a pending order event for it, or it
+// still defers (backoff or park; a first issuance that crashed has no row
+// yet); expiry notices of ids with no row, expiry notices
 // for an earlier expiry date of a certificate, and failed-validation
 // counters with nothing in the last hour.
 func (m *Manager) pruneState(ctx context.Context, rows []store.Cert, now time.Time) {
@@ -1209,9 +1243,29 @@ func (m *Manager) pruneState(ctx context.Context, rows []store.Cert, now time.Ti
 		}
 		return ks
 	}
+	pending := map[string]bool{}
+	ordersReadable := true
+	for _, k := range list("acme/orders/") {
+		var evs []orderEvent
+		if _, err := m.kv.getJSON(ctx, k, &evs); err != nil {
+			ordersReadable = false // keep every attempt record rather than guess
+		}
+		for _, e := range evs {
+			if e.Pending {
+				pending[e.Set] = true
+			}
+		}
+	}
 	for _, k := range list("acme/attempt/") {
 		id := strings.TrimPrefix(k, "acme/attempt/")
-		if _, ok := notAfter[id]; ok || m.isInFlight(id) {
+		if _, ok := notAfter[id]; ok || m.isInFlight(id) || pending[id] || !ordersReadable {
+			continue
+		}
+		// A record still deferring (backoff or park) is kept: after a crash
+		// during a first issuance (no row yet) it is the only thing that
+		// stops an immediate re-order.
+		var a attemptState
+		if _, err := m.kv.getJSON(ctx, k, &a); err != nil || a.NextAttempt.After(now) || a.ParkedUntil.After(now) {
 			continue
 		}
 		del(k)
