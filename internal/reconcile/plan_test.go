@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -386,11 +387,10 @@ func TestPlanUnavailableSourceStillClaimsHostname(t *testing.T) {
 	if !strings.Contains(got[0].Reason, "truenas:app") {
 		t.Fatalf("reason %q", got[0].Reason)
 	}
-	// A Published claimant beats the phantom; the phantom emits nothing.
+	// Source-first: even a Published docker claimant loses to the phantom of
+	// a higher-ranked source, and its Known route is not removed.
 	got = Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, cfg, t0)
-	assertSums(t, got,
-		"CertEnsure example.test *.example.test *.example.test,example.test",
-		"RouteWrite example.test app.example.test docker:app ->198.51.100.5:80")
+	assertSums(t, got, "Conflict example.test app.example.test docker:app")
 }
 
 func TestPlanOtherSourcesUnaffectedByOutage(t *testing.T) {
@@ -506,8 +506,8 @@ func TestPlanHostnameConflicts(t *testing.T) {
 		{"static beats truenas", []model.Service{pub("truenas:app", "app", "example.test", 1), pub("static:app", "app", "example.test", 2)}, "static:app", []string{"truenas:app"}},
 		{"same source by key", []model.Service{renamed(pub("docker:b", "b", "example.test", 1), "app"), renamed(pub("docker:a", "a", "example.test", 2), "app"), renamed(pub("docker:c", "c", "example.test", 3), "APP")}, "docker:a", []string{"docker:b", "docker:c"}},
 		{"slug collision", []model.Service{pub("docker:my_app", "my_app", "example.test", 1), pub("docker:my-app", "my-app", "example.test", 2)}, "docker:my-app", []string{"docker:my_app"}},
-		{"published beats pending of higher rank", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StatePending, "198.51.100.5", 2)}, "docker:app", []string{"static:app"}},
-		{"published beats never-published error", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StateError, "", 0)}, "docker:app", []string{"static:app"}},
+		{"pending static beats published docker", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StatePending, "198.51.100.5", 2)}, "static:app", []string{"docker:app"}},
+		{"error static beats published docker", []model.Service{pub("docker:app", "app", "example.test", 1), svc("static:app", "app", "example.test", model.StateError, "", 0)}, "static:app", []string{"docker:app"}},
 		{"key prefix beats source name", []model.Service{
 			func() model.Service { s := pub("static:x", "app", "example.test", 1); s.Source = "docker"; return s }(),
 			func() model.Service { s := pub("docker:y", "app", "example.test", 2); s.Source = "static"; return s }()}, "static:x", []string{"docker:y"}},
@@ -860,4 +860,210 @@ func TestPlanStoppedOnlyZoneKeepsZoneLevelActions(t *testing.T) {
 		"CertEnsure example.test *.example.test *.example.test,example.test",
 		"RouteWrite example.test app.example.test docker:app ->198.51.100.5:1",
 	)
+}
+
+// --- fix round 2: source-first ranking --------------------------------------
+
+func TestPlanLowerSourceNeverBeatsHigherSource(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	dk := pub("docker:app", "app", "example.test", 80)
+	dkKnown := known("docker:app", "example.test", "app.example.test", nil)
+	tests := []struct {
+		name   string
+		higher []model.Service
+		obs    Observed
+	}{
+		{"pending static", []model.Service{svc("static:app", "app", "example.test", model.StatePending, "198.51.100.6", 80)}, Observed{}},
+		{"error static", []model.Service{svc("static:app", "app", "example.test", model.StateError, "", 0)}, Observed{}},
+		{"stopped truenas", []model.Service{svc("truenas:app", "app", "example.test", model.StateStopped, "", 0)}, Observed{}},
+		{"pending truenas", []model.Service{svc("truenas:app", "app", "example.test", model.StatePending, "198.51.100.6", 80)}, Observed{}},
+		{"phantom truenas", nil, Observed{Unavailable: map[string]bool{"truenas": true},
+			Known: knownMap(known("truenas:app", "example.test", "app.example.test", nil))}},
+	}
+	for _, tc := range tests {
+		for _, withKnown := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dockerKnown=%v", tc.name, withKnown), func(t *testing.T) {
+				obs := tc.obs
+				if withKnown {
+					m := knownMap(dkKnown)
+					for k, v := range obs.Known {
+						m[k] = v
+					}
+					obs.Known = m
+				}
+				got := Plan(append([]model.Service{dk}, tc.higher...), obs, cfg, t0)
+				assertSums(t, forKey(got, "docker:app"), "Conflict example.test app.example.test docker:app")
+				assertNone(t, got, RouteWrite, RouteRemove)
+			})
+		}
+	}
+}
+
+func TestPlanLoserRouteRemovedOnlyWhenWinnerRouted(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	dk := pub("docker:app", "app", "example.test", 80)
+	obs := Observed{Known: knownMap(known("docker:app", "example.test", "app.example.test", nil))}
+
+	// (ii) routable static winner: docker's Known route is removed
+	got := Plan([]model.Service{dk, pub("static:app", "app", "example.test", 81)}, obs, cfg, t0)
+	assertSums(t, forKey(got, "docker:app"), "Conflict example.test app.example.test docker:app", "RouteRemove example.test app.example.test docker:app")
+	if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "static:app" {
+		t.Fatalf("winner route: %v", sums(got))
+	}
+
+	// winner routable only via LastKnown still counts
+	noBackend := svc("static:app", "app", "example.test", model.StatePublished, "", 0)
+	lkObs := obs
+	lkObs.LastKnown = map[string]model.Backend{"static:app": {Scheme: "http", Host: "198.51.100.6", Port: 82}}
+	got = Plan([]model.Service{dk, noBackend}, lkObs, cfg, t0)
+	if len(ofKind(got, RouteRemove)) != 1 || len(ofKind(got, RouteWrite)) != 1 {
+		t.Fatalf("LastKnown winner: %v", sums(got))
+	}
+
+	// (iii) static published without any backend: Invalid, nobody removed, but
+	// static still holds the name (source-first), so docker gets no new route.
+	got = Plan([]model.Service{dk, noBackend}, obs, cfg, t0)
+	assertNone(t, got, RouteRemove, RouteWrite)
+	assertSums(t, got, "Invalid example.test app.example.test static:app", "Conflict example.test app.example.test docker:app")
+
+	// non-authoritative LastKnown does not make it routable
+	badLK := obs
+	badLK.LastKnown = map[string]model.Backend{"static:app": {Scheme: "http"}}
+	got = Plan([]model.Service{dk, noBackend}, badLK, cfg, t0)
+	assertNone(t, got, RouteRemove, RouteWrite)
+}
+
+func TestPlanSameSourceTiers(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	rn := func(s model.Service) model.Service { s.Options.Rename = "app"; return s }
+	t.Run("stopped v1 never beats published v2", func(t *testing.T) {
+		v1 := rn(svc("docker:a_v1", "x", "example.test", model.StateStopped, "", 0))
+		v2 := rn(pub("docker:b_v2", "y", "example.test", 2))
+		obs := Observed{Known: knownMap(known("docker:a_v1", "example.test", "app.example.test", nil)),
+			LastKnown: map[string]model.Backend{"docker:a_v1": {Scheme: "http", Host: "198.51.100.5", Port: 1}}}
+		got := Plan([]model.Service{v1, v2}, obs, cfg, t0)
+		if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:b_v2" {
+			t.Fatalf("got %v", sums(got))
+		}
+		assertSums(t, forKey(got, "docker:a_v1"), "Conflict example.test app.example.test docker:a_v1", "RouteRemove example.test app.example.test docker:a_v1")
+	})
+	t.Run("published without backend is not serving", func(t *testing.T) {
+		a := rn(svc("docker:a", "x", "example.test", model.StatePublished, "", 0))
+		b := rn(pub("docker:b", "y", "example.test", 2))
+		got := Plan([]model.Service{a, b}, Observed{}, cfg, t0)
+		if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:b" {
+			t.Fatalf("got %v", sums(got))
+		}
+	})
+	t.Run("equal tier stable by key whichever is known", func(t *testing.T) {
+		a := rn(pub("docker:a", "x", "example.test", 1))
+		b := rn(pub("docker:b", "y", "example.test", 2))
+		for _, k := range []string{"docker:a", "docker:b"} {
+			obs := Observed{Known: knownMap(known(k, "example.test", "app.example.test", nil))}
+			got := Plan([]model.Service{b, a}, obs, cfg, t0)
+			if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:a" {
+				t.Fatalf("known=%s: %v", k, sums(got))
+			}
+		}
+	})
+	t.Run("phantom with route beats non-serving newcomer of same source", func(t *testing.T) {
+		obs := Observed{Unavailable: map[string]bool{"docker": true},
+			Known: knownMap(known("docker:z", "example.test", "app.example.test", nil))}
+		// docker:a is from another docker source name that is available
+		a := rn(svc("docker:a", "x", "example.test", model.StatePending, "198.51.100.5", 1))
+		a.Source = "docker2"
+		got := Plan([]model.Service{a}, obs, cfg, t0)
+		assertSums(t, got, "Conflict example.test app.example.test docker:a")
+	})
+}
+
+func TestPlanUnavailableLoserKeepsRoute(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	dk := pub("docker:app", "app", "example.test", 80)
+	obs := Observed{Unavailable: map[string]bool{"docker": true},
+		Known: knownMap(known("docker:app", "example.test", "app.example.test", nil))}
+	got := Plan([]model.Service{dk, pub("static:app", "app", "example.test", 81)}, obs, cfg, t0)
+	assertNone(t, got, RouteRemove)
+	assertSums(t, forKey(got, "docker:app"), "Conflict example.test app.example.test docker:app")
+}
+
+func TestPlanTrueNASOutageNoFlip(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "per-host", "per-host"))
+	tn := pub("truenas:app", "app", "example.test", 30000)
+	dk := pub("docker:app", "app", "example.test", 32768)
+	obs := Observed{Foreign: listed("example.test"), Known: map[string]KnownService{}, LastKnown: map[string]model.Backend{}}
+	apply := func(acts []Action) {
+		for _, a := range acts {
+			switch a.Kind {
+			case RouteWrite:
+				obs.Known[a.Key] = KnownService{Key: a.Key, Source: a.Svc.Source, Zone: a.Zone, Hostname: a.Host}
+				obs.LastKnown[a.Key] = *a.Backend
+			case RouteRemove:
+				delete(obs.Known, a.Key)
+			case DNSEnsure:
+				obs.Owned = append(obs.Owned, store.DNSRecord{Provider: a.Provider, Zone: a.Zone, Name: a.Record.Name,
+					Type: a.Record.Type, Value: a.Record.Value, OwnerKey: a.Owner})
+			}
+		}
+	}
+	check := func(cycle string, acts []Action) {
+		t.Helper()
+		for _, a := range forKey(acts, "docker:app") {
+			if a.Kind != Conflict {
+				t.Fatalf("%s: docker got %v", cycle, sum(a))
+			}
+		}
+		assertNone(t, acts, DNSDelete, ScheduleRemoval)
+	}
+	c1 := Plan([]model.Service{tn, dk}, obs, cfg, t0)
+	check("healthy", c1)
+	if r := ofKind(c1, RouteWrite); len(r) != 1 || r[0].Key != "truenas:app" {
+		t.Fatalf("healthy: %v", sums(c1))
+	}
+	apply(c1)
+
+	obs.Unavailable = map[string]bool{"truenas": true}
+	c2 := Plan([]model.Service{dk}, obs, cfg, t0.Add(time.Minute))
+	check("outage", c2)
+	assertNone(t, c2, RouteWrite, RouteRemove)
+	apply(c2)
+
+	obs.Unavailable = nil
+	c3 := Plan([]model.Service{tn, dk}, obs, cfg, t0.Add(2*time.Minute))
+	check("recovered", c3)
+	assertNone(t, c3, RouteRemove)
+	if r := ofKind(c3, RouteWrite); len(r) != 1 || r[0].Key != "truenas:app" {
+		t.Fatalf("recovered: %v", sums(c3))
+	}
+}
+
+// mayRemoveLoserRoute's published and rank checks are redundant by
+// construction (routable implies published; the winner never ranks below the
+// loser); pin them directly so they cannot silently disappear.
+func TestMayRemoveLoserRouteGuards(t *testing.T) {
+	p := newPlanner(Observed{Unavailable: map[string]bool{"truenas": true}}, cfgOf(), t0)
+	loser := pub("docker:app", "app", "example.test", 1)
+	ok := claimant{key: "static:app", source: "static", published: true, routable: true, serving: true}
+	tests := []struct {
+		name  string
+		loser model.Service
+		w     func(claimant) claimant
+		want  bool
+	}{
+		{"all hold", loser, func(c claimant) claimant { return c }, true},
+		{"winner not published", loser, func(c claimant) claimant { c.published = false; return c }, false},
+		{"winner not routable", loser, func(c claimant) claimant { c.routable = false; return c }, false},
+		{"winner phantom", loser, func(c claimant) claimant { c.phantom = true; return c }, false},
+		{"winner lower rank", pub("static:other", "app", "example.test", 1), func(c claimant) claimant {
+			c.key, c.source = "docker:app", "docker"
+			return c
+		}, false},
+		{"loser source unavailable", pub("truenas:app", "app", "example.test", 1), func(c claimant) claimant { return c }, false},
+		{"loser source empty", func() model.Service { s := loser; s.Source = ""; return s }(), func(c claimant) claimant { return c }, false},
+	}
+	for _, tc := range tests {
+		if got := p.mayRemoveLoserRoute(tc.loser, tc.w(ok)); got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
 }

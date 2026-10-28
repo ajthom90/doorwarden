@@ -20,30 +20,45 @@
 // config; a name with no DNS-valid characters; no zone and no default), a
 // hostname over 253 characters, an earlier duplicate of a key (the last
 // occurrence wins, like the approval gate), or a Published service with
-// neither a backend nor a last-known backend. Nothing else is emitted for it;
-// it still counts as present, so it is never scheduled for removal and its
-// existing route is left as is.
+// neither a backend nor a last-known backend. Nothing else is emitted for it,
+// including any removal: it still counts as present, so it is never scheduled
+// for removal, its existing route is left as is, and (not being routable) it
+// never causes another service's route to be removed.
 //
 // Hostname conflicts are decided on the resulting hostname, case-insensitive,
 // among every desired service with a valid hostname plus the Known services
-// of unavailable sources (whose routes may still exist). Tiers, highest
-// first: (a) services whose current state in desired is Published; (b)
-// everything else (Pending, Discovered, Stopped, Error, Known-only services of
-// an unavailable source). A tier (b) claimant never beats a Published one,
-// even with a higher source rank or an existing route. Within a tier: static >
-// truenas > docker > other, taken from the stable key prefix ("static:",
-// "truenas:", "docker:") because source names are configurable
-// (Service.Source is only a fallback for unknown prefixes), then the
-// lexicographically smaller key. Every loser gets a Conflict naming the
-// winner. A loser to a PUBLISHED winner that has an existing route (it is in
-// Known) also gets RouteRemove naming the winner; its DNS is untouched (the
-// winner's record of the same value is already there, and owned rows are
-// never deleted for losers). After the caller forgets the Known entry the
-// loser gets only Conflict (no flapping); when the winner goes away, the
-// loser wins again and gets its route back. A loser to a non-published winner
-// keeps its route. A Known-only claimant of an unavailable source still beats
-// lower-ranked tier (b) claimants, so a stopped or pending service cannot take
-// its name during an outage.
+// of unavailable sources ("phantoms", whose routes may still exist). Order is
+// SOURCE-FIRST:
+//  1. key-prefix source rank: static > truenas > docker > other, taken from
+//     the stable key prefix ("static:", "truenas:", "docker:") because source
+//     names are configurable (Service.Source is only a fallback for unknown
+//     prefixes);
+//  2. within one source rank, the serving tier first: a Published service
+//     that will get a RouteWrite this cycle (authoritative backend or an
+//     authoritative last-known one), or a phantom (it still has a Known
+//     route); everything else (Pending, Discovered, Stopped, Error, Published
+//     without any backend) is the lower tier;
+//  3. the lexicographically smaller key.
+//
+// A lower-trust source can therefore never take a hostname from a
+// higher-trust one, whatever their states. Trade-off, chosen fail-safe: a
+// Pending, Error or Stopped static/truenas entry blocks a Published docker
+// service of the same hostname until it is fixed, approved or removed; this
+// is visible as a Conflict on the docker service. Within one source a
+// Stopped v1 never beats a Published v2, and equal-tier claimants are decided
+// by key whichever of them is Known (no flapping). During an outage a
+// phantom keeps its name, and a lower-ranked or non-serving claimant gets
+// only a Conflict; recovery does not flip the name either.
+//
+// Every loser gets a Conflict naming the winner. A loser that has an existing
+// route (it is in Known) also gets RouteRemove ONLY when the winner really
+// takes the name over in this same plan: the winner is Published, gets a
+// RouteWrite now, is not a phantom, and ranks at least as high; and the
+// loser's source is available. Otherwise (the winner is pending, invalid,
+// backend-less, or a phantom) the loser keeps its working route. DNS is never
+// touched for losers. After the caller forgets the Known entry the loser gets
+// only Conflict; when the winner goes away the loser wins again and gets its
+// route back.
 //
 // States: only Published services get DNSEnsure/CertEnsure. A Published
 // service whose backend is not authoritative (empty host or port 0) uses its

@@ -9,23 +9,28 @@ import (
 // claimant is a service that holds or wants a hostname this cycle.
 type claimant struct {
 	key, source, host string
-	// published: the service's current state in desired is Published. A
-	// published claimant always beats every other claimant.
+	// published: the service's current state in desired is Published.
 	published bool
+	// routable: a published claimant that will receive a RouteWrite in this
+	// Plan call (authoritative backend or a last-known one).
+	routable bool
+	// serving: within its source rank, this claimant is in the upper tier:
+	// it is routable, or it is a phantom that still has a Known route.
+	serving bool
 	// phantom marks a known service of an unavailable source: it is not in
 	// desired, but its route may still exist, so it keeps its hostname.
 	phantom bool
 }
 
-// sourceRank orders hostname precedence: static > truenas > docker > other.
-// The stable key prefix decides first (source names are configurable, key
-// prefixes are not); the source name is only a fallback.
 // loss describes why a claimant lost its hostname.
 type loss struct {
 	winner claimant
 	reason string
 }
 
+// sourceRank orders hostname precedence: static > truenas > docker > other
+// (lower is stronger). The stable key prefix decides first (source names are
+// configurable, key prefixes are not); the source name is only a fallback.
 func sourceRank(key, source string) int {
 	ranks := map[string]int{"static": 0, "truenas": 1, "docker": 2}
 	if i := strings.IndexByte(key, ':'); i > 0 {
@@ -39,20 +44,24 @@ func sourceRank(key, source string) int {
 	return len(ranks)
 }
 
+func (c claimant) rank() int { return sourceRank(c.key, c.source) }
+
+// outranks is source-first: a lower-trust source never takes a hostname from
+// a higher-trust one, whatever their states. Within one source rank, the
+// serving tier wins, then the smaller key.
 func outranks(a, b claimant) bool {
-	if a.published != b.published {
-		return a.published
-	}
-	ra, rb := sourceRank(a.key, a.source), sourceRank(b.key, b.source)
-	if ra != rb {
+	if ra, rb := a.rank(), b.rank(); ra != rb {
 		return ra < rb
+	}
+	if a.serving != b.serving {
+		return a.serving
 	}
 	return a.key < b.key
 }
 
-// resolveHostnames picks one winner per (case-insensitive) hostname: a
-// Published claimant first, then source rank, then key. It returns winners by
-// host and, for each losing non-phantom key, the reason naming the winner.
+// resolveHostnames picks one winner per (case-insensitive) hostname using
+// outranks. It returns winners by host and, for each losing non-phantom key,
+// the loss naming the winner.
 func resolveHostnames(cs []claimant) (winners map[string]claimant, losers map[string]loss) {
 	byHost := map[string][]claimant{}
 	for _, c := range cs {
@@ -69,10 +78,14 @@ func resolveHostnames(cs []claimant) (winners map[string]claimant, losers map[st
 				continue
 			}
 			why := ""
-			if w.phantom {
+			switch {
+			case w.phantom:
 				why = "; its source is unavailable, so it keeps the name"
+			case !w.routable:
+				why = "; the winner is not published/routable, fix or approve it (or remove it)"
 			}
-			losers[l.key] = loss{winner: w, reason: fmt.Sprintf("hostname %s is claimed by %s (precedence: published first, then static > truenas > docker, then key)%s", h, w.key, why)}
+			losers[l.key] = loss{winner: w, reason: fmt.Sprintf(
+				"hostname %s is claimed by %s (precedence: static > truenas > docker, then serving, then key)%s", h, w.key, why)}
 		}
 	}
 	return winners, losers

@@ -57,13 +57,17 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 	for _, e := range entries {
 		present[e.svc.Key] = true
 		if e.err == nil {
+			pubd := e.svc.State == model.StatePublished
+			_, routable := p.routeBackend(e.svc)
+			routable = routable && pubd
 			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host,
-				published: e.svc.State == model.StatePublished})
+				published: pubd, routable: routable, serving: routable})
 		}
 	}
 	for _, k := range sortedKnown(obs.Known) {
 		if !present[k.Key] && p.unavailable(k) && k.Hostname != "" {
-			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true})
+			// it is Known, i.e. it still has a route: serving tier
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true})
 		}
 	}
 	winners, losers := resolveHostnames(claims)
@@ -83,7 +87,7 @@ func Plan(desired []model.Service, obs Observed, cfg *config.Config, now time.Ti
 			// A loser to a Published winner must not keep serving the name:
 			// remove its existing route (only if it has one, so this does not
 			// repeat once the caller forgets the Known entry). DNS is untouched.
-			if k, ok := obs.Known[e.svc.Key]; ok && l.winner.published {
+			if k, ok := obs.Known[e.svc.Key]; ok && p.mayRemoveLoserRoute(e.svc, l.winner) {
 				p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,
 					Svc: copySvc(e.svc), Reason: "hostname " + e.host + " now belongs to published " + l.winner.key})
 			}
@@ -212,14 +216,11 @@ func (p *planner) planService(e entry) bool {
 	_, isKnown := p.obs.Known[s.Key]
 	switch s.State {
 	case model.StatePublished:
-		b := s.Backend
-		if !authoritative(b) {
-			if !haveLK {
-				p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
-					Reason: "published service has no backend (host/port) and no last-known backend"})
-				return false
-			}
-			b = lk
+		b, ok := p.routeBackend(s)
+		if !ok {
+			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
+				Reason: "published service has no backend (host/port) and no last-known backend"})
+			return false
 		}
 		if z.mode == "per-host" {
 			p.ensureRecord(z, e.host, s.Key, &s)
@@ -397,6 +398,29 @@ func (p *planner) planRemovals(present map[string]bool, winners map[string]claim
 				Owner: o.OwnerKey, Reason: "grace period expired"})
 		}
 	}
+}
+
+// routeBackend returns the backend a RouteWrite for s would carry: its own
+// when authoritative, else its last-known one; ok is false when neither.
+func (p *planner) routeBackend(s model.Service) (model.Backend, bool) {
+	if authoritative(s.Backend) {
+		return s.Backend, true
+	}
+	if lk, ok := p.obs.LastKnown[s.Key]; ok && authoritative(lk) {
+		return lk, true
+	}
+	return model.Backend{}, false
+}
+
+// mayRemoveLoserRoute reports whether a hostname loser's existing route may be
+// removed: only when the winner really takes over the name in this same plan
+// (published, gets a RouteWrite, not a phantom, at least the loser's source
+// rank) and the loser's source is available (an outage never removes).
+func (p *planner) mayRemoveLoserRoute(loser model.Service, w claimant) bool {
+	if loser.Source == "" || p.obs.Unavailable[loser.Source] {
+		return false
+	}
+	return !w.phantom && w.published && w.routable && w.rank() <= sourceRank(loser.Key, loser.Source)
 }
 
 func sortedKnown(m map[string]KnownService) []KnownService {
