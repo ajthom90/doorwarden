@@ -793,11 +793,18 @@ func TestGatherObserved(t *testing.T) {
 		Value: ip1, ProviderRecordID: "p2-1", OwnerKey: "docker:x", CreatedAt: t0}); err != nil {
 		t.Fatal(err)
 	}
+	// a row under a provider (or zone) no configured pair names: still in
+	// owned, so Plan reports it (Skip) instead of never seeing it
+	if err := st.AddOwnedRecord(ctx, store.DNSRecord{Provider: "oldp", Zone: dz, Name: "app.example.test", Type: "A",
+		Value: ip1, ProviderRecordID: "old-1", OwnerKey: "docker:app", CreatedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
 	f2.FailNext("ListRecords", errors.New("unreachable"))
 	provs := map[string]dns.Provider{dzp: f1, "p2": f2}
 	zones := []ZoneRef{{dzp, "Example.Test."}, {dzp, dz}, {"p2", "other.test"}, {"p3", "third.test"}}
 	owned, foreign, errs := GatherObserved(ctx, provs, st, zones, 0)
-	if len(owned) != 2 || owned[0].OwnerKey != "docker:app" || owned[1].OwnerKey != "docker:x" { // rows survive a failed listing
+	if len(owned) != 3 || owned[0].OwnerKey != "docker:app" || owned[0].Provider != dzp ||
+		owned[1].Provider != "oldp" || owned[2].OwnerKey != "docker:x" { // rows survive a failed listing
 		t.Fatalf("owned %+v", owned)
 	}
 	got, ok := foreign[dzp+"/"+dz]
@@ -822,6 +829,27 @@ func TestGatherObserved(t *testing.T) {
 	if v, ok := foreign["p2/empty.test"]; !ok || len(v) != 0 || len(errs) != 0 {
 		t.Fatalf("foreign %+v errs %v", foreign, errs)
 	}
+}
+
+// The ownership rows cannot be read: nothing is known, so nothing is owned
+// and no pair has a listing (Plan then creates and removes nothing).
+func TestGatherObservedOwnershipReadFails(t *testing.T) {
+	st := openStore(t)
+	f1 := fake.New(true)
+	bad := &listFailStore{OwnershipStore: st}
+	owned, foreign, errs := GatherObserved(context.Background(), map[string]dns.Provider{dzp: f1}, bad, []ZoneRef{{dzp, dz}}, 0)
+	if len(owned) != 0 || len(foreign) != 0 || len(errs) != 1 {
+		t.Fatalf("owned %+v foreign %+v errs %v", owned, foreign, errs)
+	}
+	if n := len(f1.Calls()); n != 0 {
+		t.Fatalf("listed the provider %d times", n)
+	}
+}
+
+type listFailStore struct{ OwnershipStore }
+
+func (listFailStore) ListAllOwnedRecords(context.Context) ([]store.DNSRecord, error) {
+	return nil, errors.New("disk on fire")
 }
 
 func TestDNSZoneRefs(t *testing.T) {

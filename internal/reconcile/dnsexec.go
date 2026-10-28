@@ -26,6 +26,9 @@ const DefaultDNSCallTimeout = 30 * time.Second
 type OwnershipStore interface {
 	AddOwnedRecord(ctx context.Context, r store.DNSRecord) error
 	ListOwnedRecords(ctx context.Context, provider, zone string) ([]store.DNSRecord, error)
+	// ListAllOwnedRecords returns every ownership row, of every provider
+	// and zone (GatherObserved's Owned).
+	ListAllOwnedRecords(ctx context.Context) ([]store.DNSRecord, error)
 	// DeleteOwnedRecordIfDue deletes the row only if it is owned by owner and
 	// its removed_after is set and strictly before notAfter.
 	DeleteOwnedRecordIfDue(ctx context.Context, provider, zone, name, typ, owner string, notAfter time.Time) (bool, error)
@@ -1041,9 +1044,13 @@ func DNSZoneRefs(cfg *config.Config) []ZoneRef {
 	return out
 }
 
-// GatherObserved builds Observed.Owned and Observed.Foreign for the given
-// provider/zone pairs (deduplicated after normalizing the zone). owned holds
-// the ownership rows of every pair whose rows could be read. foreign is keyed
+// GatherObserved builds Observed.Owned and Observed.Foreign. owned is EVERY
+// ownership row in the store, of any provider or zone, including rows under
+// a provider or zone no pair names (Plan reports those with a Skip and never
+// removes them). When the rows cannot be read, owned is empty and foreign is
+// empty for every pair (nothing is known: Plan creates and removes nothing).
+// foreign covers the given provider/zone pairs (deduplicated after
+// normalizing the zone) and is keyed
 // provider+"/"+zone and holds the provider's listing minus the records that
 // have an ownership row (matched on normalized name and type), records of
 // every type included, names and types normalized. A pair whose listing or
@@ -1057,6 +1064,14 @@ func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st O
 		timeout = DefaultDNSCallTimeout
 	}
 	foreign = map[string][]dns.Record{}
+	if st == nil {
+		return nil, foreign, []error{errors.New("no ownership store")}
+	}
+	all, err := st.ListAllOwnedRecords(ctx)
+	if err != nil {
+		return nil, foreign, []error{fmt.Errorf("reading ownership rows: %w", err)}
+	}
+	owned = all
 	seen := map[string]bool{}
 	for _, zr := range zones {
 		zn := normName(zr.Zone)
@@ -1065,16 +1080,6 @@ func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st O
 			continue
 		}
 		seen[key] = true
-		if st == nil {
-			errs = append(errs, fmt.Errorf("%s: no ownership store", key))
-			continue
-		}
-		rows, err := st.ListOwnedRecords(ctx, zr.Provider, zn)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: reading ownership rows: %w", key, err))
-			continue
-		}
-		owned = append(owned, rows...)
 		p := providers[zr.Provider]
 		if p == nil {
 			errs = append(errs, fmt.Errorf("%s: provider %q is not available", key, zr.Provider))
@@ -1088,8 +1093,10 @@ func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st O
 			continue
 		}
 		mine := map[string]bool{}
-		for _, r := range rows {
-			mine[normName(r.Name)+" "+normType(r.Type)] = true
+		for _, r := range all {
+			if r.Provider == zr.Provider && normName(r.Zone) == zn {
+				mine[normName(r.Name)+" "+normType(r.Type)] = true
+			}
 		}
 		out := make([]dns.Record, 0, len(recs))
 		for _, r := range recs {

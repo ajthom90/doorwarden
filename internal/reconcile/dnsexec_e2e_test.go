@@ -484,3 +484,34 @@ func TestDNSE2EDryRunWritesNothing(t *testing.T) {
 		t.Fatal("ownership written")
 	}
 }
+
+// A row left under a provider (or zone) the configuration no longer names is
+// gathered too: Plan reports it with a Skip and never deletes it, however
+// long its owner is gone.
+func TestDNSE2EUnconfiguredProviderRowSkipped(t *testing.T) {
+	w := newWorld(t, "per-host")
+	ctx := context.Background()
+	for _, r := range []store.DNSRecord{
+		{Provider: "oldp", Zone: dz, Name: "app." + dz, Type: "A", Value: target, ProviderRecordID: "old-1", OwnerKey: "docker:app", CreatedAt: t0},
+		{Provider: dzp, Zone: "gone.test", Name: "app.gone.test", Type: "A", Value: target, ProviderRecordID: "old-2", OwnerKey: "docker:app", CreatedAt: t0},
+	} {
+		if err := w.st.AddOwnedRecord(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		ra := t0.Add(-time.Hour)
+		if err := w.st.SetOwnedRemoval(ctx, r.Provider, r.Zone, r.Name, r.Type, r.OwnerKey, &ra); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, now := range []time.Time{t0, t0.Add(100 * time.Hour)} {
+		acts := w.mustCycle(now)
+		if len(ofKind(acts, Skip)) != 2 {
+			t.Fatalf("plan %v", sums(acts))
+		}
+		assertNone(t, acts, DNSDelete, DNSScheduleRemoval, DNSCancelRemoval, DNSReassign)
+	}
+	all, err := w.st.ListAllOwnedRecords(ctx)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("rows %+v %v", all, err)
+	}
+}
