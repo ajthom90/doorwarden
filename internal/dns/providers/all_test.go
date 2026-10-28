@@ -198,15 +198,32 @@ func (w *walker) leaf(s, path string) {
 	}
 }
 
-// walkSkipPkgs are the standard-library packages whose values the walker does
-// not enter (connection pools and their I/O buffers).
-var walkSkipPkgs = map[string]bool{"net/http": true, "net": true, "crypto/tls": true, "bufio": true}
-
+// skipType reports whether the walker must not enter values of this type: ONLY
+// connection-pool and I/O plumbing, whose buffers legitimately hold recently
+// written request bytes (net/http keeps the Authorization header of the last
+// request in a keep-alive connection's write buffer, and we do not disable
+// keep-alives to hide that). Everything else is walked, in particular
+// http.Header, http.Cookie*, http.Client and any interface or RoundTripper
+// wrapper, so a credential stored in a header map or in a doorwarden-owned
+// transport wrapper is still found; the fields of a doorwarden-owned type are
+// walked even when it sits behind a skipped interface.
 func skipType(t reflect.Type) bool {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	return walkSkipPkgs[t.PkgPath()]
+	switch t.PkgPath() {
+	case "net/http":
+		return t.Name() == "Transport" || strings.HasPrefix(t.Name(), "http2") || t.Name() == "persistConn" || t.Name() == "connLRU"
+	case "net": // net.Conn implementations and the dialer machinery
+		return true
+	case "crypto/tls":
+		return t.Name() == "Conn"
+	case "bufio":
+		return t.Name() == "Reader" || t.Name() == "Writer" || t.Name() == "ReadWriter"
+	case "sync", "sync/atomic":
+		return true
+	}
+	return false
 }
 
 func (w *walker) walk(v reflect.Value, path string) {
