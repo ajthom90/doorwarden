@@ -212,10 +212,6 @@ func TestFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The fixture is a full JSON-RPC response; serve its result field.
-	var env struct {
-		Result []byte `json:"-"`
-	}
-	_ = env
 	res := extractResult(t, b)
 	f := newFake(t, res)
 	s := newSource(t, f, fakeLookup{ports: map[string][]int{"example-app-2": {30002}}})
@@ -243,5 +239,37 @@ func TestFixture(t *testing.T) {
 		if s.State != w.state || s.Backend.Scheme != w.scheme || s.Backend.Host != w.host || s.Backend.Port != w.port {
 			t.Errorf("%s: %+v want %+v", s.Key, s, w)
 		}
+	}
+}
+
+func TestListCancelledMidLookupIsFailedList(t *testing.T) {
+	f := newFake(t, appsJSON(appJSON("a", "RUNNING", `{}`), appJSON("b", "RUNNING", `{}`)))
+	s := newSource(t, f, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ports = cancelLookup{cancel: cancel}
+	out, err := s.List(ctx)
+	if out != nil || !errors.Is(err, source.ErrSourceUnavailable) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("out=%v err=%v", out, err)
+	}
+	if len(s.Warnings()) != 0 {
+		t.Fatalf("warnings = %v", s.Warnings())
+	}
+}
+
+type cancelLookup struct{ cancel context.CancelFunc }
+
+func (l cancelLookup) PublishedPorts(ctx context.Context, _ string) ([]int, error) {
+	l.cancel()
+	return nil, ctx.Err()
+}
+
+func TestListPreservesContextError(t *testing.T) {
+	f := newFake(t, `[]`)
+	s := newSource(t, f, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.List(ctx)
+	if !errors.Is(err, source.ErrSourceUnavailable) || !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
 	}
 }

@@ -87,7 +87,7 @@ type apiApp struct {
 }
 
 func unavailable(err error) error {
-	return fmt.Errorf("truenas: %w: %v", source.ErrSourceUnavailable, err)
+	return fmt.Errorf("truenas: %w: %w", source.ErrSourceUnavailable, err)
 }
 
 // List returns every app known to TrueNAS.
@@ -111,11 +111,19 @@ func (s *Source) List(ctx context.Context) ([]model.Service, error) {
 		if a.Name == "" {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, unavailable(err)
+		}
 		svc, warn := s.convert(ctx, a)
 		if warn != "" {
 			warns = append(warns, warn)
 		}
 		out = append(out, svc)
+	}
+	// A cancelled ctx may have made lookups fail; do not report those as
+	// per-app errors from a "successful" List.
+	if err := ctx.Err(); err != nil {
+		return nil, unavailable(err)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	s.mu.Lock()

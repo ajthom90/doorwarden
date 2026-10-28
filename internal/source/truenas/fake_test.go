@@ -28,16 +28,19 @@ type fakeServer struct {
 	mu       sync.Mutex
 	methods  []string // methods received, in order, across connections
 	conns    int
+	pings    int
 	handler  func(c *websocket.Conn, req rpcReq, conn int) (handled bool) // optional override, after auth
 	authOK   bool
 	apps     json.RawMessage
 	rpcError bool
 }
 
-func newFake(t *testing.T, apps string) *fakeServer {
+func newFake(t *testing.T, apps string) *fakeServer { return newFakeTLS(t, apps, false) }
+
+func newFakeTLS(t *testing.T, apps string, useTLS bool) *fakeServer {
 	f := &fakeServer{t: t, authOK: true, apps: json.RawMessage(apps)}
 	up := websocket.Upgrader{}
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	f.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/current" {
 			http.NotFound(w, r)
 			return
@@ -51,6 +54,13 @@ func newFake(t *testing.T, apps string) *fakeServer {
 		f.conns++
 		n := f.conns
 		f.mu.Unlock()
+		defaultPing := c.PingHandler()
+		c.SetPingHandler(func(m string) error {
+			f.mu.Lock()
+			f.pings++
+			f.mu.Unlock()
+			return defaultPing(m)
+		})
 		for {
 			var req rpcReq
 			if err := c.ReadJSON(&req); err != nil {
@@ -90,6 +100,11 @@ func newFake(t *testing.T, apps string) *fakeServer {
 			}
 		}
 	}))
+	if useTLS {
+		f.srv.StartTLS()
+	} else {
+		f.srv.Start()
+	}
 	t.Cleanup(f.srv.Close)
 	return f
 }
@@ -117,4 +132,22 @@ func extractResult(t *testing.T, b []byte) string {
 		t.Fatalf("fixture: %v", err)
 	}
 	return string(env.Result)
+}
+
+func (f *fakeServer) connCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.conns
+}
+
+func (f *fakeServer) pingCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pings
+}
+
+func (f *fakeServer) setHandler(h func(c *websocket.Conn, req rpcReq, conn int) bool) {
+	f.mu.Lock()
+	f.handler = h
+	f.mu.Unlock()
 }
