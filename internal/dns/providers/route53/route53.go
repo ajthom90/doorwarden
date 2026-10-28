@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	r53 "github.com/aws/aws-sdk-go-v2/service/route53"
@@ -130,9 +131,6 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 		opts = append(opts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(c.AccessKeyID.Reveal(), c.SecretAccessKey.Reveal(), "")))
 		sec = []secrets.Secret{c.AccessKeyID, c.SecretAccessKey}
-	}
-	if c.Endpoint != "" {
-		opts = append(opts, awsconfig.WithRetryMaxAttempts(1))
 	}
 	awscfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
@@ -447,24 +445,49 @@ func (p *Provider) getSet(ctx context.Context, zid, name, typ string) (*types.Re
 	return nil, nil
 }
 
-// change submits one atomic change batch.
-func (p *Provider) change(ctx context.Context, zid, op string, changes ...types.Change) error {
+// change submits one atomic change batch whose intended post-state of the
+// (name, typ) set is want (the values; nil when the set should be gone).
+//
+// The call is made exactly ONCE (per-call RetryMaxAttempts = 1): the SDK's
+// standard retryer would resend a change whose response was lost, and the
+// resend would be refused (InvalidChangeBatch: "already exists" / "values do
+// not match") although the first attempt applied it, turning an applied write
+// into a plain error and an unowned record. Reads keep the standard retryer.
+//
+// Classification: an API error with HTTP status >= 500 (InternalFailure,
+// ServiceUnavailable, a gateway page) and every non-API failure (cancellation,
+// deadline, transport error, unparseable answer) may have been applied and wrap
+// dns.ErrUnconfirmed. A 4xx API error is a refusal and a plain error, except an
+// InvalidChangeBatch while the set already holds want: someone (an earlier
+// attempt of ours, or another writer) made exactly the requested state. We
+// cannot prove who, so the conservative answer is ErrUnconfirmed (the caller
+// records ownership; drift repair corrects a wrong guess) instead of a plain
+// error that could leave our own write unowned.
+func (p *Provider) change(ctx context.Context, zid, op, name, typ string, want []string, changes ...types.Change) error {
 	resp, err := p.client().ChangeResourceRecordSets(ctx, &r53.ChangeResourceRecordSetsInput{
 		HostedZoneId: aws.String(zid),
 		ChangeBatch:  &types.ChangeBatch{Changes: changes},
-	})
+	}, func(o *r53.Options) { o.RetryMaxAttempts = 1 })
 	if err != nil {
 		var ae smithy.APIError
-		if ctx.Err() == nil && errors.As(err, &ae) {
-			return p.mapErr(op, err) // the service answered with an API error: definitively refused
+		var re *awshttp.ResponseError
+		serverFault := errors.As(err, &re) && re.HTTPStatusCode() >= 500
+		if ctx.Err() == nil && !serverFault && errors.As(err, &ae) {
+			if ae.ErrorCode() == "InvalidChangeBatch" {
+				if cur, gerr := p.getSet(ctx, zid, name, typ); gerr == nil && sameValues(cur, append([]string(nil), want...)...) {
+					return fmt.Errorf("route53: %s: the service refused the change (%s: %s), but %s %s already holds the requested values; it was made by an earlier attempt or another writer: %w",
+						op, ae.ErrorCode(), p.scrub(ae.ErrorMessage()), name, typ, dns.ErrUnconfirmed)
+				}
+			}
+			return p.mapErr(op, err) // the service answered with a 4xx API error: refused
 		}
-		// cancellation, deadline, transport failure, unparseable answer: the
-		// service may have applied the change
-		cause := err
+		// cancellation, deadline, a 5xx, transport failure, unparseable answer:
+		// the service may have applied the change. Only scrubbed text is kept
+		// (the SDK error may carry request details); ctx.Err() stays matchable.
 		if ctx.Err() != nil {
-			cause = ctx.Err()
+			return fmt.Errorf("route53: %s: the request may have been applied but the outcome is unknown (%s): %w: %w", op, p.scrub(ctx.Err().Error()), dns.ErrUnconfirmed, ctx.Err())
 		}
-		return fmt.Errorf("route53: %s: the request may have been applied but the outcome is unknown (%s): %w: %w", op, p.scrub(cause.Error()), dns.ErrUnconfirmed, cause)
+		return fmt.Errorf("route53: %s: the request may have been applied but the outcome is unknown (%s): %w", op, p.scrub(err.Error()), dns.ErrUnconfirmed)
 	}
 	if resp.ChangeInfo == nil || aws.ToString(resp.ChangeInfo.Id) == "" {
 		return fmt.Errorf("%w: %w", malformed(op, "no ChangeInfo"), dns.ErrUnconfirmed)
@@ -644,7 +667,7 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	r.TTL = int(ttlOf(r))
 	set := newSet(r, int64(r.TTL))
-	if err := p.change(ctx, ref.id, "create record "+r.Name, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
+	if err := p.change(ctx, ref.id, "create record "+r.Name, r.Name, r.Type, []string{r.Value}, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
 		if errors.Is(err, dns.ErrUnconfirmed) {
 			return r, err // may exist: the caller must record ownership
 		}
@@ -687,7 +710,7 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	set := newSet(r, int64(r.TTL))
 	// compare-and-swap: DELETE only succeeds if the set is still exactly what
 	// was read, so a concurrent change fails the batch instead of being lost
-	if err := p.change(ctx, ref.id, "update record "+r.Name,
+	if err := p.change(ctx, ref.id, "update record "+r.Name, r.Name, r.Type, []string{r.Value},
 		types.Change{Action: types.ChangeActionDelete, ResourceRecordSet: cur},
 		types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &set}); err != nil {
 		if errors.Is(err, dns.ErrUnconfirmed) {
@@ -740,7 +763,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 		keep.ResourceRecords = rest
 		changes = append(changes, types.Change{Action: types.ChangeActionCreate, ResourceRecordSet: &keep})
 	}
-	if err := p.change(ctx, ref.id, op, changes...); err != nil {
+	if err := p.change(ctx, ref.id, op, r.Name, r.Type, restVals, changes...); err != nil {
 		return err
 	}
 	return p.verify(ctx, ref.id, op, r.Name, r.Type, valuesOf(cur), restVals)

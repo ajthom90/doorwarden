@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
+
 	"github.com/ajthom90/doorwarden/internal/dns"
 	"github.com/ajthom90/doorwarden/internal/dns/dnstest"
 	"github.com/ajthom90/doorwarden/internal/dns/providers/route53"
@@ -53,6 +55,10 @@ type backend struct {
 	badAll, badSets, badPost                  string // serve a malformed HTTP 200 body for all / rrset / change requests
 	dropChange                                bool   // acknowledge changes without applying them
 	brokenTrunc                               bool   // truncated pages without a continuation marker
+	posts                                     int    // change requests received
+	changeStatus                              int    // answer change requests with this HTTP status (not applied)
+	changeBody                                string // body for changeStatus ("" = an XML ServiceUnavailable error)
+	applyThenReject                           bool   // apply the change, then answer InvalidChangeBatch (a lost first attempt)
 }
 
 // mkzone builds a hosted zone with the apex SOA and NS sets every real zone has.
@@ -251,6 +257,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, `<MaxItems>%d</MaxItems></ListResourceRecordSetsResponse>`, per)
 	case len(parts) == 2 && parts[1] == "rrset" && r.Method == "POST":
+		b.posts++
 		body, _ := io.ReadAll(r.Body)
 		var cb changeBatch
 		if err := xml.Unmarshal(body, &cb); err != nil {
@@ -263,6 +270,23 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if b.rejectChange {
 			xmlErr(w, 400, "InvalidChangeBatch", "refused")
+			return
+		}
+		if b.changeStatus != 0 {
+			if b.changeBody != "" {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(b.changeStatus)
+				_, _ = w.Write([]byte(b.changeBody))
+				return
+			}
+			code := "ServiceUnavailable"
+			switch {
+			case b.changeStatus == 500:
+				code = "InternalFailure"
+			case b.changeStatus < 500:
+				code = "Throttling"
+			}
+			xmlErr(w, b.changeStatus, code, "change failed")
 			return
 		}
 		if b.stallChange { // times out on the client before anything is applied
@@ -305,6 +329,11 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			z.sets = next
 			b.afterChange(z)
 			next = z.sets
+		}
+		if b.applyThenReject { // an earlier attempt applied it: this one is refused
+			z.sets = next
+			xmlErr(w, 400, "InvalidChangeBatch", "[Tried to create resource record set [name='x', type='A'] but it already exists, Tried to delete resource record set [name='x', type='A'] but the values provided do not match the current values]")
+			return
 		}
 		if b.dropAfterApply { // apply, then cut the connection before answering
 			z.sets = next
@@ -979,5 +1008,175 @@ func TestErrorsBeforeTheRequestIsSentArePlain(t *testing.T) {
 	}
 	if _, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: "x.example.test", Type: "MX", Value: "v"}); err == nil || errors.Is(err, dns.ErrUnconfirmed) {
 		t.Fatalf("validation: %v", err)
+	}
+}
+
+// newProductionProvider uses the SDK's PRODUCTION retry configuration (the
+// standard retryer: 3 attempts, retrying resets, EOF, timeouts and 5xx); only
+// the endpoint points at the fake.
+func newProductionProvider(t *testing.T, b http.Handler) *route53.Provider {
+	t.Helper()
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+	clk := newClock()
+	p, err := route53.New(context.Background(), route53.Config{AccessKeyID: fakeKeyID, SecretAccessKey: fakeSecret, Endpoint: srv.URL,
+		VerifyTimeout: 10 * time.Second, VerifyInterval: time.Second, Now: clk.now, Sleep: clk.sleep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestChangeIsNeverRetriedUnderProductionRetries: with the SDK's standard
+// retryer, a change that was applied but whose response was lost would be sent
+// again and refused (InvalidChangeBatch "already exists" / "values do not
+// match"), turning an applied write into a plain error and an unowned record.
+// The change call must be sent exactly once and end ambiguous.
+func TestChangeIsNeverRetriedUnderProductionRetries(t *testing.T) {
+	rec := dns.Record{Name: "prod.example.test", Type: "A", Value: "192.0.2.1"}
+	ctx := context.Background()
+	check := func(op string, b *backend, got dns.Record, err error, wantRec bool) {
+		t.Helper()
+		b.mu.Lock()
+		posts := b.posts
+		b.mu.Unlock()
+		if posts != 1 {
+			t.Errorf("%s: %d change requests, want exactly 1", op, posts)
+		}
+		if !errors.Is(err, dns.ErrUnconfirmed) || (wantRec && (got.Name != rec.Name || got.Value != rec.Value)) {
+			t.Errorf("%s: want ErrUnconfirmed with the record, got %+v err %v", op, got, err)
+		}
+	}
+	b := newBackend()
+	b.dropAfterApply = true
+	got, err := newProductionProvider(t, b).CreateRecord(ctx, "example.test", rec)
+	check("create", b, got, err, true)
+
+	b = newBackend()
+	b.seed("ZEXAMPLE", rec.Name, "192.0.2.9")
+	b.dropAfterApply = true
+	got, err = newProductionProvider(t, b).UpdateRecord(ctx, "example.test", rec)
+	check("update", b, got, err, true)
+
+	b = newBackend()
+	b.seed("ZEXAMPLE", rec.Name, rec.Value)
+	b.dropAfterApply = true
+	err = newProductionProvider(t, b).DeleteRecord(ctx, "example.test", rec)
+	check("delete", b, dns.Record{}, err, false)
+}
+
+// TestChangeStatusClassification: an AWS 5xx answer (InternalFailure,
+// ServiceUnavailable, an HTML gateway page) to the change leaves the outcome
+// unknown; a 4xx API error (Throttling, InvalidChangeBatch) is a refusal.
+func TestChangeStatusClassification(t *testing.T) {
+	rec := dns.Record{Name: "st.example.test", Type: "A", Value: "192.0.2.1"}
+	ctx := context.Background()
+	for _, tc := range []struct {
+		status    int
+		body      string
+		ambiguous bool
+	}{
+		{400, "", false},
+		{500, "", true},
+		{502, "<html><body><h1>502 Bad Gateway</h1></body></html>", true},
+		{503, "", true},
+		{504, "<html><body><h1>504 Gateway Time-out</h1></body></html>", true},
+	} {
+		for _, op := range []string{"create", "update", "delete"} {
+			b := newBackend()
+			if op != "create" {
+				b.seed("ZEXAMPLE", rec.Name, "192.0.2.9")
+			}
+			b.changeStatus, b.changeBody = tc.status, tc.body
+			p := newProductionProvider(t, b)
+			var got dns.Record
+			var err error
+			want := rec
+			switch op {
+			case "create":
+				got, err = p.CreateRecord(ctx, "example.test", rec)
+			case "update":
+				got, err = p.UpdateRecord(ctx, "example.test", rec)
+			case "delete":
+				want.Value = "192.0.2.9"
+				err = p.DeleteRecord(ctx, "example.test", want)
+			}
+			b.mu.Lock()
+			posts := b.posts
+			b.mu.Unlock()
+			if posts != 1 {
+				t.Errorf("status %d %s: %d change requests, want 1", tc.status, op, posts)
+			}
+			if err == nil || errors.Is(err, dns.ErrUnconfirmed) != tc.ambiguous {
+				t.Errorf("status %d %s: ambiguous=%v, got err %v", tc.status, op, tc.ambiguous, err)
+			}
+			if op != "delete" && tc.ambiguous && (got.Name != rec.Name || got.Value != rec.Value) {
+				t.Errorf("status %d %s: ErrUnconfirmed must come with the record, got %+v", tc.status, op, got)
+			}
+			if op != "delete" && !tc.ambiguous && got != (dns.Record{}) {
+				t.Errorf("status %d %s: a refusal must return an empty Record, got %+v", tc.status, op, got)
+			}
+		}
+	}
+}
+
+// TestRefusedChangeWhoseResultIsAlreadyInPlaceIsUnconfirmed: InvalidChangeBatch
+// ("already exists" / "values do not match") while the set already holds the
+// requested state means someone (an earlier attempt of ours, or another
+// writer) made it; we cannot prove who, so the conservative answer is the
+// record with ErrUnconfirmed rather than a plain error that could leave our own
+// write unowned. A refusal with the set in any other state stays plain.
+func TestRefusedChangeWhoseResultIsAlreadyInPlaceIsUnconfirmed(t *testing.T) {
+	rec := dns.Record{Name: "rej.example.test", Type: "A", Value: "192.0.2.1"}
+	ctx := context.Background()
+	b := newBackend()
+	b.applyThenReject = true
+	got, err := newProvider(t, b, nil).CreateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Name != rec.Name || got.Value != rec.Value {
+		t.Errorf("create: got %+v err %v", got, err)
+	}
+	b = newBackend()
+	b.seed("ZEXAMPLE", rec.Name, "192.0.2.9")
+	b.applyThenReject = true
+	got, err = newProvider(t, b, nil).UpdateRecord(ctx, "example.test", rec)
+	if !errors.Is(err, dns.ErrUnconfirmed) || got.Value != rec.Value {
+		t.Errorf("update: got %+v err %v", got, err)
+	}
+	b = newBackend()
+	b.seed("ZEXAMPLE", rec.Name, rec.Value)
+	b.applyThenReject = true
+	if err := newProvider(t, b, nil).DeleteRecord(ctx, "example.test", rec); !errors.Is(err, dns.ErrUnconfirmed) {
+		t.Errorf("delete: %v", err)
+	}
+	// refused and the set is NOT in the requested state: plain
+	b = newBackend()
+	b.rejectChange = true
+	got, err = newProvider(t, b, nil).CreateRecord(ctx, "example.test", rec)
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Errorf("plain refusal: got %+v err %v", got, err)
+	}
+	// refused while ANOTHER value is in place: plain (another writer)
+	b = newBackend()
+	b.afterChange = func(z *zone) { z.sets["rej.example.test.|A"].vals = []string{"192.0.2.77"} }
+	b.applyThenReject = true
+	got, err = newProvider(t, b, nil).CreateRecord(ctx, "example.test", rec)
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || got.Name != "" {
+		t.Errorf("refused with another value in place: got %+v err %v", got, err)
+	}
+}
+
+// TestAmbiguousChangeErrorCarriesOnlyScrubbedText: the unconfirmed error keeps
+// the SDK error only as scrubbed text, never as a wrapped value a caller could
+// unwrap and print unscrubbed.
+func TestAmbiguousChangeErrorCarriesOnlyScrubbedText(t *testing.T) {
+	b := newBackend()
+	b.changeStatus, b.changeBody = 502, "<html>bad gateway "+fakeSecret+"</html>"
+	_, err := newProductionProvider(t, b).CreateRecord(context.Background(), "example.test", dns.Record{Name: "s.example.test", Type: "A", Value: "192.0.2.1"})
+	if !errors.Is(err, dns.ErrUnconfirmed) || strings.Contains(err.Error(), fakeSecret) {
+		t.Fatalf("err = %v", err)
+	}
+	var oe *smithy.OperationError
+	if errors.As(err, &oe) {
+		t.Fatalf("the raw SDK error is reachable: %v", oe)
 	}
 }
