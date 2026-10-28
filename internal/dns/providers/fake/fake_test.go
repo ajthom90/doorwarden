@@ -104,3 +104,21 @@ func TestIdentityContract(t *testing.T) {
 		t.Fatalf("recs = %+v", recs)
 	}
 }
+
+func TestUpdateByIDRejectsNameTypeMismatch(t *testing.T) {
+	ctx := context.Background()
+	f := fake.New(true)
+	r, _ := f.CreateRecord(ctx, "z.test", dns.Record{Name: "a.z.test", Type: "A", Value: "1.1.1.1"})
+	for _, bad := range []dns.Record{
+		{ID: r.ID, Name: "b.z.test", Type: "A", Value: "2.2.2.2"},
+		{ID: r.ID, Name: "a.z.test", Type: "AAAA", Value: "2.2.2.2"},
+	} {
+		if _, err := f.UpdateRecord(ctx, "z.test", bad); !errors.Is(err, dns.ErrNotFound) {
+			t.Fatalf("mismatch %+v: err = %v", bad, err)
+		}
+	}
+	recs, _ := f.ListRecords(ctx, "z.test")
+	if len(recs) != 1 || recs[0].Name != "a.z.test" || recs[0].Value != "1.1.1.1" {
+		t.Fatalf("record was renamed/changed: %+v", recs)
+	}
+}

@@ -17,6 +17,23 @@ var (
 	// ErrRecordExists is returned when creating a record whose (name, type)
 	// already exists with a different value.
 	ErrRecordExists = errors.New("dns: record already exists with a different value")
+	// ErrUnconfirmed is returned (wrapped) when a write was ACCEPTED by the
+	// service but could not be confirmed within the provider's verification
+	// window, and also when the request MAY have been applied but its outcome is
+	// unknown (a timeout, cancellation, dropped connection, server-side failure
+	// such as an HTTP 5xx or DNS SERVFAIL, or an unparseable answer after the
+	// write was sent). A definitive rejection (an HTTP 4xx, an AWS 4xx API error,
+	// a DNS REFUSED/NOTAUTH/prerequisite failure) and any failure before the
+	// request was sent are ordinary errors with an empty Record. The Record
+	// returned alongside ErrUnconfirmed describes what was written, so callers
+	// MUST treat a Create/Update that returns errors.Is(err, ErrUnconfirmed) with
+	// a non-empty Record.Name as done (create the ownership row, warn, verify on
+	// a later cycle): ignoring it would leave a record the service holds but
+	// nobody owns. For DeleteRecord the error wraps ErrUnconfirmed and the caller
+	// must KEEP its ownership row, because the record may or may not be gone yet.
+	// A conflicting value seen by a verification read (another writer) is an
+	// ordinary error.
+	ErrUnconfirmed = errors.New("dns: write accepted but not confirmed")
 )
 
 // Record is a single DNS record.
@@ -34,6 +51,12 @@ var (
 // value. DeleteRecord targets ID if set, otherwise exact (name, type, value);
 // a Delete whose ID or Value matches nothing stored is a no-op returning nil
 // and must never delete a record with a different value.
+//
+// If ID is set it wins: on Delete Value is ignored, and Name/Type are ignored
+// when empty (a caller that does set them must name the stored record: a
+// provider that can check refuses a mismatch instead of deleting by ID alone);
+// on Update Name/Type must match the stored record (a mismatch is an error,
+// never a silent rename).
 type Record struct {
 	ID    string
 	Name  string

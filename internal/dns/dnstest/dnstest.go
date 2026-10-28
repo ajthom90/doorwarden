@@ -4,8 +4,9 @@ package dnstest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -21,6 +22,18 @@ type Options struct {
 	// AllowMultiValue skips the "differing value returns ErrRecordExists"
 	// subtest for providers that permit several values per (name, type).
 	AllowMultiValue bool
+	// SeedMultiValue, when set, creates an A record set holding all values at
+	// name out of band (directly in the fake backend). The MultiValue subtest
+	// then requires that Create/Update/Delete leave values doorwarden did not
+	// write intact (or refuse with an error). Providers that cannot hold
+	// several values per (name, type) leave it nil.
+	SeedMultiValue func(ctx context.Context, zone, name string, values ...string) error
+	// Unconfirmed, when set, returns a provider (same backend, writes accepted
+	// but never visible to reads) that can only answer Create with
+	// dns.ErrUnconfirmed. The UnconfirmedCreateReturnsRecord subtest requires the
+	// error to wrap dns.ErrUnconfirmed AND the returned Record to describe what
+	// was written, so a caller can record ownership.
+	Unconfirmed func(t *testing.T) dns.Provider
 }
 
 // Run executes the suite with default zones example.test and other.test.
@@ -41,9 +54,13 @@ func find(recs []dns.Record, name, typ string) (dns.Record, bool) {
 // every call; each created record is deleted again on cleanup (best effort).
 func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 	if o.Zone == "" {
-		o.Zone = "example.test"
+		t.Fatal("dnstest.RunWith: Options.Zone is required (use Run for the example.test defaults)")
 	}
-	prefix := fmt.Sprintf("dwt%d", time.Now().UnixNano()%1_000_000_000)
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		t.Fatalf("dnstest: random prefix: %v", err)
+	}
+	prefix := "dwt" + hex.EncodeToString(rnd[:])
 	zone := o.Zone
 	name := func(label, z string) string { return prefix + "-" + label + "." + z }
 
@@ -129,9 +146,18 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 		}
 		create(t, p, zone, rec)
 		rec.Value = "192.0.2.11" // no ID: targets (name, type)
-		if _, err := p.UpdateRecord(ctx(t), zone, rec); err != nil {
+		upd, err := p.UpdateRecord(ctx(t), zone, rec)
+		if err != nil {
 			t.Fatal(err)
 		}
+		// Clean up the updated record by its own name/type/value too, so
+		// providers that return no ID (or whose create-time handle is stale)
+		// do not leak it.
+		t.Cleanup(func() {
+			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = p.DeleteRecord(c, zone, dns.Record{ID: upd.ID, Name: rec.Name, Type: rec.Type, Value: rec.Value})
+		})
 		if r, ok := find(list(t, p, zone), rec.Name, "A"); !ok || r.Value != "192.0.2.11" {
 			t.Fatalf("after update: %+v", r)
 		}
@@ -162,6 +188,18 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 			t.Skip("provider does not support Update")
 		}
 		if _, err := p.UpdateRecord(ctx(t), zone, mk("nope")); !errors.Is(err, dns.ErrNotFound) {
+			t.Fatalf("want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("UpdateUnknownID", func(t *testing.T) {
+		p := factory(t)
+		if !p.Capabilities().Update {
+			t.Skip("provider does not support Update")
+		}
+		r := mk("unkid")
+		r.ID = "doorwarden-no-such-id"
+		if _, err := p.UpdateRecord(ctx(t), zone, r); !errors.Is(err, dns.ErrNotFound) {
 			t.Fatalf("want ErrNotFound, got %v", err)
 		}
 	})
@@ -222,6 +260,72 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 		if err := p.DeleteRecord(ctx(t), zone, created); err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	t.Run("MultiValueUnmanagedIntact", func(t *testing.T) {
+		if o.SeedMultiValue == nil {
+			t.Skip("no SeedMultiValue configured")
+		}
+		p := factory(t)
+		name := name("multi", zone)
+		if err := o.SeedMultiValue(ctx(t), zone, name, "192.0.2.1", "192.0.2.2"); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		t.Cleanup(func() {
+			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			for _, v := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.77", "192.0.2.99"} {
+				_ = p.DeleteRecord(c, zone, dns.Record{Name: name, Type: "A", Value: v})
+			}
+		})
+		values := func() map[string]bool {
+			m := map[string]bool{}
+			for _, r := range list(t, p, zone) {
+				if r.Name == name && r.Type == "A" {
+					m[r.Value] = true
+				}
+			}
+			return m
+		}
+		intact := func(op string) {
+			t.Helper()
+			if v := values(); !v["192.0.2.1"] || !v["192.0.2.2"] {
+				t.Fatalf("%s destroyed unmanaged values: now %v", op, v)
+			}
+		}
+		if p.Capabilities().Update {
+			// ok or refused, but never destructive
+			_, _ = p.UpdateRecord(ctx(t), zone, dns.Record{Name: name, Type: "A", Value: "192.0.2.99", TTL: 300})
+			intact("Update")
+		}
+		_, _ = p.CreateRecord(ctx(t), zone, dns.Record{Name: name, Type: "A", Value: "192.0.2.77", TTL: 300})
+		intact("Create")
+		if err := p.DeleteRecord(ctx(t), zone, dns.Record{Name: name, Type: "A", Value: "192.0.2.1"}); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if v := values(); v["192.0.2.1"] || !v["192.0.2.2"] {
+			t.Fatalf("Delete of one value: now %v", v)
+		}
+	})
+
+	t.Run("UnconfirmedCreateReturnsRecord", func(t *testing.T) {
+		if o.Unconfirmed == nil {
+			t.Skip("provider does not declare an unconfirmed-write mode")
+		}
+		p := o.Unconfirmed(t)
+		rec := mk("unconf")
+		got, err := p.CreateRecord(ctx(t), zone, rec)
+		if !errors.Is(err, dns.ErrUnconfirmed) {
+			t.Fatalf("want ErrUnconfirmed, got %v", err)
+		}
+		if got.Name != rec.Name || got.Type != rec.Type || got.Value != rec.Value {
+			t.Fatalf("ErrUnconfirmed must come with the written record, got %+v", got)
+		}
+		t.Cleanup(func() {
+			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = factory(t).DeleteRecord(c, zone, rec)
+		})
 	})
 
 	t.Run("ListScopedToZone", func(t *testing.T) {

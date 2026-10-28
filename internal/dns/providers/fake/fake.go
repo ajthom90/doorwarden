@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/ajthom90/doorwarden/internal/dns"
+	"github.com/ajthom90/doorwarden/internal/dns/httpx"
 )
 
 // Type is the registry name of the fake provider.
@@ -15,10 +16,10 @@ const Type = "fake"
 func init() {
 	dns.Register(Type, func(cfg map[string]any, _ dns.SecretResolver) (dns.Provider, error) {
 		wildcard := true
-		if v, ok := cfg["wildcard"]; ok {
-			b, ok := v.(bool)
-			if !ok {
-				return nil, fmt.Errorf("fake: config field \"wildcard\" must be a bool")
+		if _, ok := cfg["wildcard"]; ok {
+			b, err := httpx.BoolOption(cfg, "wildcard")
+			if err != nil {
+				return nil, fmt.Errorf("fake: %w", err)
 			}
 			wildcard = b
 		}
@@ -149,6 +150,10 @@ func (f *Fake) UpdateRecord(_ context.Context, zone string, r dns.Record) (dns.R
 	}
 	if i < 0 {
 		return dns.Record{}, dns.ErrNotFound
+	}
+	if cur := f.zones[zone][i]; cur.Name != r.Name || cur.Type != r.Type {
+		return dns.Record{}, fmt.Errorf("fake: update of record %q: name/type mismatch (%s %s vs stored %s %s): %w",
+			r.ID, r.Name, r.Type, cur.Name, cur.Type, dns.ErrNotFound)
 	}
 	r.ID = f.zones[zone][i].ID
 	f.zones[zone][i] = r
