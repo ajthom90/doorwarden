@@ -1,0 +1,141 @@
+package reconcile
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/ajthom90/doorwarden/internal/model"
+	"github.com/ajthom90/doorwarden/internal/store"
+)
+
+// RouteStore is the persisted route set (*store.Store implements it). The
+// Traefik writer renders from it, and ObservedFromRoutes builds the plan's
+// Known and LastKnown from it.
+type RouteStore interface {
+	UpsertRoute(ctx context.Context, r store.Route) error
+	DeleteRoute(ctx context.Context, key string) error
+	SetRouteRemoval(ctx context.Context, key string, at *time.Time) error
+	ListRoutes(ctx context.Context) ([]store.Route, error)
+}
+
+// NewRouteExecutor returns the executor that maintains the persisted route
+// set. Register it in a MultiExecutor for RouteWrite, RouteRemove,
+// ScheduleRemoval and CancelRemoval; other kinds are ignored.
+//
+//   - RouteWrite upserts the route for Action.Key from Action.Zone/Host,
+//     Action.Svc (Source; Options.Websockets and Options.Middlewares) and
+//     Action.Backend (Scheme, Host, Port, SkipVerify). Backend is required: a
+//     nil Backend, an empty host or a port outside 1..65535 (or a nil Svc) is
+//     an error and nothing is written. An empty Scheme is stored as "http"
+//     (the sources' default). A scheduled removal is preserved.
+//   - RouteRemove deletes the route (absent is not an error). It is the ONLY
+//     way a route leaves the set.
+//   - ScheduleRemoval persists Action.RemovedAfter (required);
+//     CancelRemoval clears it. For a key without a route both do nothing
+//     (store.ErrRouteNotFound is swallowed): there is nothing to remove.
+//
+// now stamps UpdatedAt. In dry run nothing is written. Every action of a
+// batch is attempted; errors are joined.
+func NewRouteExecutor(st RouteStore, now func() time.Time) Executor {
+	if now == nil {
+		now = time.Now
+	}
+	return &routeExecutor{st: st, now: now}
+}
+
+type routeExecutor struct {
+	st  RouteStore
+	now func() time.Time
+}
+
+func (e *routeExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) error {
+	if dryRun {
+		return nil
+	}
+	var errs []error
+	for _, a := range actions {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if err := e.apply(ctx, a); err != nil {
+			errs = append(errs, fmt.Errorf("%s %s: %w", a.Kind, a.Key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e *routeExecutor) apply(ctx context.Context, a Action) error {
+	switch a.Kind {
+	case RouteWrite:
+		r, err := routeFromAction(a, e.now())
+		if err != nil {
+			return err
+		}
+		return e.st.UpsertRoute(ctx, r)
+	case RouteRemove:
+		return e.st.DeleteRoute(ctx, a.Key)
+	case ScheduleRemoval:
+		if a.RemovedAfter == nil {
+			return errors.New("ScheduleRemoval without RemovedAfter")
+		}
+		at := *a.RemovedAfter
+		return ignoreNotFound(e.st.SetRouteRemoval(ctx, a.Key, &at))
+	case CancelRemoval:
+		return ignoreNotFound(e.st.SetRouteRemoval(ctx, a.Key, nil))
+	}
+	return nil
+}
+
+func ignoreNotFound(err error) error {
+	if errors.Is(err, store.ErrRouteNotFound) {
+		return nil
+	}
+	return err
+}
+
+func routeFromAction(a Action, now time.Time) (store.Route, error) {
+	if a.Backend == nil {
+		return store.Route{}, errors.New("RouteWrite without a backend")
+	}
+	if a.Svc == nil {
+		return store.Route{}, errors.New("RouteWrite without a service")
+	}
+	b := *a.Backend
+	if !authoritative(b) || b.Port > 65535 {
+		return store.Route{}, fmt.Errorf("RouteWrite with a non-routable backend (host %q, port %d)", b.Host, b.Port)
+	}
+	scheme := strings.ToLower(strings.TrimSpace(b.Scheme))
+	if scheme == "" {
+		scheme = "http"
+	}
+	return store.Route{
+		Key: a.Key, Source: a.Svc.Source, Zone: a.Zone, Hostname: a.Host,
+		Scheme: scheme, Host: b.Host, Port: b.Port, SkipVerify: b.SkipVerify,
+		Websockets:  a.Svc.Options.Websockets,
+		Middlewares: append([]string(nil), a.Svc.Options.Middlewares...),
+		UpdatedAt:   now,
+	}, nil
+}
+
+// ObservedFromRoutes builds Observed.Known and Observed.LastKnown from the
+// persisted route set. Every persisted backend is authoritative: only a
+// RouteWrite with a real backend can persist a route. A key whose route was
+// deleted (RouteRemove applied) is thereby forgotten, as doc.go requires.
+// Both maps are non-nil.
+func ObservedFromRoutes(routes []store.Route) (known map[string]KnownService, lastKnown map[string]model.Backend) {
+	known = make(map[string]KnownService, len(routes))
+	lastKnown = make(map[string]model.Backend, len(routes))
+	for _, r := range routes {
+		var ra *time.Time
+		if r.RemovedAfter != nil {
+			t := *r.RemovedAfter
+			ra = &t
+		}
+		known[r.Key] = KnownService{Key: r.Key, Source: r.Source, Zone: r.Zone, Hostname: r.Hostname, RemovedAfter: ra}
+		lastKnown[r.Key] = model.Backend{Scheme: r.Scheme, Host: r.Host, Port: r.Port, SkipVerify: r.SkipVerify}
+	}
+	return known, lastKnown
+}
