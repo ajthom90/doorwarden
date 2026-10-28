@@ -406,3 +406,15 @@ func TestOrphanDeterministicUnderShuffle(t *testing.T) {
 		}
 	}
 }
+
+// A wanted row whose value changes is updated AND its removal cancelled in
+// the same plan (the cancel is not a removal; the update keeps RemovedAfter).
+func TestOrphanCancelAlongsideUpdate(t *testing.T) {
+	obs := Observed{Foreign: listed("example.test"),
+		Owned: []store.DNSRecord{ownedRA("example.test", "app.example.test", "A", "192.0.2.99", "docker:app", tp(t0.Add(-time.Hour)))}}
+	got := Plan([]model.Service{pub("docker:app", "app", "example.test", 80)}, obs, phCfg(), t0)
+	assertOrphans(t, got, "DNSCancelRemoval example.test app.example.test docker:app [app.example.test A 192.0.2.99]")
+	if e := ofKind(got, DNSEnsure); len(e) != 1 || e[0].Record.Value != target {
+		t.Fatalf("plan %v", sums(got))
+	}
+}

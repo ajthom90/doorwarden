@@ -174,9 +174,6 @@ func (p *planner) planOrphans(entries []entry) {
 			continue // (e)
 		}
 		rk := rowKey(o.Provider, zn, name, typ)
-		if ensured[rk] {
-			continue // never remove what this plan ensures
-		}
 		ow, present := owners[owner]
 		if present && ow.wants[rk] {
 			if o.RemovedAfter != nil {
@@ -184,6 +181,9 @@ func (p *planner) planOrphans(entries []entry) {
 				p.emit(base)
 			}
 			continue
+		}
+		if ensured[rk] {
+			continue // never remove what this plan ensures
 		}
 		if present && ow.protected {
 			continue // (a) present but not cleanly Published: keeps its records
