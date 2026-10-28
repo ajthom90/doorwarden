@@ -1,0 +1,344 @@
+package unifi_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ajthom90/doorwarden/internal/dns"
+	"github.com/ajthom90/doorwarden/internal/dns/dnstest"
+	"github.com/ajthom90/doorwarden/internal/dns/providers/unifi"
+	"github.com/ajthom90/doorwarden/internal/secrets"
+)
+
+const (
+	fakeKey = "unifi-KEY-do-not-leak-987"
+	siteID  = "11111111-2222-4333-8444-555555555555"
+)
+
+type backend struct {
+	mu       sync.Mutex
+	sites    []map[string]any
+	pols     []map[string]any
+	n        int
+	status   int
+	slow     time.Duration
+	huge     bool
+	requests []string // "METHOD path"
+	otherKey string   // key seen at a redirect target
+}
+
+func fixture(t *testing.T, name string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile("testdata/" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func newBackend(t *testing.T) *backend {
+	b := &backend{}
+	for _, s := range fixture(t, "sites.json")["data"].([]any) {
+		b.sites = append(b.sites, s.(map[string]any))
+	}
+	for _, s := range fixture(t, "policies.json")["data"].([]any) {
+		b.pols = append(b.pols, s.(map[string]any))
+	}
+	return b
+}
+
+func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if b.slow > 0 {
+		time.Sleep(b.slow)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.requests = append(b.requests, r.Method+" "+r.URL.Path)
+	reply := func(code int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	if b.status != 0 {
+		reply(b.status, map[string]any{"message": "failed with key " + r.Header.Get("X-API-KEY")})
+		return
+	}
+	if r.Header.Get("X-API-KEY") != fakeKey {
+		reply(401, map[string]any{"message": "unauthorized"})
+		return
+	}
+	if b.huge {
+		_, _ = w.Write([]byte(`{"data":"` + strings.Repeat("a", 5<<20) + `"}`))
+		return
+	}
+	root := "/proxy/network/integration/v1"
+	paged := func(items []map[string]any) {
+		off, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		if off > len(items) {
+			off = len(items)
+		}
+		end := off + 3 // server caps page size at 3
+		if end > len(items) {
+			end = len(items)
+		}
+		reply(200, map[string]any{"offset": off, "limit": 3, "count": end - off, "totalCount": len(items), "data": items[off:end]})
+	}
+	if r.URL.Path == root+"/sites" {
+		paged(b.sites)
+		return
+	}
+	pre := root + "/sites/" + siteID + "/dns/policies"
+	switch {
+	case r.URL.Path == pre && r.Method == "GET":
+		paged(b.pols)
+	case r.URL.Path == pre && r.Method == "POST":
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		b.n++
+		in["id"] = fmt.Sprintf("bbbbbbbb-0000-4000-8000-%012d", b.n)
+		in["metadata"] = map[string]any{"origin": "USER_DEFINED"}
+		b.pols = append(b.pols, in)
+		reply(201, in)
+	case strings.HasPrefix(r.URL.Path, pre+"/"):
+		id := strings.TrimPrefix(r.URL.Path, pre+"/")
+		for i, p := range b.pols {
+			if p["id"] != id {
+				continue
+			}
+			switch r.Method {
+			case "PUT":
+				var in map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&in)
+				in["id"], in["metadata"] = id, p["metadata"]
+				b.pols[i] = in
+				reply(200, in)
+			case "DELETE":
+				b.pols = append(b.pols[:i], b.pols[i+1:]...)
+				w.WriteHeader(200)
+			}
+			return
+		}
+		reply(404, map[string]any{"message": "not found"})
+	default:
+		reply(404, map[string]any{"message": "no route"})
+	}
+}
+
+func newProvider(t *testing.T, b http.Handler, mod func(*unifi.Config)) *unifi.Provider {
+	t.Helper()
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+	cfg := unifi.Config{URL: srv.URL, APIKey: secrets.Secret(fakeKey), Wildcard: true}
+	if mod != nil {
+		mod(&cfg)
+	}
+	p, err := unifi.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestConformance(t *testing.T) {
+	b := newBackend(t)
+	p := newProvider(t, b, nil)
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+}
+
+func TestConformanceNoWildcard(t *testing.T) {
+	b := newBackend(t)
+	p := newProvider(t, b, func(c *unifi.Config) { c.Wildcard = false })
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+}
+
+func TestWildcardRefusedUnlessEnabled(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	p := newProvider(t, b, func(c *unifi.Config) { c.Wildcard = false })
+	if p.Capabilities().WildcardA {
+		t.Fatal("instance must not claim wildcard")
+	}
+	before := len(b.pols)
+	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "*.example.test", Type: "A", Value: "192.0.2.9"})
+	if err == nil || !strings.Contains(err.Error(), "wildcard") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(b.pols) != before {
+		t.Fatal("wildcard policy was created")
+	}
+	for _, r := range b.requests {
+		if strings.HasPrefix(r, "POST") {
+			t.Fatal("POST sent for refused wildcard")
+		}
+	}
+	on := newProvider(t, b, nil)
+	if !on.Capabilities().WildcardA {
+		t.Fatal("wildcard: true must enable")
+	}
+	// via registry: flag parsed
+	srv := httptest.NewServer(b)
+	defer srv.Close()
+	rp, err := dns.New("unifi", map[string]any{"url": srv.URL, "api_key": fakeKey, "wildcard": true}, nil)
+	if err != nil || !rp.Capabilities().WildcardA {
+		t.Fatalf("registry wildcard: %v", err)
+	}
+}
+
+func TestForeignRecordsAnyTypeAndUnsupportedWrites(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	p := newProvider(t, b, nil)
+	recs, err := p.ListRecords(ctx, "example.test")
+	if err != nil || len(recs) != 3 {
+		t.Fatalf("recs=%+v err=%v", recs, err)
+	}
+	types := map[string]string{}
+	for _, r := range recs {
+		types[r.Type] = r.Value
+	}
+	if types["A"] != "192.0.2.10" || types["CNAME"] != "app.example.test" || types["FORWARD_DOMAIN"] != "198.51.100.53" {
+		t.Fatalf("types = %v", types)
+	}
+	for _, typ := range []string{"AAAA", "CNAME", "TXT"} {
+		_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "x.example.test", Type: typ, Value: "v"})
+		if err == nil || !strings.Contains(err.Error(), "not supported") {
+			t.Fatalf("%s: err = %v", typ, err)
+		}
+	}
+	// a user-origin foreign A record is returned unfiltered and can be conflicted with
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "app.example.test", Type: "A", Value: "192.0.2.99"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPaginationIteratesAll(t *testing.T) {
+	b := newBackend(t)
+	for i := 0; i < 10; i++ {
+		b.pols = append(b.pols, map[string]any{"type": "A_RECORD", "id": fmt.Sprint("p", i), "enabled": true, "domain": fmt.Sprintf("h%d.example.test", i), "ipv4Address": "192.0.2.1", "ttlSeconds": 0})
+	}
+	p := newProvider(t, b, nil)
+	recs, err := p.ListRecords(context.Background(), "example.test")
+	if err != nil || len(recs) != 13 {
+		t.Fatalf("got %d recs err %v", len(recs), err)
+	}
+}
+
+func TestSiteDiscovery(t *testing.T) {
+	ctx := context.Background()
+	mk := func(refs ...string) *backend {
+		b := newBackend(t)
+		b.sites = nil
+		for i, r := range refs {
+			id := siteID
+			if i > 0 {
+				id = fmt.Sprintf("22222222-0000-4000-8000-%012d", i)
+			}
+			b.sites = append(b.sites, map[string]any{"id": id, "internalReference": r, "name": r})
+		}
+		return b
+	}
+	// default among several is chosen
+	b := mk("default", "other")
+	p := newProvider(t, b, nil)
+	if _, err := p.ListRecords(ctx, "example.test"); err != nil {
+		t.Fatalf("default site not chosen: %v", err)
+	}
+	// ambiguous: no default
+	p = newProvider(t, mk("a", "b"), nil)
+	if err := p.Test(ctx); err == nil || !strings.Contains(err.Error(), "site_id") || !strings.Contains(err.Error(), "none is \"default\"") {
+		t.Fatalf("err = %v", err)
+	}
+	// none
+	p = newProvider(t, mk(), nil)
+	if err := p.Test(ctx); err == nil || !strings.Contains(err.Error(), "no sites") {
+		t.Fatalf("err = %v", err)
+	}
+	// explicit site_id skips discovery
+	b = mk("a", "b")
+	p = newProvider(t, b, func(c *unifi.Config) { c.SiteID = siteID })
+	if _, err := p.ListRecords(ctx, "example.test"); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range b.requests {
+		if strings.HasSuffix(r, "/sites") {
+			t.Fatal("site list requested despite site_id")
+		}
+	}
+}
+
+func TestErrorMappingNoSecretLeak(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	wrong := newProvider(t, b, func(c *unifi.Config) { c.APIKey = "wrong-" + fakeKey })
+	err := wrong.Test(ctx)
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") || strings.Contains(err.Error(), fakeKey) {
+		t.Fatalf("err = %v", err)
+	}
+	p := newProvider(t, b, nil)
+	for status, want := range map[int]string{429: "rate limited", 500: "status 500"} {
+		b.status = status
+		err := p.Test(ctx)
+		if err == nil || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), fakeKey) {
+			t.Fatalf("%d: err = %v", status, err)
+		}
+	}
+}
+
+func TestSizeLimitAndContext(t *testing.T) {
+	b := newBackend(t)
+	b.huge = true
+	p := newProvider(t, b, nil)
+	if err := p.Test(context.Background()); err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("err = %v", err)
+	}
+	b.huge = false
+	b.slow = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := p.Test(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestURLValidationAndRedirect(t *testing.T) {
+	for _, u := range []string{"http://dns.example.test", "ftp://x", "https://user:pw@host", ""} {
+		if _, err := unifi.New(unifi.Config{URL: u, APIKey: "k"}); err == nil {
+			t.Errorf("%q accepted", u)
+		}
+	}
+	if _, err := unifi.New(unifi.Config{URL: "http://dns.example.test", APIKey: "k", AllowInsecureHTTP: true}); err != nil {
+		t.Errorf("allow_insecure_http ignored: %v", err)
+	}
+	// a redirect to another host must not receive the key
+	var leaked string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked = r.Header.Get("X-API-KEY") }))
+	defer other.Close()
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, strings.Replace(other.URL, "127.0.0.1", "localhost", 1), http.StatusFound)
+	}))
+	defer src.Close()
+	p, _ := unifi.New(unifi.Config{URL: src.URL, APIKey: fakeKey})
+	if err := p.Test(context.Background()); err == nil || leaked != "" {
+		t.Fatalf("redirect followed: err=%v leaked=%q", err, leaked)
+	}
+}
+
+func TestSecretRefViaResolver(t *testing.T) {
+	if _, err := dns.New("unifi", map[string]any{"url": "https://gw.example.test", "api_key": "secret:k"}, nil); err == nil {
+		t.Fatal("secret ref without resolver accepted")
+	}
+}
