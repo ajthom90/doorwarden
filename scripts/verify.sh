@@ -18,7 +18,52 @@
 set -u
 
 HOST_RE='^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'
-IP_RE='^[0-9A-Fa-f:.]+$'
+
+# valid_ip IP - dotted-quad (octets 0-255) or a plausible IPv6 literal.
+valid_ip() {
+	local ip="$1" i
+	if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+		for i in 1 2 3 4; do
+			(( 10#${BASH_REMATCH[i]} <= 255 )) || return 1
+		done
+		return 0
+	fi
+	[[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:*:* && "$ip" != *:::* ]] || return 1
+	local rest="${ip/::/:}" groups g n=0
+	[[ "${ip#*::}" == *::* ]] && return 1 # more than one "::"
+	[[ "$ip" == :[!:]* || "$ip" == *[!:]: ]] && return 1
+	local IFS=':'
+	groups=($rest)
+	for g in ${groups[@]+"${groups[@]}"}; do
+		[[ -z "$g" ]] && continue
+		(( ${#g} <= 4 )) || return 1
+		n=$((n + 1))
+	done
+	if [[ "$ip" == *::* ]]; then (( n <= 7 )) || return 1; else (( n == 8 )) || return 1; fi
+	return 0
+}
+
+# run_timeout SECS CMD... - timeout(1), else gtimeout, else a background-kill
+# fallback (also used when _VERIFY_FORCE_FALLBACK=1, for tests).
+run_timeout() {
+	local secs="$1"
+	shift
+	if [[ -z "${_VERIFY_FORCE_FALLBACK:-}" ]] && command -v timeout >/dev/null; then
+		timeout "$secs" "$@"
+	elif [[ -z "${_VERIFY_FORCE_FALLBACK:-}" ]] && command -v gtimeout >/dev/null; then
+		gtimeout "$secs" "$@"
+	else
+		"$@" &
+		local pid=$! rc watcher
+		(sleep "$secs"; kill "$pid" 2>/dev/null) &
+		watcher=$!
+		wait "$pid" 2>/dev/null
+		rc=$?
+		kill "$watcher" 2>/dev/null
+		wait "$watcher" 2>/dev/null
+		return $rc
+	fi
+}
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -86,9 +131,10 @@ main() {
 	local list="" ip="${VERIFY_IP:-}" port="${VERIFY_PORT:-443}" cacert="" insecure=0
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--resolve) ip="${2:-}"; shift 2 ;;
-		--port) port="${2:-}"; shift 2 ;;
-		--cacert) cacert="${2:-}"; shift 2 ;;
+		--resolve | --port | --cacert)
+			if [[ $# -lt 2 ]]; then echo "verify: $1 needs a value" >&2; return 2; fi
+			case "$1" in --resolve) ip="$2" ;; --port) port="$2" ;; --cacert) cacert="$2" ;; esac
+			shift 2 ;;
 		--insecure) insecure=1; shift ;;
 		-h | --help) sed -n '2,16p' "$0"; return 0 ;;
 		-*) echo "verify: unknown option $1" >&2; return 2 ;;
@@ -96,7 +142,7 @@ main() {
 		esac
 	done
 	if [[ -z "$list" || ! -r "$list" ]]; then echo "verify: HOSTLIST file required and readable" >&2; return 2; fi
-	if [[ -z "$ip" || ! "$ip" =~ $IP_RE ]]; then echo "verify: --resolve IP (or VERIFY_IP) required, and must be an IP address" >&2; return 2; fi
+	if [[ -z "$ip" ]] || ! valid_ip "$ip"; then echo "verify: --resolve IP (or VERIFY_IP) required, and must be an IP address" >&2; return 2; fi
 	if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then echo "verify: invalid port" >&2; return 2; fi
 	command -v curl >/dev/null || { echo "verify: curl not found" >&2; return 2; }
 	command -v openssl >/dev/null || { echo "verify: openssl not found" >&2; return 2; }
@@ -107,8 +153,6 @@ main() {
 
 	local connect="$ip:$port"
 	[[ "$ip" == *:* ]] && connect="[$ip]:$port"
-	local to=()
-	command -v timeout >/dev/null && to=(timeout 20)
 
 	local rows=() line host
 	while IFS= read -r line || [[ -n "$line" ]]; do
@@ -122,6 +166,7 @@ main() {
 			rc=1
 			continue
 		fi
+		rm -f "$tmp/cert.pem" # never reuse the previous host's certificate
 		local url="https://$host/"
 		[[ "$port" != 443 ]] && url="https://$host:$port/"
 		local copts=(-sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 --resolve "$host:$port:$ip")
@@ -137,7 +182,7 @@ main() {
 		[[ "$cls" == auth ]] && notes+=("auth ($code)")
 
 		local cert="$tmp/cert.pem" issuer="-" san="" dl="?" iflag="-" sanok="no"
-		${to[@]+"${to[@]}"} openssl s_client -servername "$host" -connect "$connect" </dev/null 2>/dev/null |
+		run_timeout 20 openssl s_client -servername "$host" -connect "$connect" </dev/null 2>/dev/null |
 			openssl x509 -out "$cert" 2>/dev/null
 		if [[ -s "$cert" ]]; then
 			issuer="$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')"

@@ -33,6 +33,24 @@ no status_class 000
 [[ "$(issuer_flag 'O=Let'"'"'s Encrypt')" == ok ]] || { echo "FAIL issuer ok"; fails=$((fails + 1)); }
 [[ "$(expiry_state 1 1)" == fail && "$(expiry_state 0 1)" == warn && "$(expiry_state 0 0)" == ok ]] || { echo "FAIL expiry"; fails=$((fails + 1)); }
 
+# IP validation
+for good in 192.0.2.10 0.0.0.0 255.255.255.255 ::1 2001:db8::1 fe80::1:2 1:2:3:4:5:6:7:8 abc:: 1:2:: ::; do ok valid_ip "$good"; done
+for bad in beef :::: 256.1.1.1 1.2.3 1.2.3.4.5 "" 1::2::3 :1:2 12345::1 1:2:3:4:5:6:7:8:9 "1.2.3.4;x" ; do no valid_ip "$bad"; done
+# timeout fallback kills a hanging command promptly
+s0=$SECONDS
+_VERIFY_FORCE_FALLBACK=1 run_timeout 1 sleep 10 >/dev/null 2>&1
+rc=$?
+if [[ $rc -eq 0 || $((SECONDS - s0)) -gt 5 ]]; then echo "FAIL: run_timeout fallback rc=$rc"; fails=$((fails + 1)); fi
+_VERIFY_FORCE_FALLBACK=1 run_timeout 5 true || { echo "FAIL: fallback success rc"; fails=$((fails + 1)); }
+
+# Missing option values must error out, not loop
+printf 'a.example.test\n' >/tmp/.vt-hosts.$$
+for o in --resolve --port --cacert; do
+	if ! out=$(perl -e 'alarm 10; exec @ARGV' bash "$dir/verify.sh" /tmp/.vt-hosts.$$ "$o" 2>&1); then :; fi
+	[[ "$out" == *"needs a value"* ]] || { echo "FAIL: $o without value: $out"; fails=$((fails + 1)); }
+done
+rm -f /tmp/.vt-hosts.$$
+
 # Integration
 tmp="$(mktemp -d)"
 pid=""
