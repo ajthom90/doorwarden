@@ -25,6 +25,7 @@ type fakeACME struct {
 	accounts []map[string]any // decoded newAccount JWS payloads
 	acctHdr  []map[string]any // decoded newAccount JWS protected headers
 	orders   int
+	kids     []any // JWS "kid" of each newOrder request
 }
 
 func newFakeACME(t *testing.T) *fakeACME {
@@ -56,7 +57,9 @@ func newFakeACME(t *testing.T) *fakeACME {
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(map[string]any{"status": "valid"})
 		case "/order":
+			hdr, _ := decodeJWS(t, r.Body)
 			f.mu.Lock()
+			f.kids = append(f.kids, hdr["kid"])
 			f.orders++
 			f.mu.Unlock()
 			w.Header().Set("Content-Type", "application/problem+json")
@@ -173,6 +176,13 @@ func TestLegoEABAccountAndRateLimitPark(t *testing.T) {
 	}
 	if len(f.accounts) != 1 || f.orders != 2 {
 		t.Fatalf("accounts %d orders %d", len(f.accounts), f.orders)
+	}
+	// Both orders are signed with the account URL as kid, including the
+	// one using the stored registration (found by the Pebble run).
+	for i, k := range f.kids {
+		if k != f.srv.URL+"/acct/1" {
+			t.Errorf("order %d kid %v", i, k)
+		}
 	}
 	s2, _, _ := h.st.GetSetting(ctx, accountKeyKey("le"))
 	if s2 != s {

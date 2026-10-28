@@ -1157,16 +1157,23 @@ func (m *Manager) accountKey(ctx context.Context, issuer string) (*ecdsa.Private
 	return k, nil
 }
 
-// registration returns the account registration for the issuer at
-// directory URL, registering (with EAB when configured) on first use.
-func (m *Manager) registration(ctx context.Context, client *lego.Client, o order) (*registration.Resource, error) {
+// storedRegistration returns the stored account registration for the
+// issuer at the order's directory, or nil.
+func (m *Manager) storedRegistration(ctx context.Context, o order) *registration.Resource {
 	m.accountMu.Lock()
 	defer m.accountMu.Unlock()
-	key := regKey(o.Issuer, o.Dir.URL)
 	var reg registration.Resource
-	if ok, err := m.kv.getJSON(ctx, key, &reg); err == nil && ok && reg.URI != "" {
-		return &reg, nil
+	if ok, err := m.kv.getJSON(ctx, regKey(o.Issuer, o.Dir.URL), &reg); err == nil && ok && reg.URI != "" {
+		return &reg
 	}
+	return nil
+}
+
+// register creates the account (with EAB when configured) and stores the
+// registration. lego signs later requests with the account URL as kid.
+func (m *Manager) register(ctx context.Context, client *lego.Client, o order) (*registration.Resource, error) {
+	m.accountMu.Lock()
+	defer m.accountMu.Unlock()
 	var r *registration.Resource
 	var err error
 	if o.IssuerCfg.EABKid != "" {
@@ -1178,7 +1185,7 @@ func (m *Manager) registration(ctx context.Context, client *lego.Client, o order
 	if err != nil {
 		return nil, fmt.Errorf("acme: register account for issuer %s: %w", o.Issuer, err)
 	}
-	if err := m.kv.putJSON(ctx, key, r); err != nil {
+	if err := m.kv.putJSON(ctx, regKey(o.Issuer, o.Dir.URL), r); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -1204,15 +1211,18 @@ func (m *Manager) legoObtain(ctx context.Context, o order) (obtained, error) {
 	if m.httpClient != nil {
 		lc.HTTPClient = m.httpClient
 	}
+	// A stored registration must be on the user before NewClient: lego
+	// takes the account URL (JWS kid) from it only at construction.
+	u.reg = m.storedRegistration(ctx, o)
 	client, err := lego.NewClient(lc)
 	if err != nil {
 		return obtained{}, fmt.Errorf("acme: directory %s: %w", o.Dir.URL, err)
 	}
-	reg, err := m.registration(ctx, client, o)
-	if err != nil {
-		return obtained{}, err
+	if u.reg == nil {
+		if u.reg, err = m.register(ctx, client, o); err != nil {
+			return obtained{}, err
+		}
 	}
-	u.reg = reg
 	switch o.Challenge {
 	case ChallengeDNS01:
 		opts := []dns01.ChallengeOption{}
