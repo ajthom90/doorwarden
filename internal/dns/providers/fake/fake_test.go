@@ -71,3 +71,36 @@ func TestSentinels(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestInstanceCapsNarrowerThanStatic(t *testing.T) {
+	static, _ := dns.CapsFor("fake")
+	p, err := dns.New("fake", map[string]any{"wildcard": false}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !static.WildcardA || p.Capabilities().WildcardA {
+		t.Fatalf("static=%+v instance=%+v", static, p.Capabilities())
+	}
+}
+
+func TestIdentityContract(t *testing.T) {
+	ctx := context.Background()
+	f := fake.New(true)
+	r, _ := f.CreateRecord(ctx, "z.test", dns.Record{Name: "a.z.test", Type: "A", Value: "1.1.1.1"})
+	// unknown ID: delete no-op, update ErrNotFound
+	if err := f.DeleteRecord(ctx, "z.test", dns.Record{ID: "bogus"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.UpdateRecord(ctx, "z.test", dns.Record{ID: "bogus", Name: "a.z.test", Type: "A", Value: "2.2.2.2"}); !errors.Is(err, dns.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+	// wrong value: no-op
+	_ = f.DeleteRecord(ctx, "z.test", dns.Record{Name: "a.z.test", Type: "A", Value: "9.9.9.9"})
+	if recs, _ := f.ListRecords(ctx, "z.test"); len(recs) != 1 {
+		t.Fatalf("recs = %+v", recs)
+	}
+	_ = f.DeleteRecord(ctx, "z.test", dns.Record{ID: r.ID})
+	if recs, _ := f.ListRecords(ctx, "z.test"); len(recs) != 0 {
+		t.Fatalf("recs = %+v", recs)
+	}
+}

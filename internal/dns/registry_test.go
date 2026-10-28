@@ -25,6 +25,12 @@ func (s *stub) UpdateRecord(_ context.Context, _ string, r dns.Record) (dns.Reco
 }
 func (s *stub) DeleteRecord(context.Context, string, dns.Record) error { return nil }
 
+func reg(t *testing.T, typ string, f dns.Factory, schema dns.ConfigSchema, c dns.Capabilities) {
+	t.Helper()
+	dns.Register(typ, f, schema, c)
+	t.Cleanup(func() { dns.Unregister(typ) })
+}
+
 func factory(dns.Capabilities) dns.Factory {
 	return func(cfg map[string]any, sr dns.SecretResolver) (dns.Provider, error) { return &stub{}, nil }
 }
@@ -40,9 +46,9 @@ func mustPanic(t *testing.T, f func()) {
 }
 
 func TestRegisterDuplicatePanics(t *testing.T) {
-	dns.Register("t-dup", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
+	reg(t, "t-dup", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
 	mustPanic(t, func() {
-		dns.Register("t-dup", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
+		reg(t, "t-dup", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
 	})
 }
 
@@ -51,7 +57,7 @@ func TestRegisterEmptyTypePanics(t *testing.T) {
 }
 
 func TestNewUnknownTypeListsKnown(t *testing.T) {
-	dns.Register("t-known", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
+	reg(t, "t-known", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
 	_, err := dns.New("nope", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), `"nope"`) || !strings.Contains(err.Error(), "t-known") {
 		t.Fatalf("err = %v", err)
@@ -59,7 +65,7 @@ func TestNewUnknownTypeListsKnown(t *testing.T) {
 }
 
 func TestNewRequiredFieldMissing(t *testing.T) {
-	dns.Register("t-req", factory(dns.Capabilities{}), dns.ConfigSchema{Fields: []dns.Field{
+	reg(t, "t-req", factory(dns.Capabilities{}), dns.ConfigSchema{Fields: []dns.Field{
 		{Name: "api_token", Secret: true, Required: true}, {Name: "opt"},
 	}}, dns.Capabilities{})
 	_, err := dns.New("t-req", map[string]any{"opt": "x"}, nil)
@@ -72,8 +78,8 @@ func TestNewRequiredFieldMissing(t *testing.T) {
 }
 
 func TestTypesSorted(t *testing.T) {
-	dns.Register("t-zz", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
-	dns.Register("t-aa", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
+	reg(t, "t-zz", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
+	reg(t, "t-aa", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
 	ts := dns.Types()
 	if !sort.StringsAreSorted(ts) || len(ts) < 2 {
 		t.Fatalf("types = %v", ts)
@@ -82,7 +88,7 @@ func TestTypesSorted(t *testing.T) {
 
 func TestCapsForAndSchemaFor(t *testing.T) {
 	want := dns.Capabilities{WildcardA: true, TTL: true}
-	dns.Register("t-caps", func(map[string]any, dns.SecretResolver) (dns.Provider, error) {
+	reg(t, "t-caps", func(map[string]any, dns.SecretResolver) (dns.Provider, error) {
 		t.Fatal("factory must not be called")
 		return nil, nil
 	}, dns.ConfigSchema{Fields: []dns.Field{{Name: "a"}}}, want)
@@ -103,8 +109,8 @@ func TestCapsForAndSchemaFor(t *testing.T) {
 }
 
 func TestConfigCaps(t *testing.T) {
-	dns.Register("t-wild", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{WildcardA: true})
-	dns.Register("t-nowild", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
+	reg(t, "t-wild", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{WildcardA: true})
+	reg(t, "t-nowild", factory(dns.Capabilities{}), dns.ConfigSchema{}, dns.Capabilities{})
 	f := dns.ConfigCaps()
 	if c, ok := f("t-wild"); !ok || !c.WildcardA {
 		t.Fatal("t-wild")

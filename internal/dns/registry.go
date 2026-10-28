@@ -34,7 +34,9 @@ var (
 )
 
 // Register adds a provider type. It panics on an empty or duplicate type.
-// caps are static capabilities available without credentials.
+// caps are static capabilities available without credentials. They are an
+// upper bound used only for config validation; the constructed instance's
+// Capabilities() is authoritative at runtime and may be narrower.
 func Register(typ string, f Factory, schema ConfigSchema, caps Capabilities) {
 	if typ == "" {
 		panic("dns: Register with empty type")
@@ -69,6 +71,12 @@ func New(typ string, cfg map[string]any, sr SecretResolver) (Provider, error) {
 	return e.factory(cfg, sr)
 }
 
+func unregister(typ string) {
+	mu.Lock()
+	delete(registry, typ)
+	mu.Unlock()
+}
+
 // Types returns registered type names, sorted.
 func Types() []string {
 	mu.RLock()
@@ -81,7 +89,9 @@ func Types() []string {
 	return out
 }
 
-// CapsFor returns a type's static capabilities without constructing it.
+// CapsFor returns a type's static capabilities without constructing it. This
+// is an upper bound for validation only; callers that depend on a capability
+// must check the constructed instance's Capabilities().
 func CapsFor(typ string) (Capabilities, bool) {
 	mu.RLock()
 	defer mu.RUnlock()

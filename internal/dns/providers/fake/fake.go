@@ -46,7 +46,9 @@ type Fake struct {
 	failing map[string][]error
 }
 
-// New returns a fake with the given wildcard capability.
+// New returns a fake with the given wildcard capability. wildcard=false is an
+// intentional fixture: the instance reports narrower capabilities than the
+// static ones registered for CapsFor (WildcardA true).
 func New(wildcard bool) *Fake {
 	return &Fake{wildcard: wildcard, zones: map[string][]dns.Record{}, failing: map[string][]error{}}
 }
@@ -106,6 +108,15 @@ func (f *Fake) find(zone string, r dns.Record) int {
 	return -1
 }
 
+func (f *Fake) findID(zone, id string) int {
+	for i, e := range f.zones[zone] {
+		if e.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
 func (f *Fake) CreateRecord(_ context.Context, zone string, r dns.Record) (dns.Record, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -130,7 +141,12 @@ func (f *Fake) UpdateRecord(_ context.Context, zone string, r dns.Record) (dns.R
 	if err := f.begin("UpdateRecord", zone, r); err != nil {
 		return dns.Record{}, err
 	}
-	i := f.find(zone, r)
+	var i int
+	if r.ID != "" {
+		i = f.findID(zone, r.ID)
+	} else {
+		i = f.find(zone, r)
+	}
 	if i < 0 {
 		return dns.Record{}, dns.ErrNotFound
 	}
@@ -145,7 +161,13 @@ func (f *Fake) DeleteRecord(_ context.Context, zone string, r dns.Record) error 
 	if err := f.begin("DeleteRecord", zone, r); err != nil {
 		return err
 	}
-	if i := f.find(zone, r); i >= 0 {
+	i := -1
+	if r.ID != "" {
+		i = f.findID(zone, r.ID)
+	} else if j := f.find(zone, r); j >= 0 && f.zones[zone][j].Value == r.Value {
+		i = j
+	}
+	if i >= 0 {
 		f.zones[zone] = append(f.zones[zone][:i], f.zones[zone][i+1:]...)
 	}
 	return nil

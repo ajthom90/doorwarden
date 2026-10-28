@@ -61,7 +61,7 @@ removed (grace).
 
 ## 4. DNS provider interface
 ```go
-type Record struct{ ID, Name, Type, Value string; TTL int } // Name relative-FQDN normalized
+type Record struct{ ID, Name, Type, Value string; TTL int } // Name: fully-qualified, lowercase, no trailing dot; one managed record per (name,type); Update/Delete target Record.ID when set, else (name,type) / exact (name,type,value), and a non-matching Delete is a no-op
 type Capabilities struct{ WildcardA, MultiZone, Update, TTL bool }
 type Provider interface {
     Type() string
