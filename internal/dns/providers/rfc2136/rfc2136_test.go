@@ -31,6 +31,7 @@ type fakeServer struct {
 	dropUpdateReply bool   // apply an UPDATE, then close the connection without answering
 	beforeUpdate    func() // runs when an UPDATE arrives, before it is evaluated (simulates a racing writer)
 	updateRcode     int    // answer every UPDATE with this rcode (signed) without applying it
+	tsigError       int    // TSIG error code for updateReply "tsigerr"
 	updateReply     string // apply the UPDATE, then reply "unsigned" (NOERROR without TSIG), "badsig" (a MAC that does not verify) or "garbled"
 	delay           time.Duration
 	unsigned        int // requests received without TSIG
@@ -105,6 +106,18 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 		}
 		if f.updateRcode != 0 {
 			m.Rcode = f.updateRcode
+			switch f.updateReply {
+			case "unsigned": // a refusal without any TSIG record
+				_ = w.WriteMsg(m)
+				m = nil
+			case "tsigerr": // a TSIG record reporting an error, with no MAC (RFC 8945 5.3.2)
+				m.Extra = append(m.Extra, &mdns.TSIG{Hdr: mdns.RR_Header{Name: keyName, Rrtype: mdns.TypeTSIG, Class: mdns.ClassANY},
+					Algorithm: mdns.HmacSHA256, TimeSigned: uint64(time.Now().Unix()), Fudge: 300, OrigId: m.Id, Error: uint16(f.tsigError)})
+				if out, err := m.Pack(); err == nil {
+					_, _ = w.Write(out)
+				}
+				m = nil
+			}
 			return
 		}
 		z := q.Name
@@ -556,23 +569,37 @@ func TestUpdateOutcomeClassification(t *testing.T) {
 		name      string
 		rcode     int
 		reply     string
+		tsigErr   int
 		ambiguous bool
 	}
+	// Only a reply whose TSIG MAC VERIFIED can prove a refusal: an on-path
+	// injector could let the UPDATE through and then forge an unsigned or
+	// unverifiable "no". Rows without "(unsigned)"/"(tsig error)" are signed by
+	// the server with the shared key and verify, except NOTAUTH, which the TSIG
+	// library refuses to verify at all.
 	cases := []tc{
-		{"SERVFAIL", mdns.RcodeServerFailure, "", true},
-		{"unknown rcode 15", 15, "", true},
-		{"unsigned NOERROR", 0, "unsigned", true},
-		{"TSIG verification failure", 0, "badsig", true},
-		{"garbled reply", 0, "garbled", true},
-		{"REFUSED", mdns.RcodeRefused, "", false},
-		{"NOTAUTH", mdns.RcodeNotAuth, "", false},
-		{"NOTZONE", mdns.RcodeNotZone, "", false},
-		{"FORMERR", mdns.RcodeFormatError, "", false},
-		{"NOTIMP", mdns.RcodeNotImplemented, "", false},
-		{"NXRRSET", mdns.RcodeNXRrset, "", false},
-		{"YXRRSET", mdns.RcodeYXRrset, "", false},
-		{"NXDOMAIN", mdns.RcodeNameError, "", false},
-		{"YXDOMAIN", mdns.RcodeYXDomain, "", false},
+		{"SERVFAIL", mdns.RcodeServerFailure, "", 0, true},
+		{"unknown rcode 15", 15, "", 0, true},
+		{"unsigned NOERROR", 0, "unsigned", 0, true},
+		{"TSIG verification failure", 0, "badsig", 0, true},
+		{"garbled reply", 0, "garbled", 0, true},
+		{"NOTAUTH (signed, unverifiable)", mdns.RcodeNotAuth, "", 0, true},
+		{"NOTAUTH (unsigned)", mdns.RcodeNotAuth, "unsigned", 0, true},
+		{"REFUSED (unsigned)", mdns.RcodeRefused, "unsigned", 0, true},
+		{"FORMERR (unsigned)", mdns.RcodeFormatError, "unsigned", 0, true},
+		{"NOTIMP (unsigned)", mdns.RcodeNotImplemented, "unsigned", 0, true},
+		{"NOTZONE (unsigned)", mdns.RcodeNotZone, "unsigned", 0, true},
+		{"BADSIG (tsig error)", mdns.RcodeNotAuth, "tsigerr", mdns.RcodeBadSig, true},
+		{"BADKEY (tsig error)", mdns.RcodeNotAuth, "tsigerr", mdns.RcodeBadKey, true},
+		{"BADTIME (tsig error)", mdns.RcodeNotAuth, "tsigerr", mdns.RcodeBadTime, true},
+		{"REFUSED (verified)", mdns.RcodeRefused, "", 0, false},
+		{"NOTZONE (verified)", mdns.RcodeNotZone, "", 0, false},
+		{"FORMERR (verified)", mdns.RcodeFormatError, "", 0, false},
+		{"NOTIMP (verified)", mdns.RcodeNotImplemented, "", 0, false},
+		{"NXRRSET (verified)", mdns.RcodeNXRrset, "", 0, false},
+		{"YXRRSET (verified)", mdns.RcodeYXRrset, "", 0, false},
+		{"NXDOMAIN (verified)", mdns.RcodeNameError, "", 0, false},
+		{"YXDOMAIN (verified)", mdns.RcodeYXDomain, "", 0, false},
 	}
 	for _, c := range cases {
 		for _, op := range []string{"create", "update", "delete"} {
@@ -583,7 +610,7 @@ func TestUpdateOutcomeClassification(t *testing.T) {
 			}
 			p := newProvider(t, f, nil)
 			f.mu.Lock()
-			f.updateRcode, f.updateReply = c.rcode, c.reply
+			f.updateRcode, f.updateReply, f.tsigError = c.rcode, c.reply, c.tsigErr
 			f.mu.Unlock()
 			var got dns.Record
 			var err error
@@ -608,5 +635,19 @@ func TestUpdateOutcomeClassification(t *testing.T) {
 				t.Errorf("%s %s: a refusal must return an empty Record, got %+v", c.name, op, got)
 			}
 		}
+	}
+}
+
+// TestDiagnosticsStayPlainOutsideUpdates: Test() and queries keep reporting an
+// unverifiable rejection (NOTAUTH, BADKEY...) as a plain, specific error.
+func TestDiagnosticsStayPlainOutsideUpdates(t *testing.T) {
+	f := startServer(t)
+	wrong := newProvider(t, f, func(c *rfc2136.Config) { c.KeySecret = "d3Jvbmctc2VjcmV0LXdyb25n" })
+	err := wrong.Test(context.Background())
+	if err == nil || errors.Is(err, dns.ErrUnconfirmed) || !strings.Contains(err.Error(), "NOTAUTH") {
+		t.Fatalf("Test: %v", err)
+	}
+	if _, err := wrong.CreateRecord(context.Background(), "example.test", dns.Record{Name: "d.example.test", Type: "A", Value: "192.0.2.1"}); err == nil || errors.Is(err, dns.ErrUnconfirmed) {
+		t.Fatalf("a query rejection before any UPDATE must stay plain: %v", err)
 	}
 }

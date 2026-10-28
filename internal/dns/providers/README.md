@@ -166,9 +166,12 @@ status >= 500, a transport failure, a deadline or an unparseable answer is
 ambiguous; a 4xx API error is a refusal, except an `InvalidChangeBatch` while the
 set already holds exactly the requested values: someone (possibly an earlier
 attempt of ours) made it, and since that cannot be proven either way the record
-is returned with `ErrUnconfirmed`. rfc2136: after the UPDATE was written,
-REFUSED, NOTAUTH, NOTZONE, FORMERR, NOTIMP, the prerequisite failures
-(NXRRSET/YXRRSET/NXDOMAIN/YXDOMAIN) and a TSIG error the server reports are
-refusals; SERVFAIL, an unknown rcode, a reply that is unsigned, signed by
-another key or fails TSIG verification, a garbled reply and any I/O failure are
-ambiguous.
+is returned with `ErrUnconfirmed`. rfc2136: after the UPDATE was written, only a refusal in a reply whose TSIG
+MAC VERIFIED is definitive (REFUSED, NOTZONE, FORMERR, NOTIMP, and the
+prerequisite failures NXRRSET/YXRRSET/NXDOMAIN/YXDOMAIN). A refusal that cannot
+be verified (NOTAUTH, which the TSIG library never verifies; an unsigned rcode;
+a TSIG error the server reports) is ambiguous for writes, because an on-path
+injector could let the update through and forge the "no"; `Test()` and queries
+still report it as a plain, specific diagnosis (BADKEY, NOTAUTH...). SERVFAIL,
+an unknown rcode, a reply that is unsigned, signed by another key or fails TSIG
+verification, a garbled reply and any I/O failure are ambiguous.

@@ -182,19 +182,19 @@ func (p *Provider) exchangeRaw(ctx context.Context, op string, m *mdns.Msg) (*md
 	if t == nil {
 		switch r.Rcode {
 		case mdns.RcodeNotAuth:
-			return nil, authErr(op, "unsigned NOTAUTH reply")
+			return nil, &unverifiedRejection{authErr(op, "unsigned NOTAUTH reply")}
 		case mdns.RcodeRefused, mdns.RcodeFormatError, mdns.RcodeNotImplemented, mdns.RcodeNotZone:
-			return nil, fmt.Errorf("rfc2136: %s: server refused the request with an unsigned %s reply", op, mdns.RcodeToString[r.Rcode])
+			return nil, &unverifiedRejection{fmt.Errorf("rfc2136: %s: server refused the request with an unsigned %s reply", op, mdns.RcodeToString[r.Rcode])}
 		}
 		return nil, &ioAfterSend{fmt.Errorf("rfc2136: %s: server response (%s) is not TSIG-signed; refusing it", op, mdns.RcodeToString[r.Rcode])}
 	}
 	if e := tsigErrorFromCode(op, p.keyName, int(t.Error)); e != nil {
-		return nil, e
+		return nil, &unverifiedRejection{e} // such a reply carries no verifiable MAC
 	}
 	if r.Rcode == mdns.RcodeNotAuth {
 		// the TSIG library cannot verify a NOTAUTH message at all (it rejects
-		// the rcode before checking the MAC); the server said no either way
-		return nil, authErr(op, "signed NOTAUTH reply")
+		// the rcode before checking the MAC)
+		return nil, &unverifiedRejection{authErr(op, "signed NOTAUTH reply")}
 	}
 	if !strings.EqualFold(t.Hdr.Name, p.keyName) {
 		return nil, &ioAfterSend{fmt.Errorf("rfc2136: %s: response signed with an unexpected key %q; refusing it", op, t.Hdr.Name)}
@@ -232,6 +232,18 @@ func tsigVerifyError(op, keyName string, err error) error {
 	}
 	return fmt.Errorf("rfc2136: %s: TSIG verification failed: %v", op, err)
 }
+
+// unverifiedRejection is a reply that SAYS the request was refused (NOTAUTH,
+// an unsigned REFUSED/FORMERR/NOTIMP/NOTZONE, a TSIG error reported by the
+// server) but whose TSIG MAC was not verified. Test() and queries report it as
+// the plain diagnosis it carries. For an UPDATE it proves nothing: an on-path
+// injector could let the update through and forge the "no" (a server that
+// verified a signed request signs its reply, RFC 8945), so update() treats it as
+// ambiguous.
+type unverifiedRejection struct{ err error }
+
+func (e *unverifiedRejection) Error() string { return e.err.Error() }
+func (e *unverifiedRejection) Unwrap() error { return e.err }
 
 // ioAfterSend marks an I/O failure that happened after the request was written:
 // the server may have applied it.
@@ -405,9 +417,10 @@ func (p *Provider) lookup(ctx context.Context, name, typ string) ([]dns.Record, 
 }
 
 // update sends one UPDATE. Errors before it was written (TSIG signing, dial)
-// are plain. After that, only an explicit refusal is definitive (REFUSED,
-// NOTAUTH, NOTZONE, FORMERR, NOTIMP, the prerequisite failures NXRRSET/YXRRSET
-// /NXDOMAIN/YXDOMAIN, or a TSIG error the server reports); SERVFAIL (a journal
+// are plain. After that, only an explicit refusal in a reply whose TSIG MAC
+// VERIFIED is definitive (REFUSED, NOTZONE, FORMERR, NOTIMP, the prerequisite
+// failures NXRRSET/YXRRSET/NXDOMAIN/YXDOMAIN); an unverified refusal (NOTAUTH,
+// an unsigned rcode, a TSIG error the server reports), SERVFAIL (a journal
 // failure, or a forwarded update whose primary timed out, may still have been
 // applied), an unknown rcode, an untrusted reply (unsigned, wrong key, MAC
 // that does not verify), a garbled reply and an I/O failure wrap
@@ -420,9 +433,13 @@ func (p *Provider) update(ctx context.Context, op, zone string, f func(*mdns.Msg
 	if err == nil {
 		err = updateRcodeErr(op, r)
 	}
+	var unv *unverifiedRejection
+	if errors.As(err, &unv) {
+		err = &ioAfterSend{fmt.Errorf("%w (the reply's TSIG signature could not be verified, so it does not prove the update was refused)", unv.err)}
+	}
 	var amb *ioAfterSend
 	if errors.As(err, &amb) {
-		return fmt.Errorf("rfc2136: %s: the update may have been applied but the outcome is unknown (%v): %w: %w", op, amb.err, dns.ErrUnconfirmed, amb.err) // amb.err text is already scrubbed
+		return fmt.Errorf("rfc2136: %s: the update may have been applied but the outcome is unknown: %w: %w", op, dns.ErrUnconfirmed, amb.err) // amb.err text is already scrubbed
 	}
 	return err
 }
