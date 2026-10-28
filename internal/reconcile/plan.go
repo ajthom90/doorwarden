@@ -50,7 +50,33 @@ type planner struct {
 	out        []Action
 	// presenceChecked: OwnedRowKey of rows ownedPresence already handled.
 	presenceChecked map[string]bool
+	// repairPairs: per provider+"/"+zone, the wanted rows eligible for
+	// repair and the missing ones (planRepairs decides what is emitted).
+	repairPairs map[string]*repairPair
 }
+
+// repairPair counts, for one provider/zone, the wanted owned rows eligible
+// for repair (wanted) and those of them a listing showed missing (missing,
+// including rows a foreign record blocks), with the repairs that could be
+// emitted (cands, unblocked missing rows).
+type repairPair struct {
+	provider, zone  string
+	wanted, missing int
+	cands           []Action
+}
+
+// Mass-repair limits per provider/zone and cycle (see planRepairs).
+const (
+	// RepairCapPerZone bounds the repairs emitted per provider/zone and cycle.
+	RepairCapPerZone = 5
+	// repairBreakerMinMissing: the breaker needs MORE than this many missing
+	// rows (and more than half of the wanted ones).
+	repairBreakerMinMissing = 3
+)
+
+// AlertDNSMassMissing marks the Skip planRepairs emits when most owned
+// records of a provider/zone are missing (Action.Alert).
+const AlertDNSMassMissing = "dns-mass-missing"
 
 // Plan computes the actions that bring the world in line with desired. It is
 // pure: no I/O, no clock, inputs are not modified, output order is
@@ -128,6 +154,7 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 	}
 	p.planRemovals(present, losers)
 	p.planOrphans(entries, winners)
+	p.planRepairs()
 
 	sortActions(p.out)
 	return p.out, winners
@@ -135,7 +162,7 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 
 func newPlanner(obs Observed, cfg *config.Config, now time.Time) *planner {
 	p := &planner{obs: obs, now: now, grace: cfg.Settings.GracePeriod, zones: map[string]*zoneInfo{},
-		foreign: map[string][]dns.Record{}}
+		foreign: map[string][]dns.Record{}, presenceChecked: map[string]bool{}, repairPairs: map[string]*repairPair{}}
 	if p.grace <= 0 {
 		p.grace = defaultGrace
 	}
@@ -476,8 +503,9 @@ func (p *planner) foreignBlocker(z *zoneInfo, name string) *dns.Record {
 
 // ownedPresence checks a wanted owned row o (owner o.OwnerKey, value equal to
 // the zone's desired value) against the provider listing: changed out of
-// band is reported with a Skip and never overwritten; missing is repaired
-// with DNSEnsure{Repair: true} carrying the stored row's identity, unless
+// band is reported with a Skip and never overwritten; missing is a repair
+// candidate (DNSEnsure{Repair: true} carrying the stored row's identity,
+// emitted by planRepairs subject to the mass-repair breaker and cap), unless
 // the owner's source is unavailable or a foreign record now holds the name
 // (Conflict). s is the owner's service (nil for the wildcard row).
 func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service) {
@@ -485,23 +513,29 @@ func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *
 	if p.presenceChecked[rk] {
 		return // once per row (a winner's row is not re-checked for its owner as a loser)
 	}
-	if p.presenceChecked == nil {
-		p.presenceChecked = map[string]bool{}
-	}
 	p.presenceChecked[rk] = true
+	pk := z.provider + "/" + z.name
+	_, listed := p.foreign[pk]
+	// eligible: the owner's state is known and the pair was listed; only
+	// such rows count for the breaker
+	eligible := listed && (s == nil || (s.Source != "" && !p.obs.Unavailable[s.Source]))
+	var pair *repairPair
+	if eligible {
+		pair = p.repairPairs[pk]
+		if pair == nil {
+			pair = &repairPair{provider: z.provider, zone: z.name}
+			p.repairPairs[pk] = pair
+		}
+		pair.wanted++
+	}
 	if d, ok := p.obs.OwnedDrifted[rk]; ok {
 		p.emit(p.driftSkip(z, o, key, s, d))
 		return
 	}
-	if !p.obs.OwnedMissing[rk] {
-		return
+	if !eligible || !p.obs.OwnedMissing[rk] {
+		return // present, or unknown this cycle: never repair blind
 	}
-	if s != nil && (s.Source == "" || p.obs.Unavailable[s.Source]) {
-		return // the owner's state is unknown this cycle
-	}
-	if _, listed := p.foreign[z.provider+"/"+z.name]; !listed {
-		return // unknown: never repair blind
-	}
+	pair.missing++
 	name := normName(o.Name)
 	if fr := p.foreignBlocker(z, name); fr != nil {
 		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
@@ -510,9 +544,49 @@ func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *
 				name, z.recType, fr.Name, fr.Type, fr.Value)})
 		return
 	}
-	p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+	pair.cands = append(pair.cands, Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 		Record: &dns.Record{ID: o.ProviderRecordID, Name: name, Type: z.recType, Value: z.value}, Owner: o.OwnerKey,
 		Repair: true, Reason: "owned record is missing at the provider; re-creating it"})
+}
+
+// planRepairs emits the repair candidates ownedPresence collected, per
+// provider/zone. Breaker: when more than repairBreakerMinMissing wanted rows
+// are missing AND they are more than half of the pair's wanted rows, the
+// listing is more likely wrong (a wiped server, a zone pinned to the wrong
+// hosted zone, a misconfigured provider) than the records gone: ONE Skip
+// (Alert AlertDNSMassMissing) is emitted and no repair at all for that pair.
+// It holds every cycle while the condition does, and clears by itself once
+// it no longer holds. Otherwise at most RepairCapPerZone repairs are emitted,
+// the first by (name, type, owner key); the rest wait for later cycles.
+func (p *planner) planRepairs() {
+	keys := make([]string, 0, len(p.repairPairs))
+	for k := range p.repairPairs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		rp := p.repairPairs[k]
+		if rp.missing > repairBreakerMinMissing && 2*rp.missing > rp.wanted {
+			p.emit(Action{Kind: Skip, Zone: rp.zone, Host: rp.zone, Provider: rp.provider, Alert: AlertDNSMassMissing,
+				Reason: fmt.Sprintf("most owned records missing at %s/%s (%d of %d); refusing mass repair: check the provider and zone configuration (repairs resume by themselves once most records are listed again)",
+					rp.provider, rp.zone, rp.missing, rp.wanted)})
+			continue
+		}
+		c := rp.cands
+		sort.SliceStable(c, func(i, j int) bool {
+			a, b := c[i], c[j]
+			if a.Record.Name != b.Record.Name {
+				return a.Record.Name < b.Record.Name
+			}
+			if a.Record.Type != b.Record.Type {
+				return a.Record.Type < b.Record.Type
+			}
+			return a.Owner < b.Owner
+		})
+		for i := 0; i < len(c) && i < RepairCapPerZone; i++ {
+			p.emit(c[i])
+		}
+	}
 }
 
 // driftSkip reports an owned record whose value was changed out of band.

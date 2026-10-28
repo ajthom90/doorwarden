@@ -133,8 +133,9 @@ type dnsZone struct{ name, provider, mode string }
 // DNSEnsure with Repair (an owned record the listing showed missing): the
 // sameValue early return is bypassed. The stored row must still match the
 // action (owner, value, provider ID, no schedule), the per-record backoff
-// must be due, and a FRESH listing must show neither our record (present:
-// no-op, backoff reset) nor any record blocking the name (Conflict,
+// must be due, and a listing refreshed once per batch and provider/zone (by
+// the pair's first repair) must show neither our record (present: no-op,
+// backoff reset) nor any record blocking the name (Conflict,
 // ErrForeignRecord); then the guarded create re-creates it and refreshes the
 // same row. See the package documentation, "Drift repair".
 //
@@ -180,15 +181,17 @@ type dnsZone struct{ name, provider, mode string }
 //
 // dns.ErrUnconfirmed (the provider accepted a write, or may have applied
 // it, but could not confirm it): a CreateRecord answering it with a record
-// that names the target (same name and type) counts as created: the
-// ownership row is written from that record (its provider ID may be empty),
+// that names the target (same name and type, and the target value or no
+// value) counts as created: the ownership row is written with the target
+// value and that record's provider ID (which may be empty),
 // the action succeeds, a warn activity says "write accepted but
 // unconfirmed; will verify on a later cycle" and LastWarnings lists it; the
 // next cycles' drift check verifies the record exists (Repair above). This
 // holds for a plain create, a re-create, the create step of a replace and a
 // restore. An UpdateRecord answering it with such a record keeps the row's
-// OLD value (storing the returned provider ID, if any) so the next plan
-// repeats the update; the update is idempotent if it landed. Without a
+// OLD value (storing the returned provider ID, if any, and a pending update
+// in kv, see the package documentation) so the next plan repeats the
+// update; the update is idempotent if it landed. Without a
 // usable record the outcome is ambiguous: the error is returned, no row is
 // written or changed, an error activity says so, and a replace does not
 // restore the old value (the new one may exist). A DeleteRecord answering
@@ -221,6 +224,7 @@ type DNSExecutor struct {
 
 	mu       sync.Mutex // serializes Apply (the Runner already does)
 	warnings []DNSWarning
+	sweptAt  time.Time // last sweepRepairState
 }
 
 // NewDNSExecutor validates the configuration against the constructed
@@ -305,15 +309,20 @@ type listing struct {
 type dnsBatch struct {
 	e        *DNSExecutor
 	listings map[string]*listing
+	// repairListed: provider/zone pairs a repair already re-listed in this
+	// batch; later repairs of the pair use the cached listing (kept current
+	// by remember/forget).
+	repairListed map[string]bool
 }
 
 // Apply implements Executor; kinds not in DNSActionKinds are ignored.
 func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	b := &dnsBatch{e: e, listings: map[string]*listing{}}
+	b := &dnsBatch{e: e, listings: map[string]*listing{}, repairListed: map[string]bool{}}
 	if !dryRun {
 		e.warnings = nil
+		e.sweepRepairState(ctx)
 	}
 	var errs []error
 	for _, a := range actions {
@@ -479,6 +488,17 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 	rec := dns.Record{ID: row.ProviderRecordID, Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}
 	var got dns.Record
 	err := b.e.call(ctx, func(c context.Context) (err error) { got, err = t.p.UpdateRecord(c, t.zone, rec); return })
+	if pu, ok := b.e.pendingUpdate(ctx, t); errors.Is(err, dns.ErrNotFound) && ok && pu.OldID != "" && pu.OldID != rec.ID {
+		// An unconfirmed update gave the row a provider ID that does not
+		// exist: the update did not land and our record may still be the one
+		// under the ID the row held before. Update that one (it is ours by
+		// ID) instead of re-creating next to it, which would find it and
+		// refuse it as foreign every cycle.
+		b.e.log.WarnContext(ctx, "owned DNS record not found under the id an unconfirmed update returned; updating it under its previous id",
+			"provider", t.provider, "zone", t.zone, "name", t.name, "type", t.typ, "id", rec.ID, "previous_id", pu.OldID)
+		rec.ID, stored.ID = pu.OldID, pu.OldID
+		err = b.e.call(ctx, func(c context.Context) (err error) { got, err = t.p.UpdateRecord(c, t.zone, rec); return })
+	}
 	if errors.Is(err, dns.ErrNotFound) {
 		b.e.log.WarnContext(ctx, "owned DNS record is gone at the provider; re-creating after a foreign-record check",
 			"provider", t.provider, "zone", t.zone, "name", t.name, "type", t.typ, "id", row.ProviderRecordID)
@@ -486,7 +506,7 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 		return b.create(ctx, t, row)
 	}
 	if errors.Is(err, dns.ErrUnconfirmed) {
-		return b.updateUnconfirmed(ctx, t, row, got, err)
+		return b.updateUnconfirmed(ctx, t, row, rec.ID, got, err)
 	}
 	if err != nil {
 		return err
@@ -513,6 +533,7 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 			t, t.provider, t.zone, t.value, id, row.Value, row.ProviderRecordID, err))
 		return fmt.Errorf("updated %s to %s (new provider id %q) but could not update its ownership row: %w", t, t.value, id, err)
 	}
+	b.e.clearKV(ctx, pendingKey(t.provider, t.zone, t.name, t.typ))
 	b.e.activity(ctx, "info", fmt.Sprintf("updated %s at %s/%s: %s -> %s (owner %s, provider id %q)", t, t.provider, t.zone, row.Value, t.value, t.owner, id))
 	return nil
 }
@@ -524,13 +545,17 @@ func (b *dnsBatch) update(ctx context.Context, t dnsTarget, row *store.DNSRecord
 // if it landed, completing it if it did not. Recording the new value instead
 // would hide an update that never landed (the value is then never checked
 // again). Without such a record nothing changes and the error is returned.
-func (b *dnsBatch) updateUnconfirmed(ctx context.Context, t dnsTarget, row *store.DNSRecord, got dns.Record, uerr error) error {
+// sentID is the provider ID the update was sent to; it is kept as a pending
+// update (kv, see pendingUpdate) so that, if the provider returned a new ID
+// but the update did not land, the next update can still reach the record.
+func (b *dnsBatch) updateUnconfirmed(ctx context.Context, t dnsTarget, row *store.DNSRecord, sentID string, got dns.Record, uerr error) error {
 	delete(b.listings, t.provider+"/"+t.zone) // which value is live is unknown
 	w, ok := unconfirmedRecord(t, got)
 	if !ok {
 		b.ambiguous(ctx, "update", t, t.value, uerr, fmt.Sprintf("the ownership row keeps value %s; the next cycle updates again", row.Value))
 		return uerr
 	}
+	b.e.recordPendingUpdate(ctx, t, pendingUpdate{Value: t.value, OldID: sentID, NewID: w.ID, At: b.e.now().Unix()})
 	if w.ID != "" && w.ID != row.ProviderRecordID {
 		nr := *row
 		nr.Zone, nr.Name, nr.Type, nr.ProviderRecordID = t.zone, t.name, t.typ, w.ID
@@ -745,6 +770,9 @@ func (b *dnsBatch) doCreate(ctx context.Context, t dnsTarget, base *store.DNSRec
 	if uerr != nil {
 		b.unconfirmed(ctx, "create", t, rec, uerr, what)
 		return true, nil
+	}
+	if base != nil {
+		b.e.clearKV(ctx, pendingKey(t.provider, t.zone, t.name, t.typ)) // the row names a confirmed record now
 	}
 	b.e.activity(ctx, "info", what)
 	return true, nil
@@ -995,6 +1023,7 @@ func (b *dnsBatch) delete(ctx context.Context, t dnsTarget, a Action) error {
 	if !deleted {
 		return b.rowChangedAfterDelete(bctx, t, stored)
 	}
+	b.e.clearKV(ctx, repairKey(t.provider, t.zone, t.name, t.typ), pendingKey(t.provider, t.zone, t.name, t.typ))
 	b.e.activity(ctx, "info", fmt.Sprintf("deleted %s %s at %s/%s (owner %s, provider id %q)", t, stored.Value, t.provider, t.zone, t.owner, stored.ID))
 	return nil
 }
@@ -1276,7 +1305,8 @@ func repairStale(row *store.DNSRecord, t dnsTarget, a Action) string {
 
 // repair re-creates an owned record a listing showed missing (a DNSEnsure
 // with Repair). Unlike a plain ensure it does not stop at an up-to-date
-// row: after the stale-plan check and the backoff it re-lists the zone;
+// row: after the stale-plan check and the backoff it re-lists the zone
+// (once per batch and provider/zone);
 // our record present (by stored ID, or by value when the row has none) is a
 // no-op that resets the backoff; any other record blocking the name is a
 // Conflict (ErrForeignRecord); otherwise the guarded create runs and the
@@ -1318,7 +1348,13 @@ func (b *dnsBatch) repair(ctx context.Context, t dnsTarget, a Action) error {
 		}
 		return nil
 	}
-	delete(b.listings, t.provider+"/"+t.zone) // re-list: the plan's listing may be stale
+	if pk := t.provider + "/" + t.zone; !b.repairListed[pk] {
+		// re-list once per batch and pair: the plan's listing may be stale.
+		// Later repairs of the pair use this listing, which remember/forget
+		// keep current with this batch's own writes.
+		delete(b.listings, pk)
+		b.repairListed[pk] = true
+	}
 	l := b.listing(ctx, t)
 	if l.err != nil {
 		e.activity(ctx, "warn", fmt.Sprintf("not re-creating missing %s at %s/%s: listing the zone failed: %v", t, t.provider, t.zone, l.err))
@@ -1348,12 +1384,21 @@ func (b *dnsBatch) repair(ctx context.Context, t dnsTarget, a Action) error {
 	}
 	e.activity(ctx, "warn", fmt.Sprintf("owned record %s %s at %s/%s (owner %s, provider id %q) is missing at the provider; re-creating it (attempt %d)",
 		t, row.Value, t.provider, t.zone, t.owner, row.ProviderRecordID, st.Attempts))
-	_, err = b.doCreate(ctx, t, row)
+	warned := len(e.warnings)
+	created, err := b.doCreate(ctx, t, row)
+	if created && err == nil && len(e.warnings) == warned {
+		// confirmed: the incident is over (an unconfirmed create keeps the
+		// backoff until a listing shows the record)
+		if derr := e.repairKV.DeleteSetting(context.WithoutCancel(ctx), key); derr != nil {
+			e.log.WarnContext(ctx, "resetting the DNS repair backoff failed", "key", key, "error", derr)
+		}
+	}
 	return err
 }
 
 // loadRepairState reads key; absent, unreadable JSON or a state older than
-// repairStateStale is a fresh state.
+// repairStateStale is a fresh state. NextAt is clamped to now+repairBackoffMax,
+// so a clock stepped back never holds a repair longer than the cap.
 func loadRepairState(ctx context.Context, kv RepairStateStore, key string, now time.Time) (repairState, error) {
 	v, ok, err := kv.GetSetting(ctx, key)
 	if err != nil || !ok {
@@ -1363,7 +1408,122 @@ func loadRepairState(ctx context.Context, kv RepairStateStore, key string, now t
 	if json.Unmarshal([]byte(v), &st) != nil || st.Attempts < 0 || now.Sub(time.Unix(st.LastAt, 0)) > repairStateStale {
 		return repairState{}, nil
 	}
+	if lim := now.Add(repairBackoffMax).Unix(); st.NextAt > lim {
+		// the clock went back: clamp, and persist it so the wait ends at
+		// most repairBackoffMax after the first read that saw it
+		st.NextAt, st.LastAt = lim, min(st.LastAt, now.Unix())
+		v, _ := json.Marshal(st)
+		if err := kv.SetSetting(context.WithoutCancel(ctx), key, string(v)); err != nil {
+			return repairState{}, err
+		}
+	}
 	return st, nil
+}
+
+// pendingUpdateTTL: a pending update older than this is ignored.
+const pendingUpdateTTL = 2 * time.Hour
+
+// pendingUpdate is the kv value under pendingKey: an UpdateRecord that
+// answered dns.ErrUnconfirmed with a usable record. The ownership row keeps
+// its old value (and takes NewID); OldID is the ID the update was sent to.
+// Value is the attempted value. It is dropped by the next confirmed write of
+// the row (update, re-create), by the row's deletion, or after
+// pendingUpdateTTL.
+type pendingUpdate struct {
+	Value string `json:"value"`
+	OldID string `json:"old_id"`
+	NewID string `json:"new_id"`
+	At    int64  `json:"at"`
+}
+
+// pendingKey is the kv key of a record's pending (unconfirmed) update.
+func pendingKey(provider, zone, name, typ string) string {
+	return "dns/pending-update/" + provider + "/" + normName(zone) + "/" + normName(name) + "/" + normType(typ)
+}
+
+// recordPendingUpdate stores pu for t (best effort: without it a rotated ID
+// that did not land shows as a foreign record, reported, never written over).
+func (e *DNSExecutor) recordPendingUpdate(ctx context.Context, t dnsTarget, pu pendingUpdate) {
+	if e.repairKV == nil {
+		return
+	}
+	v, _ := json.Marshal(pu)
+	if err := e.repairKV.SetSetting(context.WithoutCancel(ctx), pendingKey(t.provider, t.zone, t.name, t.typ), string(v)); err != nil {
+		e.log.WarnContext(ctx, "recording a pending DNS update failed", "provider", t.provider, "zone", t.zone,
+			"name", t.name, "type", t.typ, "error", err)
+	}
+}
+
+// pendingUpdate returns t's pending update, if one younger than
+// pendingUpdateTTL is stored.
+func (e *DNSExecutor) pendingUpdate(ctx context.Context, t dnsTarget) (pendingUpdate, bool) {
+	if e.repairKV == nil {
+		return pendingUpdate{}, false
+	}
+	v, ok, err := e.repairKV.GetSetting(ctx, pendingKey(t.provider, t.zone, t.name, t.typ))
+	if err != nil || !ok {
+		return pendingUpdate{}, false
+	}
+	var pu pendingUpdate
+	if json.Unmarshal([]byte(v), &pu) != nil || e.now().Sub(time.Unix(pu.At, 0)) > pendingUpdateTTL {
+		return pendingUpdate{}, false
+	}
+	return pu, true
+}
+
+// clearKV deletes kv keys (best effort, logged).
+func (e *DNSExecutor) clearKV(ctx context.Context, keys ...string) {
+	if e.repairKV == nil {
+		return
+	}
+	for _, k := range keys {
+		if err := e.repairKV.DeleteSetting(context.WithoutCancel(ctx), k); err != nil {
+			e.log.WarnContext(ctx, "deleting a DNS state key failed", "key", k, "error", err)
+		}
+	}
+}
+
+// repairStateLister lists kv keys by prefix (*store.Store implements it);
+// optional, found on the RepairStateStore by type assertion.
+type repairStateLister interface {
+	ListSettingsWithPrefix(ctx context.Context, prefix string) (map[string]string, error)
+}
+
+// repairSweepEvery spaces the sweeps of leftover repair/pending-update keys.
+const repairSweepEvery = time.Hour
+
+// sweepRepairState deletes repair and pending-update kv keys whose ownership
+// row no longer exists. It runs at the first non-dry Apply and then at most
+// every repairSweepEvery; failures are logged and never fail the batch.
+func (e *DNSExecutor) sweepRepairState(ctx context.Context) {
+	l, ok := e.repairKV.(repairStateLister)
+	now := e.now()
+	if !ok || (!e.sweptAt.IsZero() && !now.Before(e.sweptAt) && now.Sub(e.sweptAt) < repairSweepEvery) {
+		return
+	}
+	rows, err := e.st.ListAllOwnedRecords(ctx)
+	if err != nil {
+		e.log.WarnContext(ctx, "sweeping DNS repair state: reading ownership rows failed", "error", err)
+		return
+	}
+	keep := map[string]bool{}
+	for _, r := range rows {
+		keep[repairKey(r.Provider, r.Zone, r.Name, r.Type)] = true
+		keep[pendingKey(r.Provider, r.Zone, r.Name, r.Type)] = true
+	}
+	for _, prefix := range []string{"dns/repair/", "dns/pending-update/"} {
+		kv, err := l.ListSettingsWithPrefix(ctx, prefix)
+		if err != nil {
+			e.log.WarnContext(ctx, "sweeping DNS repair state: listing keys failed", "prefix", prefix, "error", err)
+			return
+		}
+		for k := range kv {
+			if !keep[k] {
+				e.clearKV(ctx, k)
+			}
+		}
+	}
+	e.sweptAt = now
 }
 
 // DNSObservation is what GatherObserved saw; Fill copies it into an
@@ -1499,18 +1659,18 @@ func (e *DNSExecutor) LastWarnings() []DNSWarning {
 
 // unconfirmedRecord returns the record a write that answered
 // dns.ErrUnconfirmed says it wrote, normalized, when that record names t
-// (same name and type; Value defaults to t.value). ok is false when the
-// provider returned no record, or one naming something else (a provider
-// bug): then the outcome is ambiguous and nothing may be recorded from it.
+// (same name and type, and t's value or none). Its Value is always t.value.
+// ok is false when the provider returned no record, or one naming something
+// else or another value (a provider bug): then the outcome is ambiguous and
+// nothing may be recorded from it.
 func unconfirmedRecord(t dnsTarget, got dns.Record) (dns.Record, bool) {
 	if normName(got.Name) == "" || normName(got.Name) != t.name || normType(got.Type) != t.typ {
 		return dns.Record{}, false
 	}
-	r := dns.Record{ID: strings.TrimSpace(got.ID), Name: t.name, Type: t.typ, Value: strings.TrimSpace(got.Value), TTL: t.ttl}
-	if r.Value == "" {
-		r.Value = t.value
+	if v := strings.TrimSpace(got.Value); v != "" && !sameValue(v, t.value) {
+		return dns.Record{}, false
 	}
-	return r, true
+	return dns.Record{ID: strings.TrimSpace(got.ID), Name: t.name, Type: t.typ, Value: t.value, TTL: t.ttl}, true
 }
 
 // unconfirmed records a typed warning and a warn activity for a write that
@@ -1524,6 +1684,6 @@ func (b *dnsBatch) unconfirmed(ctx context.Context, op string, t dnsTarget, r dn
 // ambiguous reports a write whose outcome is unknown and for which the
 // provider returned no usable record: nothing is recorded from it.
 func (b *dnsBatch) ambiguous(ctx context.Context, op string, t dnsTarget, value string, err error, consequence string) {
-	b.e.activity(ctx, "error", fmt.Sprintf("%s of %s %s at %s/%s: OUTCOME UNKNOWN and the provider returned no record describing it (%v); %s",
+	b.e.activity(ctx, "error", fmt.Sprintf("%s of %s %s at %s/%s: OUTCOME UNKNOWN and the provider returned no usable record describing it (none, or one naming another name, type or value) (%v); %s",
 		op, t, value, t.provider, t.zone, err, consequence))
 }

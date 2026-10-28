@@ -396,8 +396,9 @@
 //     provider already lists the desired value (our own unconfirmed update);
 //     any other out-of-band value is a Skip.
 //   - missing: DNSEnsure{Repair: true} carrying the stored row's identity
-//     (Record.ID = its provider ID, its value, Owner = its owner), emitted
-//     every cycle while it stays missing. Wanted means: the owner is a
+//     (Record.ID = its provider ID, its value, Owner = its owner), planned
+//     every cycle while it stays missing, subject to the breaker and the cap
+//     below. Wanted means: the owner is a
 //     present, cleanly Published service from an available source and the
 //     row is its per-host record in a per-host zone (a hostname winner via
 //     ensureRecord, a loser via planOrphans), or the row is the "*.zone" row
@@ -410,6 +411,27 @@
 //     zones without a listing. A scheduled wanted row is cancelled
 //     (DNSCancelRemoval runs first) and repaired in the same plan.
 //
+// Mass-repair breaker and cap, per provider/zone and cycle (planRepairs).
+// Counted are the wanted rows ELIGIBLE for repair: wanted as above, with
+// the zone listed and the owner's source available (the wildcard row counts
+// as one; orphans, protected owners and unavailable sources do not count).
+// Of them, M are wanted and N missing (a missing row a foreign record blocks
+// counts as missing; a drifted row counts as wanted, not missing). When
+// N > 3 AND 2N > M, a listing that succeeded but is (nearly) empty is far
+// more likely wrong (a wiped Pi-hole, a Route 53 zone pinned to the wrong
+// hosted zone, a misconfigured provider) than the records gone: ONE Skip
+// "most owned records missing at <provider>/<zone> (N of M); refusing mass
+// repair: check the provider and zone configuration" with
+// Action.Alert = AlertDNSMassMissing (the caller notifies an operator) is
+// emitted, and NO repair for that pair. It holds every cycle while the
+// condition holds and clears by itself: once most records are listed again
+// (restored by hand, or the configuration fixed) the remaining rows are
+// repaired as usual. Otherwise at most RepairCapPerZone (5) repairs are
+// emitted per pair, the first by (name, type, owner key); the rest follow in
+// later cycles. A wildcard zone has at most one eligible row, so its breaker
+// never trips. Not covered: a wanted row whose desired value also changed
+// takes the update path (no Repair flag), which is not counted or capped.
+//
 // The executor (DNSEnsure with Repair) does not stop at an up-to-date row:
 //  1. stale-plan check: the stored row must still exist with the action's
 //     owner, value and provider ID and no removal scheduled; otherwise
@@ -420,8 +442,12 @@
 //     of 1m << (n-1), capped at 1h. A state whose last attempt is more than
 //     2h old is ignored (a new incident starts at 1m). Without a state store
 //     the repair is refused (ErrDNSRefused): attempts are never unbounded;
-//  3. the zone is RE-LISTED (the batch cache is dropped): a failed listing
-//     counts an attempt and returns ErrListingUnavailable; our record present
+//  3. the zone is RE-LISTED once per batch and provider/zone, by the first
+//     repair of that pair (the batch cache is dropped then); later repairs
+//     of the pair use that listing, which the batch keeps current with its
+//     own creates and deletes, so N repairs cost one listing. A failed
+//     listing is cached for the batch too: it counts an attempt for every
+//     repair of the pair and returns ErrListingUnavailable; our record present
 //     (same name and type and our stored ID, or our value when the row has
 //     no ID) is a no-op that deletes the backoff state; any other record
 //     blocking the name (same type, even with an identical value, or a
@@ -430,17 +456,43 @@
 //     nothing) and the guarded create runs; the SAME row is refreshed
 //     (CreatedAt kept, new provider ID), with the usual rollback.
 //
-// Every attempt that reaches the listing counts, successful or not; only the
-// executor seeing our record present resets the state (plus the 2h
-// staleness). After a successful repair the plan no longer emits the repair,
-// so its state stays in kv until it goes stale (harmless: ignored after 2h;
-// a recurrence within 2h continues the backoff where it was).
+// Every attempt that reaches the listing counts. The state is deleted when
+// the executor sees our record present, after a CONFIRMED create (an
+// unconfirmed one keeps it, so a lagging listing stays bounded by the
+// backoff), when the row is deleted, and by a sweep at the first non-dry
+// Apply and then hourly that deletes dns/repair/ and dns/pending-update/
+// keys whose ownership row no longer exists (store.ListSettingsWithPrefix,
+// found by type assertion on the RepairStateStore). A state whose next_at
+// is more than 1h ahead (the clock went back) is clamped to now+1h and
+// persisted, so no repair is held longer than the cap. Trade-off: a record
+// that is created with confirmation and then vanishes again every cycle is
+// re-created once per cycle, without backoff (the cap and the breaker still
+// bound how many per zone).
 //
 // The unconfirmed-write contract feeds this: a create that answered
 // dns.ErrUnconfirmed with a usable record wrote its ownership row; if it
 // never landed the next listing shows the row missing and it is repaired;
 // if it landed but a lagging listing hides it, the repair's own listing (or
 // the provider's idempotent create) finds it and nothing is duplicated.
+//
+// Pending updates: an UpdateRecord answering dns.ErrUnconfirmed with a
+// usable record (same name, type and the target value or none; a record
+// with another value is ambiguous and nothing is recorded) keeps the row's
+// OLD value and takes the returned provider ID, and stores kv
+// dns/pending-update/<provider>/<zone>/<name>/<type> = {value (attempted),
+// old_id (the ID the update was sent to), new_id, at}. If the next update
+// by the row's (returned) ID answers dns.ErrNotFound, the update is retried
+// once under old_id (still ours by ID) before the guarded create, so an ID
+// the provider rotated for an update that never landed does not leave our
+// own old record refused as foreign every cycle. The key is dropped by the
+// next confirmed update or re-create of the row, by the row's deletion, by
+// the sweep, and ignored after 2h. Plan does not read it: a listed value
+// equal to the attempted value is already treated as ours when it is also
+// the current desired value (the update is repeated, idempotently); if the
+// desired value changes AGAIN before the attempted one is confirmed, the
+// listed attempted value is reported as changed out of band (the drift
+// Skip, never overwritten) until an operator resolves it. No provider in
+// this repository updates by ID and answers dns.ErrUnconfirmed today.
 //
 // # Execution
 //

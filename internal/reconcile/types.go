@@ -99,6 +99,9 @@ type Action struct {
 	// and its own listing, never writes over a record it does not own, and
 	// bounds attempts with a backoff (see doc.go).
 	Repair bool
+	// Alert, on an informational action, names a condition an operator must
+	// act on (the caller notifies): AlertDNSMassMissing. Empty otherwise.
+	Alert string
 	// Names are the certificate names for CertEnsure; Issuer its issuer key.
 	Names  []string
 	Issuer string

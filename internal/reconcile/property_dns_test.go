@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -366,8 +367,20 @@ func TestPropertyDNSRepairInvariants(t *testing.T) {
 			return false
 		}
 		ensuredSlot := map[string]int{}
+		perPair, tripped := map[string]int{}, map[string]bool{}
 		for _, a := range ofKind(acts, DNSEnsure) {
 			ensuredSlot[OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)]++
+			if a.Repair {
+				perPair[a.Provider+"/"+a.Zone]++
+			}
+		}
+		for _, a := range breakerSkips(acts) {
+			tripped[a.Provider+"/"+a.Zone] = true
+		}
+		for pk, n := range perPair {
+			if n > RepairCapPerZone || tripped[pk] {
+				fail("%d repairs at %s (breaker tripped: %v)", n, pk, tripped[pk])
+			}
 		}
 		got := map[string]int{}
 		for _, a := range acts {
@@ -427,6 +440,9 @@ func TestPropertyDNSRepairInvariants(t *testing.T) {
 				o.Value != zoneVal(o.Zone) || blocked(o) {
 				continue
 			}
+			if tripped[o.Provider+"/"+o.Zone] {
+				continue
+			}
 			completeChecked++
 			if got[k] != 1 {
 				fail("wanted missing row %s not repaired", k)
@@ -436,5 +452,100 @@ func TestPropertyDNSRepairInvariants(t *testing.T) {
 	t.Logf("repaired %d, complete-checked %d, drifted %d", repaired, completeChecked, drifted)
 	if repaired == 0 || completeChecked == 0 || drifted == 0 {
 		t.Error("a check never ran")
+	}
+}
+
+// TestPropertyDNSRepairBreaker checks the mass-repair breaker and the
+// per-zone cap against the test's own statement of them, on one per-host zone
+// with many owners: some absent (orphans), some stopped (protected), some from
+// an unavailable source, rows randomly missing, drifted or blocked by a
+// foreign CNAME.
+func TestPropertyDNSRepairBreaker(t *testing.T) {
+	var trips, capped, under int
+	for seed := int64(0); seed < 2000; seed++ {
+		r := rand.New(rand.NewSource(seed))
+		obs := Observed{Foreign: listed("example.test"), OwnedMissing: map[string]bool{}, OwnedDrifted: map[string][]dns.Record{}}
+		if r.Intn(3) == 0 {
+			obs.Unavailable = map[string]bool{"truenas": true}
+		}
+		var desired []model.Service
+		var eligibleMissing []string // names of unblocked eligible missing rows
+		wanted, miss := 0, 0
+		total, pMiss := 1+r.Intn(40), r.Float64()
+		for i := 0; i < total; i++ {
+			name := fmt.Sprintf("h%02d", i)
+			prefix := []string{"docker", "docker", "docker", "truenas"}[r.Intn(4)]
+			key := prefix + ":" + name
+			role := r.Intn(6) // 0: absent, 1: stopped, else Published
+			switch role {
+			case 0:
+			case 1:
+				desired = append(desired, svc(key, name, "example.test", model.StateStopped, "198.51.100.5", 80))
+			default:
+				desired = append(desired, pub(key, name, "example.test", 80))
+			}
+			o := owned("example.test", name+".example.test", "A", target, key)
+			obs.Owned = append(obs.Owned, o)
+			k := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+			isMissing, blocked := r.Float64() < pMiss, false
+			if isMissing {
+				obs.OwnedMissing[k] = true
+				if r.Intn(8) == 0 {
+					blocked = true
+					obs.Foreign["dnsp/example.test"] = append(obs.Foreign["dnsp/example.test"],
+						dns.Record{ID: "f" + name, Name: o.Name, Type: "CNAME", Value: "x.test"})
+				}
+			} else if r.Intn(8) == 0 { // drifted: wanted, not missing
+				obs.OwnedDrifted[k] = []dns.Record{{ID: "x", Name: o.Name, Type: "A", Value: ipFX}}
+			}
+			if role >= 2 && !obs.Unavailable[prefix] {
+				wanted++
+				if isMissing {
+					miss++
+					if !blocked {
+						eligibleMissing = append(eligibleMissing, o.Name)
+					}
+				}
+			}
+		}
+		r.Shuffle(len(desired), func(i, j int) { desired[i], desired[j] = desired[j], desired[i] })
+		r.Shuffle(len(obs.Owned), func(i, j int) { obs.Owned[i], obs.Owned[j] = obs.Owned[j], obs.Owned[i] })
+		acts := Plan(desired, obs, phCfg(), t0)
+		var got []string
+		for _, a := range acts {
+			if a.Repair {
+				got = append(got, a.Record.Name)
+			}
+		}
+		sk := breakerSkips(acts)
+		fail := func(f string, a ...any) {
+			t.Helper()
+			t.Fatalf("seed %d (wanted %d, missing %d): %s\nacts %v", seed, wanted, miss, fmt.Sprintf(f, a...), sums(acts))
+		}
+		if miss > 3 && 2*miss > wanted {
+			trips++
+			want := fmt.Sprintf("(%d of %d)", miss, wanted)
+			if len(got) != 0 || len(sk) != 1 || !strings.Contains(sk[0].Reason, want) {
+				fail("breaker: repairs %v skips %v", got, sums(sk))
+			}
+			continue
+		}
+		if len(sk) != 0 {
+			fail("breaker tripped wrongly")
+		}
+		sort.Strings(eligibleMissing)
+		if len(eligibleMissing) > RepairCapPerZone {
+			capped++
+			eligibleMissing = eligibleMissing[:RepairCapPerZone]
+		} else if len(eligibleMissing) > 0 {
+			under++
+		}
+		if !reflect.DeepEqual(got, eligibleMissing) && (len(got) != 0 || len(eligibleMissing) != 0) {
+			fail("repairs %v, want %v", got, eligibleMissing)
+		}
+	}
+	t.Logf("tripped %d, capped %d, under the cap %d", trips, capped, under)
+	if trips == 0 || capped == 0 || under == 0 {
+		t.Error("a branch never ran")
 	}
 }
