@@ -40,6 +40,29 @@ check the value the container sees:
 If it is not 0, uncomment `cap_add: [NET_BIND_SERVICE]` on the `traefik`
 service (it is the only capability to add back).
 
+## Certificates in Traefik
+
+Doorwarden writes certificates to `./certs` (its `acme.certs_dir`, mounted at
+`/data/certs`) and lists them in `doorwarden-tls.yml` with Traefik's view of
+the same directory (`traefik.cert_path_prefix`, default `/certs`, mounted
+read-only). Each issuance uses a new `certs/<id>/v<N>/` directory, so the
+dynamic file changes and Traefik reloads. Traefik picks the certificate by
+SNI; its single default certificate (clients without SNI or with an unknown
+name) is the wildcard certificate of `settings.default_zone`, or of the only
+zone; with several zones and no `default_zone` Traefik's self-signed default
+is used. Settings under `traefik:`:
+
+- `tls_min_version`: `VersionTLS12` (default) or `VersionTLS13`
+  (`tls.options.default.minVersion`).
+- `sni_strict` (default false): reject handshakes without SNI or with a name
+  no certificate matches. Leave it off unless every client sends SNI.
+- `serve_expired` (default false): keep serving an expired certificate when
+  nothing valid covers its names (clients then see an expiry error for the
+  right host instead of the default certificate).
+
+Do not define `tls.options.default` or `tls.stores.default` in another file of
+Traefik's dynamic directory: Traefik keeps only one of them.
+
 ## Deploy
 
 1. Copy `deploy/compose.truenas.yml` and `deploy/traefik/traefik.yml` onto the
