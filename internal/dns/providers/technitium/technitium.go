@@ -30,9 +30,14 @@ var staticCaps = dns.Capabilities{WildcardA: true, MultiZone: true, Update: true
 func init() {
 	dns.Register(Type, func(cfg map[string]any, sr dns.SecretResolver) (dns.Provider, error) {
 		str := func(k string) string { v, _ := cfg[k].(string); return v }
-		flag := func(k string) bool { v, _ := cfg[k].(bool); return v }
-		c := Config{URL: str("url"), Username: str("username"),
-			InsecureSkipVerify: flag("insecure_skip_verify"), AllowInsecureHTTP: flag("allow_insecure_http")}
+		c := Config{URL: str("url"), Username: str("username")}
+		var err error
+		if c.InsecureSkipVerify, err = httpx.BoolOption(cfg, "insecure_skip_verify"); err != nil {
+			return nil, fmt.Errorf("technitium: %w", err)
+		}
+		if c.AllowInsecureHTTP, err = httpx.BoolOption(cfg, "allow_insecure_http"); err != nil {
+			return nil, fmt.Errorf("technitium: %w", err)
+		}
 		if str("token") != "" {
 			tok, err := dns.ResolveField(cfg, sr, "token")
 			if err != nil {
@@ -91,7 +96,7 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("technitium: %w", err)
 	}
-	c.Secrets = []string{cfg.Token.Reveal(), cfg.Password.Reveal()}
+	c.Secrets = []secrets.Secret{cfg.Token, cfg.Password}
 	return &Provider{c: c, user: cfg.Username, password: cfg.Password, token: cfg.Token, fixed: cfg.Token != ""}, nil
 }
 
@@ -124,6 +129,8 @@ func (p *Provider) post(ctx context.Context, path string, form url.Values) (*env
 		return &env, nil
 	case "invalid-token":
 		return nil, errInvalidToken
+	case "":
+		return nil, errors.New("technitium: malformed response (no status)")
 	}
 	msg := p.c.Scrub(env.ErrorMessage)
 	if strings.Contains(strings.ToLower(msg), "no such zone") {
@@ -146,6 +153,7 @@ func (p *Provider) login(ctx context.Context) error {
 	p.mu.Lock()
 	p.token = secrets.Secret(env.Token)
 	p.mu.Unlock()
+	p.c.AddSecret(secrets.Secret(env.Token))
 	return nil
 }
 
@@ -193,6 +201,7 @@ type apiRecord struct {
 	Type     string         `json:"type"`
 	TTL      int            `json:"ttl"`
 	Disabled bool           `json:"disabled"`
+	Comments string         `json:"comments"`
 	RData    map[string]any `json:"rData"`
 }
 
@@ -213,22 +222,33 @@ func (r apiRecord) record() dns.Record {
 	return out
 }
 
-func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, error) {
+func (p *Provider) listRaw(ctx context.Context, zone string) ([]apiRecord, error) {
 	env, err := p.call(ctx, "/api/zones/records/get", url.Values{"domain": {zone}, "zone": {zone}, "listZone": {"true"}})
 	if err != nil {
 		return nil, err
 	}
 	var resp struct {
-		Records []apiRecord `json:"records"`
+		Records *[]apiRecord `json:"records"`
 	}
-	if err := json.Unmarshal(env.Response, &resp); err != nil {
-		return nil, fmt.Errorf("technitium: decode records: %w", err)
+	if len(env.Response) == 0 || json.Unmarshal(env.Response, &resp) != nil || resp.Records == nil {
+		return nil, errors.New("technitium: list records: malformed response (no records array)")
 	}
-	out := make([]dns.Record, 0, len(resp.Records))
-	for _, r := range resp.Records {
-		if r.Type == "SOA" {
-			continue
+	out := make([]apiRecord, 0, len(*resp.Records))
+	for _, r := range *resp.Records {
+		if r.Type != "SOA" {
+			out = append(out, r)
 		}
+	}
+	return out, nil
+}
+
+func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, error) {
+	raw, err := p.listRaw(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dns.Record, 0, len(raw))
+	for _, r := range raw {
 		out = append(out, r.record())
 	}
 	return out, nil
@@ -258,14 +278,14 @@ func valueParams(typ, val string, isNew bool) (url.Values, error) {
 	return v, nil
 }
 
-func (p *Provider) find(ctx context.Context, zone, name, typ string) ([]dns.Record, error) {
-	recs, err := p.ListRecords(ctx, zone)
+func (p *Provider) find(ctx context.Context, zone, name, typ string) ([]apiRecord, error) {
+	recs, err := p.listRaw(ctx, zone)
 	if err != nil {
 		return nil, err
 	}
-	var out []dns.Record
+	var out []apiRecord
 	for _, r := range recs {
-		if r.Name == name && r.Type == typ {
+		if rec := r.record(); rec.Name == name && rec.Type == typ {
 			out = append(out, r)
 		}
 	}
@@ -287,10 +307,12 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
-	if len(cur) > 0 {
-		if len(cur) == 1 && cur[0].Value == r.Value {
-			return cur[0], nil
+	for _, c := range cur {
+		if rec := c.record(); rec.Value == r.Value {
+			return rec, nil
 		}
+	}
+	if len(cur) > 0 {
 		return dns.Record{}, dns.ErrRecordExists
 	}
 	f := url.Values{"zone": {zone}, "domain": {r.Name}, "type": {r.Type}, "overwrite": {"false"}}
@@ -324,7 +346,8 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		return dns.Record{}, fmt.Errorf("technitium: %s %s has %d values; refusing ambiguous update", r.Name, r.Type, len(cur))
 	}
 	f := url.Values{"zone": {zone}, "domain": {r.Name}, "type": {r.Type}}
-	oldP, _ := valueParams(r.Type, cur[0].Value, false)
+	old := cur[0]
+	oldP, _ := valueParams(r.Type, old.record().Value, false)
 	for k, v := range oldP {
 		f[k] = v
 	}
@@ -334,10 +357,23 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if r.Type == "CNAME" { // single-valued: "cname" carries the new target
 		f.Set("cname", r.Value)
 	}
-	ttlForm(r, f)
+	// always send the ttl (the current one when unspecified) and carry over the
+	// fields doorwarden does not manage, so an update resets nothing
+	ttl := r.TTL
+	if ttl <= 0 {
+		ttl = old.TTL
+	}
+	if ttl > 0 {
+		f.Set("ttl", strconv.Itoa(ttl))
+	}
+	f.Set("disable", strconv.FormatBool(old.Disabled))
+	if old.Comments != "" {
+		f.Set("comments", old.Comments)
+	}
 	if _, err := p.call(ctx, "/api/zones/records/update", f); err != nil {
 		return dns.Record{}, err
 	}
+	r.TTL = ttl
 	return r, nil
 }
 
@@ -355,7 +391,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	match := false
 	for _, c := range cur {
-		if c.Value == r.Value {
+		if c.record().Value == r.Value {
 			match = true
 		}
 	}
@@ -369,3 +405,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	_, err = p.call(ctx, "/api/zones/records/delete", f)
 	return err
 }
+
+// String and GoString keep credentials out of any formatted output of the
+// provider (unexported struct fields are printed raw by fmt, bypassing the
+// redaction of secrets.Secret).
+func (p *Provider) String() string   { return "technitium.Provider" }
+func (p *Provider) GoString() string { return "technitium.Provider" }

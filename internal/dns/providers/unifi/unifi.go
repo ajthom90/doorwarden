@@ -93,7 +93,7 @@ type Config struct {
 // Provider implements dns.Provider.
 type Provider struct {
 	c        *httpx.Client
-	h        http.Header
+	key      secrets.Secret
 	wildcard bool
 
 	mu     sync.Mutex
@@ -112,9 +112,11 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unifi: %w", err)
 	}
-	c.Secrets = []string{cfg.APIKey.Reveal()}
-	return &Provider{c: c, h: http.Header{"X-Api-Key": {cfg.APIKey.Reveal()}}, wildcard: cfg.Wildcard, siteID: cfg.SiteID}, nil
+	c.Secrets = []secrets.Secret{cfg.APIKey}
+	return &Provider{c: c, key: cfg.APIKey, wildcard: cfg.Wildcard, siteID: cfg.SiteID}, nil
 }
+
+func (p *Provider) hdr() http.Header { return http.Header{"X-Api-Key": {p.key.Reveal()}} }
 
 func (p *Provider) Type() string { return Type }
 
@@ -137,16 +139,58 @@ func (p *Provider) wrapErr(op string, err error) error {
 	return fmt.Errorf("unifi: %s: %w", op, err)
 }
 
-type page struct {
-	Offset     int `json:"offset"`
-	Count      int `json:"count"`
-	TotalCount int `json:"totalCount"`
-}
+// maxPages bounds pagination so a server that ignores the offset cannot loop us.
+const maxPages = 1000
 
 type site struct {
 	ID                string `json:"id"`
 	InternalReference string `json:"internalReference"`
 	Name              string `json:"name"`
+}
+
+// paginate collects every item of an offset/limit paginated list. It fails
+// closed: a missing data array or totalCount, an empty page before the total
+// is reached, repeated items (a server ignoring the offset), more than maxPages
+// pages, or a final count differing from totalCount are all errors, never a
+// short list.
+func paginate[T any](ctx context.Context, p *Provider, op, path string, id func(T) string) ([]T, error) {
+	var all []T
+	seen := map[string]bool{}
+	for pages := 0; ; pages++ {
+		if pages >= maxPages {
+			return nil, fmt.Errorf("unifi: %s: more than %d pages; refusing to continue", op, maxPages)
+		}
+		var out struct {
+			TotalCount *int `json:"totalCount"`
+			Data       *[]T `json:"data"`
+		}
+		q := url.Values{"offset": {strconv.Itoa(len(all))}, "limit": {"100"}}
+		if _, err := p.c.Do(ctx, "GET", path, q, p.hdr(), nil, &out); err != nil {
+			return nil, p.wrapErr(op, err)
+		}
+		if out.Data == nil {
+			return nil, fmt.Errorf("unifi: %s: malformed response (no data array)", op)
+		}
+		if out.TotalCount == nil {
+			return nil, fmt.Errorf("unifi: %s: malformed response (no totalCount)", op)
+		}
+		for _, it := range *out.Data {
+			k := id(it)
+			if k == "" || seen[k] {
+				return nil, fmt.Errorf("unifi: %s: repeated or id-less item in page %d (server ignoring offset?)", op, pages+1)
+			}
+			seen[k] = true
+			all = append(all, it)
+		}
+		switch {
+		case len(all) > *out.TotalCount:
+			return nil, fmt.Errorf("unifi: %s: collected %d items but totalCount is %d", op, len(all), *out.TotalCount)
+		case len(all) == *out.TotalCount:
+			return all, nil
+		case len(*out.Data) == 0:
+			return nil, fmt.Errorf("unifi: %s: empty page after %d of %d items", op, len(all), *out.TotalCount)
+		}
+	}
 }
 
 func (p *Provider) site(ctx context.Context) (string, error) {
@@ -156,21 +200,9 @@ func (p *Provider) site(ctx context.Context) (string, error) {
 	if id != "" {
 		return id, nil
 	}
-	var sites []site
-	for off := 0; ; {
-		var out struct {
-			page
-			Data []site `json:"data"`
-		}
-		q := url.Values{"offset": {strconv.Itoa(off)}, "limit": {"100"}}
-		if _, err := p.c.Do(ctx, "GET", apiRoot+"/sites", q, p.h, nil, &out); err != nil {
-			return "", p.wrapErr("list sites", err)
-		}
-		sites = append(sites, out.Data...)
-		off += out.Count
-		if out.Count == 0 || off >= out.TotalCount {
-			break
-		}
+	sites, err := paginate(ctx, p, "list sites", apiRoot+"/sites", func(s site) string { return s.ID })
+	if err != nil {
+		return "", err
 	}
 	var pick *site
 	switch len(sites) {
@@ -235,22 +267,7 @@ func (po policy) record() dns.Record {
 }
 
 func (p *Provider) policies(ctx context.Context, sid string) ([]policy, error) {
-	var all []policy
-	for off := 0; ; {
-		var out struct {
-			page
-			Data []policy `json:"data"`
-		}
-		q := url.Values{"offset": {strconv.Itoa(off)}, "limit": {"100"}}
-		if _, err := p.c.Do(ctx, "GET", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies", q, p.h, nil, &out); err != nil {
-			return nil, p.wrapErr("list DNS policies", err)
-		}
-		all = append(all, out.Data...)
-		off += out.Count
-		if out.Count == 0 || off >= out.TotalCount {
-			return all, nil
-		}
-	}
+	return paginate(ctx, p, "list DNS policies", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies", func(po policy) string { return po.ID })
 }
 
 func inZone(name, zone string) bool { return name == zone || strings.HasSuffix(name, "."+zone) }
@@ -303,18 +320,38 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 		return dns.Record{}, err
 	}
 	for _, po := range pols {
-		if e := po.record(); e.Name == r.Name && e.Type == r.Type {
-			if e.Value == r.Value {
-				return e, nil
-			}
-			return dns.Record{}, dns.ErrRecordExists
+		e := po.record()
+		if e.Name != r.Name || e.Type != r.Type {
+			continue
 		}
+		if e.Value == r.Value && po.Enabled {
+			return e, nil
+		}
+		state := ""
+		if !po.Enabled {
+			state = " (the existing policy is disabled and does not resolve)"
+		}
+		return dns.Record{}, fmt.Errorf("unifi: a DNS policy for %s %s already exists%s: %w", r.Name, r.Type, state, dns.ErrRecordExists)
 	}
 	var out policy
-	if _, err := p.c.Do(ctx, "POST", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies", nil, p.h, body(r), &out); err != nil {
+	path := apiRoot + "/sites/" + url.PathEscape(sid) + "/dns/policies"
+	if _, err := p.c.Do(ctx, "POST", path, nil, p.hdr(), body(r), &out); err != nil {
 		return dns.Record{}, p.wrapErr("create DNS policy "+r.Name, err)
 	}
-	return out.record(), nil
+	if got := out.record(); out.ID != "" && got.Name == r.Name && got.Type == r.Type {
+		return got, nil
+	}
+	// the response did not echo the policy: find it again to learn its ID
+	pols, err = p.policies(ctx, sid)
+	if err != nil {
+		return dns.Record{}, fmt.Errorf("unifi: create DNS policy %s: created but could not confirm: %w", r.Name, err)
+	}
+	for _, po := range pols {
+		if e := po.record(); e.Name == r.Name && e.Type == r.Type && e.Value == r.Value {
+			return e, nil
+		}
+	}
+	return dns.Record{}, fmt.Errorf("unifi: create DNS policy %s: the gateway accepted the request but the policy ID could not be determined", r.Name)
 }
 
 func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) (dns.Record, error) {
@@ -329,24 +366,27 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
-	var cur *policy
+	var matches []*policy
 	for i := range pols {
 		e := pols[i].record()
 		if (r.ID != "" && e.ID == r.ID) || (r.ID == "" && e.Name == r.Name && e.Type == r.Type) {
-			cur = &pols[i]
-			break
+			matches = append(matches, &pols[i])
 		}
 	}
-	if cur == nil {
+	if len(matches) == 0 {
 		return dns.Record{}, dns.ErrNotFound
 	}
+	if len(matches) != 1 {
+		return dns.Record{}, fmt.Errorf("unifi: %s %s has %d DNS policies; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(matches), dns.ErrRecordExists)
+	}
+	cur := matches[0]
 	if e := cur.record(); e.Name != r.Name || e.Type != r.Type {
 		return dns.Record{}, fmt.Errorf("unifi: update of policy %s: name/type mismatch with stored record: %w", cur.ID, dns.ErrNotFound)
 	}
 	b := body(r)
 	b.Enabled = cur.Enabled
 	var out policy
-	if _, err := p.c.Do(ctx, "PUT", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies/"+url.PathEscape(cur.ID), nil, p.h, b, &out); err != nil {
+	if _, err := p.c.Do(ctx, "PUT", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies/"+url.PathEscape(cur.ID), nil, p.hdr(), b, &out); err != nil {
 		return dns.Record{}, p.wrapErr("update DNS policy "+r.Name, err)
 	}
 	if out.ID == "" {
@@ -377,7 +417,7 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 			return nil
 		}
 	}
-	_, err = p.c.Do(ctx, "DELETE", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies/"+url.PathEscape(id), nil, p.h, nil, nil)
+	_, err = p.c.Do(ctx, "DELETE", apiRoot+"/sites/"+url.PathEscape(sid)+"/dns/policies/"+url.PathEscape(id), nil, p.hdr(), nil, nil)
 	var se *httpx.StatusError
 	if errors.As(err, &se) && se.Status == 404 {
 		return nil
@@ -387,3 +427,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	return nil
 }
+
+// String and GoString keep credentials out of any formatted output of the
+// provider (unexported struct fields are printed raw by fmt, bypassing the
+// redaction of secrets.Secret).
+func (p *Provider) String() string   { return "unifi.Provider" }
+func (p *Provider) GoString() string { return "unifi.Provider" }

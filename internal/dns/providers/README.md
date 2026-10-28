@@ -57,14 +57,46 @@ itself from `init()`.
   credential headers are never forwarded), and scrubs configured secrets from
   error text.
 
+## Config keys
+
+`dns.New` rejects config keys that are not declared in the provider's schema
+(the error names the key and lists the valid ones), so a typo such as
+`wildcrd: true` can never silently change behaviour. Declare every key your
+factory reads in `ConfigSchema`; boolean options must be real bools
+(`httpx.BoolOption` returns an error otherwise).
+
+## Network behaviour
+
+- Hand-written HTTP providers (cloudflare, unifi, technitium, pihole, adguard)
+  use `httpx`, which ignores `HTTP(S)_PROXY`/`NO_PROXY`.
+- **route53 uses the AWS SDK's default HTTP client and configuration chain**, so
+  it *does* honour `HTTPS_PROXY` and the `AWS_ENDPOINT_URL` /
+  `AWS_ENDPOINT_URL_ROUTE_53` environment overrides (and the shared AWS config
+  file). These are controlled by whoever runs the process, not by dns config,
+  and are deliberate: it is how corporate proxies and VPC endpoints work for
+  AWS. The config schema still has no endpoint key.
+- rfc2136 speaks DNS over TCP directly to `server`.
+
 ## Provider notes
 
-| type | records | wildcard A | TTL | IDs | notes |
+Writable types are the ones Create/Update/Delete accept; every provider lists
+foreign records of other types read-only where its API exposes them.
+
+| type | writable types | wildcard A | TTL | IDs | notes |
 |---|---|---|---|---|---|
-| cloudflare | all via API | yes | yes | yes | token needs Zone:Read + DNS:Edit; records never proxied |
-| route53 | A/AAAA/CNAME/TXT sets | yes | yes | no | zone auto-discovery by longest suffix; public preferred; private zone only with `hosted_zone_id`; empty keys use the default AWS credential chain |
-| rfc2136 | A/AAAA/CNAME/TXT | yes | yes | no | TSIG mandatory; listing is AXFR, so the server needs `allow-transfer` for the key |
-| unifi | A writes; any type listed | only with `wildcard: true` | yes | yes | Integration API DNS policies; set `wildcard: true` only after confirming your controller accepts `*.zone` policies; site auto-discovery (`default` or the only site) |
-| technitium | A/AAAA/CNAME/TXT | yes | yes | no | token or username+password |
-| pihole | A/AAAA | no (dnsmasq `address=/.zone/ip` is not manageable through the API) | no | no | v6 API; session re-auth; call `Close()` to end the session |
-| adguard | A/AAAA/CNAME rewrites | yes | no | no | basic auth; update falls back to add+delete on old servers |
+| cloudflare | all via API | yes | yes | yes | token needs Zone:Read + DNS:Edit; records never proxied; Update refuses when several records match (name, type) |
+| route53 | A, AAAA, CNAME | yes | yes | no | zone auto-discovery by longest suffix; public preferred; a private zone only with `hosted_zone_id`; empty keys use the default AWS credential chain; TXT is not writable (quoting not implemented); Update refuses multi-value and alias sets |
+| rfc2136 | A, AAAA, CNAME, TXT | yes | yes | no | TSIG mandatory and every response must be signed; listing is AXFR, so the server needs `allow-transfer` for the key; Update refuses multi-value sets; A is refused where a CNAME exists |
+| unifi | A | only with `wildcard: true` | yes | yes | Integration API DNS policies; other policy types are listed read-only (CNAME, AAAA, FORWARD_DOMAIN...); set `wildcard: true` only after confirming your controller accepts `*.zone` policies; a disabled policy at the same name blocks Create; list pagination fails closed |
+| technitium | A, AAAA, CNAME, TXT | yes | yes | no | token or username+password; Update preserves ttl, disabled flag and comments |
+| pihole | A, AAAA | no (dnsmasq `address=/.zone/ip` is not manageable through the API) | no | no | v6 API; user CNAMEs (`dns.cnameRecords`) are listed read-only and block an A at the same name; session re-auth; the provider implements `io.Closer` (ends the session), and since the registry has no lifecycle hook the owner of the Provider should close it |
+| adguard | A, AAAA, CNAME | yes | no | no | basic auth; raw rewrite strings are sent back on delete/update; answers `A`/`AAAA` are listed as type `KEEP` and are not writable; update falls back to add+delete on old servers |
+
+## Multi-value record sets
+
+doorwarden manages one value per (name, type). When a provider can hold several
+values at the same name (route53, rfc2136, cloudflare, technitium, pihole,
+adguard, unifi), Update without an ID **refuses** (wrapping
+`dns.ErrRecordExists`) unless exactly one value exists, and Delete removes only
+the exact value. The optional conformance case `Options.SeedMultiValue` checks
+this against a fake backend.

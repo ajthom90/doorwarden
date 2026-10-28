@@ -57,8 +57,8 @@ type Config struct {
 
 // Provider implements dns.Provider.
 type Provider struct {
-	c *httpx.Client
-	h http.Header
+	c   *httpx.Client
+	tok secrets.Secret
 
 	mu    sync.Mutex
 	zones map[string]string // zone name -> id
@@ -74,24 +74,41 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cloudflare: %w", err)
 	}
-	tok := cfg.APIToken.Reveal()
-	if tok == "" {
+	if cfg.APIToken == "" {
 		return nil, errors.New("cloudflare: config field \"api_token\" is required")
 	}
-	c.Secrets = []string{tok}
-	return &Provider{c: c, h: http.Header{"Authorization": {"Bearer " + tok}}, zones: map[string]string{}}, nil
+	c.Secrets = []secrets.Secret{cfg.APIToken}
+	return &Provider{c: c, tok: cfg.APIToken, zones: map[string]string{}}, nil
+}
+
+func (p *Provider) hdr() http.Header {
+	return http.Header{"Authorization": {"Bearer " + p.tok.Reveal()}}
 }
 
 func (p *Provider) Type() string                   { return Type }
 func (p *Provider) Capabilities() dns.Capabilities { return staticCaps }
 
 type apiResult struct {
-	Success    bool                       `json:"success"`
+	Success    *bool                      `json:"success"`
 	Errors     []struct{ Message string } `json:"errors"`
-	ResultInfo struct {
-		Page       int `json:"page"`
-		TotalPages int `json:"total_pages"`
+	ResultInfo *struct {
+		TotalPages *int `json:"total_pages"`
 	} `json:"result_info"`
+}
+
+// ok rejects a 200 that is not an explicit API success.
+func (r apiResult) ok() error {
+	if r.Success == nil {
+		return errors.New("malformed response (no success flag)")
+	}
+	if !*r.Success {
+		msg := "request failed"
+		if len(r.Errors) > 0 && r.Errors[0].Message != "" {
+			msg = r.Errors[0].Message
+		}
+		return errors.New(msg)
+	}
+	return nil
 }
 
 type apiRecord struct {
@@ -126,13 +143,16 @@ func (p *Provider) zoneID(ctx context.Context, zone string) (string, error) {
 	}
 	var out struct {
 		apiResult
-		Result []struct{ ID, Name string } `json:"result"`
+		Result *[]struct{ ID, Name string } `json:"result"`
 	}
 	q := url.Values{"name": {zone}}
-	if _, err := p.c.Do(ctx, "GET", "/zones", q, p.h, nil, &out); err != nil {
+	if _, err := p.c.Do(ctx, "GET", "/zones", q, p.hdr(), nil, &out); err != nil {
 		return "", p.wrapErr("look up zone "+zone, err)
 	}
-	for _, z := range out.Result {
+	if err := out.ok(); err != nil || out.Result == nil {
+		return "", fmt.Errorf("cloudflare: look up zone %s: %s", zone, p.c.Scrub(errText(err, out.Result == nil)))
+	}
+	for _, z := range *out.Result {
 		if strings.EqualFold(z.Name, zone) {
 			p.mu.Lock()
 			p.zones[zone] = z.ID
@@ -146,8 +166,11 @@ func (p *Provider) zoneID(ctx context.Context, zone string) (string, error) {
 // Test verifies the token can read zones.
 func (p *Provider) Test(ctx context.Context) error {
 	var out apiResult
-	if _, err := p.c.Do(ctx, "GET", "/zones", url.Values{"per_page": {"1"}}, p.h, nil, &out); err != nil {
+	if _, err := p.c.Do(ctx, "GET", "/zones", url.Values{"per_page": {"1"}}, p.hdr(), nil, &out); err != nil {
 		return p.wrapErr("verify credentials", err)
+	}
+	if err := out.ok(); err != nil {
+		return fmt.Errorf("cloudflare: verify credentials: %s", p.c.Scrub(err.Error()))
 	}
 	return nil
 }
@@ -167,23 +190,51 @@ func apiTTL(ttl int) int {
 	return ttl
 }
 
+const perPage = 100
+
+func errText(err error, missing bool) string {
+	if err != nil {
+		return err.Error()
+	}
+	if missing {
+		return "malformed response (no result)"
+	}
+	return ""
+}
+
 func (p *Provider) list(ctx context.Context, zid string, q url.Values) ([]apiRecord, error) {
 	var all []apiRecord
 	for page := 1; ; page++ {
-		qq := url.Values{"per_page": {"100"}, "page": {strconv.Itoa(page)}}
+		if page > 1000 {
+			return nil, errors.New("cloudflare: list records: more than 1000 pages; refusing to continue")
+		}
+		qq := url.Values{"per_page": {strconv.Itoa(perPage)}, "page": {strconv.Itoa(page)}}
 		for k, v := range q {
 			qq[k] = v
 		}
 		var out struct {
 			apiResult
-			Result []apiRecord `json:"result"`
+			Result *[]apiRecord `json:"result"`
 		}
-		if _, err := p.c.Do(ctx, "GET", "/zones/"+zid+"/dns_records", qq, p.h, nil, &out); err != nil {
+		if _, err := p.c.Do(ctx, "GET", "/zones/"+zid+"/dns_records", qq, p.hdr(), nil, &out); err != nil {
 			return nil, p.wrapErr("list records", err)
 		}
-		all = append(all, out.Result...)
-		if page >= out.ResultInfo.TotalPages || len(out.Result) == 0 {
-			return all, nil
+		if err := out.ok(); err != nil || out.Result == nil {
+			return nil, fmt.Errorf("cloudflare: list records: %s", p.c.Scrub(errText(err, out.Result == nil)))
+		}
+		all = append(all, *out.Result...)
+		switch {
+		case out.ResultInfo != nil && out.ResultInfo.TotalPages != nil:
+			if page >= *out.ResultInfo.TotalPages {
+				return all, nil
+			}
+		case len(*out.Result) < perPage:
+			return all, nil // no paging info, and a short page: the only page
+		default:
+			return nil, errors.New("cloudflare: list records: full page without result_info.total_pages; cannot tell whether the list is complete")
+		}
+		if len(*out.Result) == 0 {
+			return nil, errors.New("cloudflare: list records: empty page before the reported last page")
 		}
 	}
 }
@@ -213,52 +264,64 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
+	found := false
 	for _, e := range existing {
 		if strings.EqualFold(e.Name, r.Name) && e.Type == r.Type {
 			if e.Content == r.Value {
 				return fromAPI(e), nil
 			}
-			return dns.Record{}, dns.ErrRecordExists
+			found = true
 		}
+	}
+	if found {
+		return dns.Record{}, dns.ErrRecordExists
 	}
 	body := map[string]any{"type": r.Type, "name": r.Name, "content": r.Value, "ttl": apiTTL(r.TTL), "proxied": false}
 	var out struct {
 		apiResult
 		Result apiRecord `json:"result"`
 	}
-	if _, err := p.c.Do(ctx, "POST", "/zones/"+zid+"/dns_records", nil, p.h, body, &out); err != nil {
+	if _, err := p.c.Do(ctx, "POST", "/zones/"+zid+"/dns_records", nil, p.hdr(), body, &out); err != nil {
 		return dns.Record{}, p.wrapErr("create record "+r.Name, err)
+	}
+	if err := out.ok(); err != nil || out.Result.ID == "" {
+		return dns.Record{}, fmt.Errorf("cloudflare: create record %s: %s", r.Name, p.c.Scrub(errText(err, out.Result.ID == "")))
 	}
 	return fromAPI(out.Result), nil
 }
 
-// target finds the stored record an Update/Delete addresses.
-func (p *Provider) target(ctx context.Context, zid string, r dns.Record) (apiRecord, bool, error) {
+// targets finds the stored records an Update/Delete addresses: the one with the
+// given ID, or every record matching (name, type).
+func (p *Provider) targets(ctx context.Context, zid string, r dns.Record) ([]apiRecord, error) {
 	if r.ID != "" {
 		var out struct {
 			apiResult
-			Result apiRecord `json:"result"`
+			Result *apiRecord `json:"result"`
 		}
-		_, err := p.c.Do(ctx, "GET", "/zones/"+zid+"/dns_records/"+url.PathEscape(r.ID), nil, p.h, nil, &out)
+		_, err := p.c.Do(ctx, "GET", "/zones/"+zid+"/dns_records/"+url.PathEscape(r.ID), nil, p.hdr(), nil, &out)
 		var se *httpx.StatusError
 		if errors.As(err, &se) && (se.Status == 404 || se.Status == 400) {
-			return apiRecord{}, false, nil
+			return nil, nil
 		}
 		if err != nil {
-			return apiRecord{}, false, p.wrapErr("get record", err)
+			return nil, p.wrapErr("get record", err)
 		}
-		return out.Result, true, nil
+		if err := out.ok(); err != nil || out.Result == nil {
+			return nil, fmt.Errorf("cloudflare: get record: %s", p.c.Scrub(errText(err, out.Result == nil)))
+		}
+		return []apiRecord{*out.Result}, nil
 	}
 	recs, err := p.list(ctx, zid, url.Values{"name.exact": {r.Name}, "type": {r.Type}})
 	if err != nil {
-		return apiRecord{}, false, err
+		return nil, err
 	}
+	var out []apiRecord
 	for _, e := range recs {
 		if strings.EqualFold(e.Name, r.Name) && e.Type == r.Type {
-			return e, true, nil
+			out = append(out, e)
 		}
 	}
-	return apiRecord{}, false, nil
+	return out, nil
 }
 
 func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) (dns.Record, error) {
@@ -266,13 +329,17 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
-	cur, ok, err := p.target(ctx, zid, r)
+	curs, err := p.targets(ctx, zid, r)
 	if err != nil {
 		return dns.Record{}, err
 	}
-	if !ok {
+	if len(curs) == 0 {
 		return dns.Record{}, dns.ErrNotFound
 	}
+	if len(curs) != 1 {
+		return dns.Record{}, fmt.Errorf("cloudflare: %s %s has %d records; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(curs), dns.ErrRecordExists)
+	}
+	cur := curs[0]
 	if !strings.EqualFold(cur.Name, r.Name) || cur.Type != r.Type {
 		return dns.Record{}, fmt.Errorf("cloudflare: update of record %s: name/type mismatch with stored record: %w", cur.ID, dns.ErrNotFound)
 	}
@@ -281,8 +348,11 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 		apiResult
 		Result apiRecord `json:"result"`
 	}
-	if _, err := p.c.Do(ctx, "PATCH", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.h, body, &out); err != nil {
+	if _, err := p.c.Do(ctx, "PATCH", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.hdr(), body, &out); err != nil {
 		return dns.Record{}, p.wrapErr("update record "+r.Name, err)
+	}
+	if err := out.ok(); err != nil || out.Result.ID == "" {
+		return dns.Record{}, fmt.Errorf("cloudflare: update record %s: %s", r.Name, p.c.Scrub(errText(err, out.Result.ID == "")))
 	}
 	return fromAPI(out.Result), nil
 }
@@ -292,23 +362,28 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return err
 	}
-	cur, ok, err := p.target(ctx, zid, r)
+	curs, err := p.targets(ctx, zid, r)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return nil
-	}
-	if r.ID == "" && cur.Content != r.Value {
-		return nil // never delete a record with a different value
-	}
-	_, err = p.c.Do(ctx, "DELETE", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.h, nil, nil)
-	var se *httpx.StatusError
-	if errors.As(err, &se) && se.Status == 404 {
-		return nil
-	}
-	if err != nil {
-		return p.wrapErr("delete record "+cur.Name, err)
+	for _, cur := range curs {
+		if r.ID == "" && cur.Content != r.Value {
+			continue // never delete a record with a different value
+		}
+		_, err := p.c.Do(ctx, "DELETE", "/zones/"+zid+"/dns_records/"+url.PathEscape(cur.ID), nil, p.hdr(), nil, nil)
+		var se *httpx.StatusError
+		if errors.As(err, &se) && se.Status == 404 {
+			continue
+		}
+		if err != nil {
+			return p.wrapErr("delete record "+cur.Name, err)
+		}
 	}
 	return nil
 }
+
+// String and GoString keep credentials out of any formatted output of the
+// provider (unexported struct fields are printed raw by fmt, bypassing the
+// redaction of secrets.Secret).
+func (p *Provider) String() string   { return "cloudflare.Provider" }
+func (p *Provider) GoString() string { return "cloudflare.Provider" }

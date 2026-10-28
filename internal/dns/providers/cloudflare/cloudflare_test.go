@@ -27,12 +27,15 @@ type rec struct {
 }
 
 type backend struct {
-	mu     sync.Mutex
-	n      int
-	recs   []rec
-	zones  map[string]string
-	status int // when non-zero, every request fails with it
-	slow   time.Duration
+	raw     string // when set, replaces the dns_records list response body (HTTP 200)
+	noInfo  bool   // omit result_info from list responses
+	perPage int    // page size (default 3)
+	mu      sync.Mutex
+	n       int
+	recs    []rec
+	zones   map[string]string
+	status  int // when non-zero, every request fails with it
+	slow    time.Duration
 }
 
 func newBackend() *backend {
@@ -65,7 +68,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	p := strings.TrimPrefix(r.URL.Path, "/client/v4")
 	if p == "/zones" {
-		var res []map[string]string
+		res := []map[string]string{}
 		for n, id := range b.zones {
 			if q := r.URL.Query().Get("name"); q == "" || q == n {
 				res = append(res, map[string]string{"id": id, "name": n})
@@ -108,7 +111,15 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				match = append(match, x)
 			}
 			page, _ := strconv.Atoi(q.Get("page"))
-			const per = 3 // force pagination regardless of per_page
+			per := 3 // force pagination regardless of per_page
+			if b.perPage > 0 {
+				per = b.perPage
+			}
+			if b.raw != "" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(b.raw))
+				return
+			}
 			total := (len(match) + per - 1) / per
 			lo, hi := (page-1)*per, page*per
 			if lo > len(match) {
@@ -121,7 +132,11 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			for _, x := range match[lo:hi] {
 				res = append(res, toJSON(x))
 			}
-			reply(200, map[string]any{"success": true, "result": res, "result_info": map[string]int{"page": page, "total_pages": total}})
+			resp := map[string]any{"success": true, "result": res}
+			if !b.noInfo {
+				resp["result_info"] = map[string]int{"page": page, "total_pages": total}
+			}
+			reply(200, resp)
 		case "POST":
 			var in struct {
 				Type, Name, Content string
@@ -176,7 +191,16 @@ func newProvider(t *testing.T, b *backend, token string) *cloudflare.Provider {
 func TestConformance(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, fakeToken)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, v := range values {
+				b.n++
+				b.recs = append(b.recs, rec{ID: fmt.Sprintf("s%d", b.n), Name: name, Type: "A", Content: v, TTL: 1, zone: "example.test"})
+			}
+			return nil
+		}})
 }
 
 func TestRegisteredAndSecretResolution(t *testing.T) {
@@ -261,5 +285,63 @@ func TestAPIURLRejectedFromConfig(t *testing.T) {
 		if f.Name == "api_url" {
 			t.Fatal("api_url in schema")
 		}
+	}
+}
+
+func seedMulti(b *backend) {
+	for i, v := range []string{"192.0.2.1", "192.0.2.2"} {
+		b.recs = append(b.recs, rec{ID: fmt.Sprint("m", i), Name: "m.example.test", Type: "A", Content: v, TTL: 1, zone: "example.test"})
+	}
+}
+
+func TestMultiRecordUpdateRefusedDeleteFindsExactValue(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	seedMulti(b)
+	p := newProvider(t, b, fakeToken)
+	_, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.99"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "2 records") {
+		t.Fatalf("err = %v", err)
+	}
+	// the exact value is the SECOND match; it must still be found and removed
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.2"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.recs) != 1 || b.recs[0].Content != "192.0.2.1" {
+		t.Fatalf("recs = %+v", b.recs)
+	}
+}
+
+func TestListingHardening(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		mod  func(*backend)
+		want string
+	}{
+		"empty object":  {func(b *backend) { b.raw = `{}` }, "malformed"},
+		"success false": {func(b *backend) { b.raw = `{"success":false,"errors":[{"message":"bad things"}],"result":[]}` }, "bad things"},
+		"no result":     {func(b *backend) { b.raw = `{"success":true}` }, "no result"},
+		"full page no info": {func(b *backend) {
+			b.noInfo, b.perPage = true, 100
+			for i := 0; i < 100; i++ {
+				b.recs = append(b.recs, rec{ID: fmt.Sprint("r", i), Name: fmt.Sprintf("h%d.example.test", i), Type: "A", Content: "192.0.2.1", zone: "example.test"})
+			}
+		}, "total_pages"},
+	} {
+		b := newBackend()
+		tc.mod(b)
+		p := newProvider(t, b, fakeToken)
+		_, err := p.ListRecords(ctx, "example.test")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	// a short single page without result_info is fine
+	b := newBackend()
+	b.noInfo = true
+	b.recs = append(b.recs, rec{ID: "x", Name: "a.example.test", Type: "A", Content: "192.0.2.1", zone: "example.test"})
+	p := newProvider(t, b, fakeToken)
+	if recs, err := p.ListRecords(ctx, "example.test"); err != nil || len(recs) != 1 {
+		t.Fatalf("recs=%v err=%v", recs, err)
 	}
 }

@@ -27,6 +27,7 @@ type fakeServer struct {
 	mu       sync.Mutex
 	zones    map[string][]mdns.RR // zone fqdn -> records (without SOA)
 	noAXFR   bool
+	noSign   bool // reply without TSIG even to signed requests
 	delay    time.Duration
 	unsigned int // requests received without TSIG
 	srv      *mdns.Server
@@ -76,7 +77,7 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 			if m == nil { // AXFR wrote its own replies
 				return
 			}
-			if w.TsigStatus() == nil {
+			if w.TsigStatus() == nil && !f.noSign {
 				m.SetTsig(t.Hdr.Name, t.Algorithm, 300, time.Now().Unix())
 			}
 			_ = w.WriteMsg(m)
@@ -140,6 +141,12 @@ func (f *fakeServer) ServeDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 				m.Rcode = mdns.RcodeRefused
 				return
 			}
+			if f.noSign {
+				m.Answer = append(append([]mdns.RR{f.soa(z)}, f.zones[z]...), f.soa(z))
+				_ = w.WriteMsg(m)
+				m = nil
+				return
+			}
 			ch := make(chan *mdns.Envelope, 1)
 			all := append([]mdns.RR{f.soa(z)}, f.zones[z]...)
 			all = append(all, f.soa(z))
@@ -185,7 +192,16 @@ func newProvider(t *testing.T, f *fakeServer, mod func(*rfc2136.Config)) *rfc213
 func TestConformance(t *testing.T) {
 	f := startServer(t)
 	p := newProvider(t, f, nil)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for _, v := range values {
+				rr, _ := mdns.NewRR(mdns.Fqdn(name) + " 60 IN A " + v)
+				f.zones["example.test."] = append(f.zones["example.test."], rr)
+			}
+			return nil
+		}})
 	if f.unsigned != 0 {
 		t.Fatalf("%d unsigned requests were sent", f.unsigned)
 	}
@@ -260,5 +276,64 @@ func TestUnsupportedType(t *testing.T) {
 	p := newProvider(t, f, nil)
 	if _, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: "a.example.test", Type: "MX", Value: "x"}); err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUpdateRefusesMultiValue(t *testing.T) {
+	f := startServer(t)
+	for _, v := range []string{"192.0.2.1", "192.0.2.2"} {
+		rr, _ := mdns.NewRR("m.example.test. 60 IN A " + v)
+		f.zones["example.test."] = append(f.zones["example.test."], rr)
+	}
+	p := newProvider(t, f, nil)
+	_, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.99"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "2 values") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f.zones["example.test."]) != 2 {
+		t.Fatal("set was modified")
+	}
+}
+
+func TestCreateARefusedWhereCNAMEExists(t *testing.T) {
+	f := startServer(t)
+	rr, _ := mdns.NewRR("c.example.test. 60 IN CNAME target.example.test.")
+	f.zones["example.test."] = append(f.zones["example.test."], rr)
+	p := newProvider(t, f, nil)
+	_, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: "c.example.test", Type: "A", Value: "192.0.2.1"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "CNAME") {
+		t.Fatalf("err = %v", err)
+	}
+	// the reverse: CNAME where an A exists
+	rr, _ = mdns.NewRR("a.example.test. 60 IN A 192.0.2.5")
+	f.zones["example.test."] = append(f.zones["example.test."], rr)
+	if _, err := p.CreateRecord(context.Background(), "example.test", dns.Record{Name: "a.example.test", Type: "CNAME", Value: "x.example.test"}); !errors.Is(err, dns.ErrRecordExists) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUnsignedResponsesRejected(t *testing.T) {
+	f := startServer(t)
+	f.noSign = true
+	p := newProvider(t, f, nil)
+	ctx := context.Background()
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}); err == nil || !strings.Contains(err.Error(), "TSIG") {
+		t.Fatalf("unsigned UPDATE/query response accepted: %v", err)
+	}
+	if _, err := p.ListRecords(ctx, "example.test"); err == nil {
+		t.Fatal("unsigned AXFR accepted")
+	}
+}
+
+func TestAXFRHonoursContext(t *testing.T) {
+	f := startServer(t)
+	f.delay = 2 * time.Second
+	p := newProvider(t, f, func(c *rfc2136.Config) { c.Timeout = 10 * time.Second })
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := p.ListRecords(ctx, "example.test")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("err = %v after %v", err, time.Since(start))
 	}
 }

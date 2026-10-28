@@ -21,9 +21,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -40,13 +42,18 @@ var staticCaps = dns.Capabilities{WildcardA: false, MultiZone: true, Update: tru
 func init() {
 	dns.Register(Type, func(cfg map[string]any, sr dns.SecretResolver) (dns.Provider, error) {
 		str := func(k string) string { v, _ := cfg[k].(string); return v }
-		flag := func(k string) bool { v, _ := cfg[k].(bool); return v }
 		pw, err := dns.ResolveField(cfg, sr, "password")
 		if err != nil {
 			return nil, fmt.Errorf("pihole: %w", err)
 		}
-		return New(Config{URL: str("url"), Password: pw,
-			InsecureSkipVerify: flag("insecure_skip_verify"), AllowInsecureHTTP: flag("allow_insecure_http")})
+		c := Config{URL: str("url"), Password: pw}
+		if c.InsecureSkipVerify, err = httpx.BoolOption(cfg, "insecure_skip_verify"); err != nil {
+			return nil, fmt.Errorf("pihole: %w", err)
+		}
+		if c.AllowInsecureHTTP, err = httpx.BoolOption(cfg, "allow_insecure_http"); err != nil {
+			return nil, fmt.Errorf("pihole: %w", err)
+		}
+		return New(c)
 	}, dns.ConfigSchema{Fields: []dns.Field{
 		{Name: "url", Required: true, Help: "Pi-hole base URL, e.g. http://pihole.lan"},
 		{Name: "password", Secret: true, Required: true, Help: "web interface or application password"},
@@ -69,7 +76,7 @@ type Provider struct {
 	password secrets.Secret
 
 	mu  sync.Mutex
-	sid string
+	sid secrets.Secret
 }
 
 // New validates cfg and builds a provider.
@@ -84,7 +91,7 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pihole: %w", err)
 	}
-	c.Secrets = []string{cfg.Password.Reveal()}
+	c.Secrets = []secrets.Secret{cfg.Password}
 	return &Provider{c: c, password: cfg.Password}, nil
 }
 
@@ -119,8 +126,9 @@ func (p *Provider) login(ctx context.Context) error {
 		return errors.New("pihole: login failed: password rejected or two-factor authentication is enabled (use an application password)")
 	}
 	p.mu.Lock()
-	p.sid = out.Session.SID
+	p.sid = secrets.Secret(out.Session.SID)
 	p.mu.Unlock()
+	p.c.AddSecret(secrets.Secret(out.Session.SID))
 	return nil
 }
 
@@ -138,7 +146,7 @@ func (p *Provider) do(ctx context.Context, op, method, path string, body, out an
 			sid = p.sid
 			p.mu.Unlock()
 		}
-		_, err := p.c.Do(ctx, method, path, nil, http.Header{"X-Ftl-Sid": {sid}}, body, out)
+		_, err := p.c.Do(ctx, method, path, nil, http.Header{"X-Ftl-Sid": {sid.Reveal()}}, body, out)
 		var se *httpx.StatusError
 		if errors.As(err, &se) && se.Status == 401 && attempt == 0 {
 			p.mu.Lock()
@@ -159,7 +167,11 @@ func (p *Provider) Test(ctx context.Context) error {
 	return err
 }
 
-// Close ends the Pi-hole session, if any.
+var _ io.Closer = (*Provider)(nil)
+
+// Close ends the Pi-hole session, if any. The dns registry has no lifecycle
+// hook, so whoever owns the Provider should call it when it implements
+// io.Closer (Pi-hole limits concurrent sessions).
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	sid := p.sid
@@ -168,7 +180,7 @@ func (p *Provider) Close() error {
 	if sid == "" {
 		return nil
 	}
-	_, err := p.c.Do(context.Background(), "DELETE", "/api/auth", nil, http.Header{"X-Ftl-Sid": {sid}}, nil, nil)
+	_, err := p.c.Do(context.Background(), "DELETE", "/api/auth", nil, http.Header{"X-Ftl-Sid": {sid.Reveal()}}, nil, nil)
 	p.c.Close()
 	if err != nil {
 		return p.mapErr("logout", err)
@@ -178,17 +190,20 @@ func (p *Provider) Close() error {
 
 func (p *Provider) hosts(ctx context.Context) ([]dns.Record, error) {
 	var out struct {
-		Config struct {
-			DNS struct {
-				Hosts []string `json:"hosts"`
+		Config *struct {
+			DNS *struct {
+				Hosts *[]string `json:"hosts"`
 			} `json:"dns"`
 		} `json:"config"`
 	}
 	if err := p.do(ctx, "list hosts", "GET", "/api/config/dns/hosts", nil, &out); err != nil {
 		return nil, err
 	}
+	if out.Config == nil || out.Config.DNS == nil || out.Config.DNS.Hosts == nil {
+		return nil, errors.New("pihole: list hosts: malformed response (no config.dns.hosts)")
+	}
 	var recs []dns.Record
-	for _, e := range out.Config.DNS.Hosts {
+	for _, e := range *out.Config.DNS.Hosts {
 		f := strings.Fields(e)
 		if len(f) < 2 {
 			continue
@@ -207,6 +222,36 @@ func (p *Provider) hosts(ctx context.Context) ([]dns.Record, error) {
 	return recs, nil
 }
 
+// cnames reads Pi-hole's CNAME list ("alias,target[,ttl]") as read-only records.
+func (p *Provider) cnames(ctx context.Context) ([]dns.Record, error) {
+	var out struct {
+		Config *struct {
+			DNS *struct {
+				CNAMEs *[]string `json:"cnameRecords"`
+			} `json:"dns"`
+		} `json:"config"`
+	}
+	if err := p.do(ctx, "list cname records", "GET", "/api/config/dns/cnameRecords", nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Config == nil || out.Config.DNS == nil || out.Config.DNS.CNAMEs == nil {
+		return nil, errors.New("pihole: list cname records: malformed response (no config.dns.cnameRecords)")
+	}
+	var recs []dns.Record
+	for _, e := range *out.Config.DNS.CNAMEs {
+		f := strings.Split(e, ",")
+		if len(f) < 2 || strings.TrimSpace(f[0]) == "" {
+			return nil, fmt.Errorf("pihole: list cname records: unparseable entry %q", e)
+		}
+		r := dns.Record{Name: strings.ToLower(strings.TrimSpace(f[0])), Type: "CNAME", Value: strings.ToLower(strings.TrimSpace(f[1]))}
+		if len(f) > 2 {
+			r.TTL, _ = strconv.Atoi(strings.TrimSpace(f[2]))
+		}
+		recs = append(recs, r)
+	}
+	return recs, nil
+}
+
 func inZone(name, zone string) bool { return name == zone || strings.HasSuffix(name, "."+zone) }
 
 func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, error) {
@@ -214,6 +259,11 @@ func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, 
 	if err != nil {
 		return nil, err
 	}
+	cn, err := p.cnames(ctx)
+	if err != nil {
+		return nil, err
+	}
+	all = append(all, cn...)
 	var out []dns.Record
 	for _, r := range all {
 		if inZone(r.Name, zone) {
@@ -255,13 +305,26 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
+	cn, err := p.cnames(ctx)
+	if err != nil {
+		return dns.Record{}, err
+	}
+	for _, c := range cn {
+		if c.Name == r.Name {
+			return dns.Record{}, fmt.Errorf("pihole: %s is already a CNAME; cannot add an %s record: %w", r.Name, r.Type, dns.ErrRecordExists)
+		}
+	}
+	exists := false
 	for _, e := range all {
 		if e.Name == r.Name && e.Type == r.Type {
 			if e.Value == r.Value {
 				return e, nil
 			}
-			return dns.Record{}, dns.ErrRecordExists
+			exists = true
 		}
+	}
+	if exists {
+		return dns.Record{}, dns.ErrRecordExists
 	}
 	if err := p.do(ctx, "create record "+r.Name, "PUT", entryPath(r), nil, nil); err != nil {
 		return dns.Record{}, err
@@ -289,6 +352,13 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	if len(old) == 0 {
 		return dns.Record{}, dns.ErrNotFound
+	}
+	if len(old) != 1 {
+		return dns.Record{}, fmt.Errorf("pihole: %s %s has %d entries; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(old), dns.ErrRecordExists)
+	}
+	if old[0].Value == r.Value {
+		r.TTL = 0
+		return r, nil // already the requested value
 	}
 	// add the new entry first so the name never disappears, then drop the old ones
 	if err := p.do(ctx, "update record "+r.Name, "PUT", entryPath(r), nil, nil); err != nil {
@@ -326,3 +396,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	}
 	return nil
 }
+
+// String and GoString keep credentials out of any formatted output of the
+// provider (unexported struct fields are printed raw by fmt, bypassing the
+// redaction of secrets.Secret).
+func (p *Provider) String() string   { return "pihole.Provider" }
+func (p *Provider) GoString() string { return "pihole.Provider" }

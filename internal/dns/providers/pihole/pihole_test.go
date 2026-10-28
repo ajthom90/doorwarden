@@ -22,6 +22,9 @@ import (
 const password = "pihole-PASSWORD-do-not-leak-1"
 
 type backend struct {
+	cnames    []string
+	rawHosts  string
+	puts      int
 	mu        sync.Mutex
 	hosts     []string
 	valid     map[string]bool
@@ -55,7 +58,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if b.status != 0 {
-		reply(b.status, map[string]any{"error": map[string]any{"key": "x", "message": "boom " + password}})
+		reply(b.status, map[string]any{"error": map[string]any{"key": "x", "message": "boom " + password + r.Header.Get("X-FTL-SID")}})
 		return
 	}
 	if r.URL.Path == "/api/auth" {
@@ -85,12 +88,17 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	const base = "/api/config/dns/hosts"
 	switch {
+	case r.URL.Path == "/api/config/dns/cnameRecords" && r.Method == "GET":
+		reply(200, map[string]any{"config": map[string]any{"dns": map[string]any{"cnameRecords": append([]string{}, b.cnames...)}}})
+	case r.URL.Path == base && r.Method == "GET" && b.rawHosts != "":
+		_, _ = w.Write([]byte(b.rawHosts))
 	case r.URL.Path == base && r.Method == "GET":
 		reply(200, map[string]any{"config": map[string]any{"dns": map[string]any{"hosts": append([]string{}, b.hosts...)}}, "took": 0.01})
 	case strings.HasPrefix(r.URL.EscapedPath(), base+"/"):
 		entry, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), base+"/"))
 		switch r.Method {
 		case "PUT":
+			b.puts++
 			for _, h := range b.hosts {
 				if h == entry {
 					reply(201, nil)
@@ -128,7 +136,15 @@ func newProvider(t *testing.T, b *backend, pw string) *pihole.Provider {
 func TestConformance(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, password)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, v := range values {
+				b.hosts = append(b.hosts, v+" "+name)
+			}
+			return nil
+		}})
 	if p.Capabilities().WildcardA || p.Capabilities().TTL {
 		t.Fatalf("caps = %+v", p.Capabilities())
 	}
@@ -238,3 +254,64 @@ func TestContextAndConfig(t *testing.T) {
 }
 
 func secretOf(s string) secrets.Secret { return secrets.Secret(s) }
+
+func TestCNAMEsListedReadOnlyAndBlockA(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.cnames = []string{"alias.example.test,app.example.test,300", "short.example.test,app.example.test"}
+	p := newProvider(t, b, password)
+	recs, err := p.ListRecords(ctx, "example.test")
+	if err != nil || len(recs) != 2 || recs[0].Type != "CNAME" || recs[0].Value != "app.example.test" || recs[0].TTL != 300 {
+		t.Fatalf("recs=%+v err=%v", recs, err)
+	}
+	_, err = p.CreateRecord(ctx, "example.test", dns.Record{Name: "alias.example.test", Type: "A", Value: "192.0.2.1"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "CNAME") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "x.example.test", Type: "CNAME", Value: "y.example.test"}); err == nil {
+		t.Fatal("CNAME writes must be refused")
+	}
+}
+
+func TestUpdateSameValueNoOpAndMultiRefused(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.hosts = []string{"192.0.2.1 a.example.test", "192.0.2.1 m.example.test", "192.0.2.2 m.example.test"}
+	p := newProvider(t, b, password)
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if b.puts != 0 || len(b.hosts) != 3 {
+		t.Fatalf("same-value update wrote: puts=%d hosts=%v", b.puts, b.hosts)
+	}
+	_, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.9"})
+	if !errors.Is(err, dns.ErrRecordExists) || len(b.hosts) != 3 {
+		t.Fatalf("err=%v hosts=%v", err, b.hosts)
+	}
+}
+
+func TestListingFailsClosedAndSIDScrubbed(t *testing.T) {
+	ctx := context.Background()
+	for name, raw := range map[string]string{
+		"empty object": `{}`, "no config": `{"took":1}`, "no hosts": `{"config":{"dns":{}}}`, "null hosts": `{"config":{"dns":{"hosts":null}}}`,
+	} {
+		b := newBackend()
+		b.rawHosts = raw
+		p := newProvider(t, b, password)
+		if recs, err := p.ListRecords(ctx, "example.test"); err == nil {
+			t.Errorf("%s: accepted %v", name, recs)
+		}
+	}
+	b := newBackend()
+	p := newProvider(t, b, password)
+	if err := p.Test(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.status = 500
+	if err := p.Test(ctx); err == nil || strings.Contains(err.Error(), "sid-") || strings.Contains(err.Error(), password) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := dns.New("pihole", map[string]any{"url": "https://pi.lan", "password": "x", "insecure_skip_verify": "true"}, nil); err == nil {
+		t.Fatal("non-bool flag accepted")
+	}
+}

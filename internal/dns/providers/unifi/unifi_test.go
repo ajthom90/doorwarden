@@ -26,15 +26,19 @@ const (
 )
 
 type backend struct {
-	mu       sync.Mutex
-	sites    []map[string]any
-	pols     []map[string]any
-	n        int
-	status   int
-	slow     time.Duration
-	huge     bool
-	requests []string // "METHOD path"
-	otherKey string   // key seen at a redirect target
+	listRaw      string // replaces list responses (HTTP 200) when set
+	ignoreOffset bool
+	failOffset   int // fail list requests at this offset when >0
+	postEmpty    bool
+	mu           sync.Mutex
+	sites        []map[string]any
+	pols         []map[string]any
+	n            int
+	status       int
+	slow         time.Duration
+	huge         bool
+	requests     []string // "METHOD path"
+	otherKey     string   // key seen at a redirect target
 }
 
 func fixture(t *testing.T, name string) map[string]any {
@@ -87,7 +91,18 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	root := "/proxy/network/integration/v1"
 	paged := func(items []map[string]any) {
+		if b.listRaw != "" {
+			_, _ = w.Write([]byte(b.listRaw))
+			return
+		}
 		off, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		if b.failOffset > 0 && off == b.failOffset {
+			reply(500, map[string]any{"message": "boom"})
+			return
+		}
+		if b.ignoreOffset {
+			off = 0
+		}
 		if off > len(items) {
 			off = len(items)
 		}
@@ -95,7 +110,8 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if end > len(items) {
 			end = len(items)
 		}
-		reply(200, map[string]any{"offset": off, "limit": 3, "count": end - off, "totalCount": len(items), "data": items[off:end]})
+		data := append([]map[string]any{}, items[off:end]...)
+		reply(200, map[string]any{"offset": off, "limit": 3, "count": end - off, "totalCount": len(items), "data": data})
 	}
 	if r.URL.Path == root+"/sites" {
 		paged(b.sites)
@@ -112,6 +128,10 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		in["id"] = fmt.Sprintf("bbbbbbbb-0000-4000-8000-%012d", b.n)
 		in["metadata"] = map[string]any{"origin": "USER_DEFINED"}
 		b.pols = append(b.pols, in)
+		if b.postEmpty {
+			w.WriteHeader(201)
+			return
+		}
 		reply(201, in)
 	case strings.HasPrefix(r.URL.Path, pre+"/"):
 		id := strings.TrimPrefix(r.URL.Path, pre+"/")
@@ -156,7 +176,16 @@ func newProvider(t *testing.T, b http.Handler, mod func(*unifi.Config)) *unifi.P
 func TestConformance(t *testing.T) {
 	b := newBackend(t)
 	p := newProvider(t, b, nil)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, v := range values {
+				b.n++
+				b.pols = append(b.pols, map[string]any{"type": "A_RECORD", "id": fmt.Sprintf("cccccccc-0000-4000-8000-%012d", b.n), "enabled": true, "domain": name, "ipv4Address": v, "ttlSeconds": 0})
+			}
+			return nil
+		}})
 }
 
 func TestConformanceNoWildcard(t *testing.T) {
@@ -340,5 +369,91 @@ func TestURLValidationAndRedirect(t *testing.T) {
 func TestSecretRefViaResolver(t *testing.T) {
 	if _, err := dns.New("unifi", map[string]any{"url": "https://gw.example.test", "api_key": "secret:k"}, nil); err == nil {
 		t.Fatal("secret ref without resolver accepted")
+	}
+}
+
+func TestListingFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	many := func(b *backend) {
+		for i := 0; i < 7; i++ {
+			b.pols = append(b.pols, map[string]any{"type": "A_RECORD", "id": fmt.Sprint("p", i), "enabled": true, "domain": fmt.Sprintf("h%d.example.test", i), "ipv4Address": "192.0.2.1", "ttlSeconds": 0})
+		}
+	}
+	cases := map[string]struct {
+		mod  func(*backend)
+		want string
+	}{
+		"empty object":     {func(b *backend) { b.listRaw = `{}` }, "no data"},
+		"no data key":      {func(b *backend) { b.listRaw = `{"offset":0,"limit":5,"count":0,"totalCount":0}` }, "no data"},
+		"no totalCount":    {func(b *backend) { b.listRaw = `{"data":[]}` }, "no totalCount"},
+		"count lies":       {func(b *backend) { b.listRaw = `{"count":0,"totalCount":3,"data":[]}` }, "empty page"},
+		"ignores offset":   {func(b *backend) { many(b); b.ignoreOffset = true }, "repeated"},
+		"mid-page failure": {func(b *backend) { many(b); b.failOffset = 3 }, "status 500"},
+		"fewer than total": {func(b *backend) {
+			b.listRaw = `{"count":1,"totalCount":2,"data":[{"id":"a","type":"A_RECORD","domain":"a.example.test","ipv4Address":"192.0.2.1"}]}`
+		}, "repeated"},
+		"more than total": {func(b *backend) {
+			b.listRaw = `{"count":1,"totalCount":0,"data":[{"id":"a","type":"A_RECORD","domain":"a.example.test","ipv4Address":"192.0.2.1"}]}`
+		}, "totalCount"},
+	}
+	for name, tc := range cases {
+		b := newBackend(t)
+		tc.mod(b)
+		p := newProvider(t, b, func(c *unifi.Config) { c.SiteID = siteID })
+		recs, err := p.ListRecords(ctx, "example.test")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: recs=%v err=%v", name, recs, err)
+		}
+	}
+	// the sites list is hardened too
+	b := newBackend(t)
+	b.listRaw = `{}`
+	if err := newProvider(t, b, nil).Test(ctx); err == nil || !strings.Contains(err.Error(), "no data") {
+		t.Errorf("sites: err = %v", err)
+	}
+}
+
+func TestCreateWithoutEchoFindsIDOrFails(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	b.postEmpty = true
+	p := newProvider(t, b, nil)
+	got, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "new.example.test", Type: "A", Value: "192.0.2.44", TTL: 60})
+	if err != nil || got.ID == "" || got.Value != "192.0.2.44" {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	// if the policy can't be found afterwards the create must error, not return an empty ID
+	b2 := newBackend(t)
+	b2.postEmpty = true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			w.WriteHeader(201) // accepted but never stored
+			return
+		}
+		b2.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	p2, _ := unifi.New(unifi.Config{URL: srv.URL, APIKey: fakeKey})
+	if got, err := p2.CreateRecord(ctx, "example.test", dns.Record{Name: "lost.example.test", Type: "A", Value: "192.0.2.45"}); err == nil || got.ID != "" {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+func TestDisabledPolicyAndMultiMatch(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	b.pols = append(b.pols,
+		map[string]any{"type": "A_RECORD", "id": "d1", "enabled": false, "domain": "off.example.test", "ipv4Address": "192.0.2.8", "ttlSeconds": 0},
+		map[string]any{"type": "A_RECORD", "id": "m1", "enabled": true, "domain": "m.example.test", "ipv4Address": "192.0.2.1", "ttlSeconds": 0},
+		map[string]any{"type": "A_RECORD", "id": "m2", "enabled": true, "domain": "m.example.test", "ipv4Address": "192.0.2.2", "ttlSeconds": 0})
+	p := newProvider(t, b, nil)
+	// same value but disabled: not a silent success
+	_, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "off.example.test", Type: "A", Value: "192.0.2.8"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("err = %v", err)
+	}
+	_, err = p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.99"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "2 DNS policies") {
+		t.Fatalf("err = %v", err)
 	}
 }

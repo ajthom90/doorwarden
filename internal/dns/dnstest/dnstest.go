@@ -22,6 +22,12 @@ type Options struct {
 	// AllowMultiValue skips the "differing value returns ErrRecordExists"
 	// subtest for providers that permit several values per (name, type).
 	AllowMultiValue bool
+	// SeedMultiValue, when set, creates an A record set holding all values at
+	// name out of band (directly in the fake backend). The MultiValue subtest
+	// then requires that Create/Update/Delete leave values doorwarden did not
+	// write intact (or refuse with an error). Providers that cannot hold
+	// several values per (name, type) leave it nil.
+	SeedMultiValue func(ctx context.Context, zone, name string, values ...string) error
 }
 
 // Run executes the suite with default zones example.test and other.test.
@@ -247,6 +253,52 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 		}
 		if err := p.DeleteRecord(ctx(t), zone, created); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("MultiValueUnmanagedIntact", func(t *testing.T) {
+		if o.SeedMultiValue == nil {
+			t.Skip("no SeedMultiValue configured")
+		}
+		p := factory(t)
+		name := name("multi", zone)
+		if err := o.SeedMultiValue(ctx(t), zone, name, "192.0.2.1", "192.0.2.2"); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		t.Cleanup(func() {
+			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			for _, v := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.77", "192.0.2.99"} {
+				_ = p.DeleteRecord(c, zone, dns.Record{Name: name, Type: "A", Value: v})
+			}
+		})
+		values := func() map[string]bool {
+			m := map[string]bool{}
+			for _, r := range list(t, p, zone) {
+				if r.Name == name && r.Type == "A" {
+					m[r.Value] = true
+				}
+			}
+			return m
+		}
+		intact := func(op string) {
+			t.Helper()
+			if v := values(); !v["192.0.2.1"] || !v["192.0.2.2"] {
+				t.Fatalf("%s destroyed unmanaged values: now %v", op, v)
+			}
+		}
+		if p.Capabilities().Update {
+			// ok or refused, but never destructive
+			_, _ = p.UpdateRecord(ctx(t), zone, dns.Record{Name: name, Type: "A", Value: "192.0.2.99", TTL: 300})
+			intact("Update")
+		}
+		_, _ = p.CreateRecord(ctx(t), zone, dns.Record{Name: name, Type: "A", Value: "192.0.2.77", TTL: 300})
+		intact("Create")
+		if err := p.DeleteRecord(ctx(t), zone, dns.Record{Name: name, Type: "A", Value: "192.0.2.1"}); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if v := values(); v["192.0.2.1"] || !v["192.0.2.2"] {
+			t.Fatalf("Delete of one value: now %v", v)
 		}
 	})
 

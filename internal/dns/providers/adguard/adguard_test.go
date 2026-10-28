@@ -26,6 +26,8 @@ const (
 type rw struct{ Domain, Answer string }
 
 type backend struct {
+	rawList   string
+	hasRaw    bool
 	mu        sync.Mutex
 	rws       []rw
 	status    int
@@ -59,6 +61,10 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/control/status":
 		_, _ = w.Write([]byte(`{"running":true,"version":"v0.107.50"}`))
 	case "/control/rewrite/list":
+		if b.hasRaw {
+			_, _ = w.Write([]byte(b.rawList))
+			return
+		}
 		out := b.rws
 		if out == nil {
 			out = []rw{}
@@ -116,7 +122,15 @@ func newProvider(t *testing.T, b *backend, pw string) *adguard.Provider {
 func TestConformance(t *testing.T) {
 	b := &backend{}
 	p := newProvider(t, b, password)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, v := range values {
+				b.rws = append(b.rws, rw{name, v})
+			}
+			return nil
+		}})
 	if !p.Capabilities().WildcardA {
 		t.Fatal("wildcard must be supported")
 	}
@@ -194,5 +208,63 @@ func TestContextAndConfig(t *testing.T) {
 	}
 	if _, err := adguard.New(adguard.Config{URL: "https://a.example.test", Username: "u"}); err == nil {
 		t.Fatal("missing password accepted")
+	}
+}
+
+func TestRawStringsSentOnDeleteAndUpdate(t *testing.T) {
+	ctx := context.Background()
+	b := &backend{rws: []rw{{"Mixed.Example.Test.", "Target.Example.Test."}, {"keep.example.test", "A"}}}
+	p := newProvider(t, b, password)
+	recs, _ := p.ListRecords(ctx, "example.test")
+	got := map[string]string{}
+	for _, r := range recs {
+		got[r.Name] = r.Type
+	}
+	if got["mixed.example.test"] != "CNAME" || got["keep.example.test"] != "KEEP" {
+		t.Fatalf("types = %v", got)
+	}
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "mixed.example.test", Type: "CNAME", Value: "other.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	if b.rws[0].Answer != "other.example.test" {
+		t.Fatalf("raw target not matched: %+v", b.rws)
+	}
+	b.rws[0] = rw{"Mixed.Example.Test.", "Other.Example.Test."}
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "mixed.example.test", Type: "CNAME", Value: "other.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.rws) != 1 {
+		t.Fatalf("delete with normalised strings left the rewrite: %+v", b.rws)
+	}
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "keep.example.test", Type: "KEEP", Value: "A"}); err == nil {
+		t.Fatal("KEEP is not writable")
+	}
+}
+
+func TestListingFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	for name, raw := range map[string]string{"empty body": ``, "empty object": `{}`, "string": `"x"`, "blank entry": `[{"domain":"","answer":""}]`} {
+		b := &backend{hasRaw: true, rawList: raw}
+		p := newProvider(t, b, password)
+		if recs, err := p.ListRecords(ctx, "example.test"); err == nil {
+			t.Errorf("%s: accepted %v", name, recs)
+		}
+	}
+	b := &backend{hasRaw: true, rawList: `null`}
+	p := newProvider(t, b, password)
+	if recs, err := p.ListRecords(ctx, "example.test"); err != nil || len(recs) != 0 {
+		t.Fatalf("null list: recs=%v err=%v", recs, err)
+	}
+	if _, err := dns.New("adguard", map[string]any{"url": "https://a.lan", "username": "u", "password": "p", "allow_insecure_http": 1}, nil); err == nil {
+		t.Fatal("non-bool flag accepted")
+	}
+}
+
+func TestMultiValueUpdateRefused(t *testing.T) {
+	b := &backend{rws: []rw{{"m.example.test", "192.0.2.1"}, {"m.example.test", "192.0.2.2"}}}
+	p := newProvider(t, b, password)
+	_, err := p.UpdateRecord(context.Background(), "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.9"})
+	if !errors.Is(err, dns.ErrRecordExists) || len(b.rws) != 2 {
+		t.Fatalf("err=%v rws=%v", err, b.rws)
 	}
 }

@@ -26,6 +26,8 @@ const (
 type rec struct {
 	name, typ, val string
 	ttl            int
+	disabled       bool
+	comments       string
 }
 
 type backend struct {
@@ -36,6 +38,7 @@ type backend struct {
 	status     int
 	slow       time.Duration
 	queryToken bool // a token was seen in the URL query
+	rawGet     string
 }
 
 func newBackend() *backend {
@@ -101,6 +104,10 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/api/zones/records/get":
+		if b.rawGet != "" {
+			_, _ = w.Write([]byte(b.rawGet))
+			return
+		}
 		var out []map[string]any
 		for _, e := range recs {
 			rd := map[string]any{}
@@ -112,20 +119,20 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case "TXT":
 				rd["text"] = e.val
 			}
-			out = append(out, map[string]any{"name": e.name, "type": e.typ, "ttl": e.ttl, "disabled": false, "rData": rd})
+			out = append(out, map[string]any{"name": e.name, "type": e.typ, "ttl": e.ttl, "disabled": e.disabled, "comments": e.comments, "rData": rd})
 		}
 		out = append(out, map[string]any{"name": zone, "type": "SOA", "ttl": 60, "rData": map[string]any{"primaryNameServer": "ns"}})
 		out = append(out, map[string]any{"name": zone, "type": "MX", "ttl": 60, "rData": map[string]any{"preference": 10, "exchange": "mx.example.test"}})
 		reply(map[string]any{"status": "ok", "response": map[string]any{"zone": map[string]any{"name": zone}, "records": out}})
 	case "/api/zones/records/add":
 		ttl, _ := strconv.Atoi(f.Get("ttl"))
-		b.zones[zone] = append(recs, rec{dom, typ, valOf(false), ttl})
+		b.zones[zone] = append(recs, rec{name: dom, typ: typ, val: valOf(false), ttl: ttl})
 		reply(map[string]any{"status": "ok", "response": map[string]any{}})
 	case "/api/zones/records/update":
 		for i, e := range recs {
 			if e.name == dom && e.typ == typ && (typ == "CNAME" || e.val == valOf(false)) {
 				ttl, _ := strconv.Atoi(f.Get("ttl"))
-				recs[i] = rec{dom, typ, valOf(true), ttl}
+				recs[i] = rec{name: dom, typ: typ, val: valOf(true), ttl: ttl, disabled: f.Get("disable") == "true", comments: f.Get("comments")}
 				reply(map[string]any{"status": "ok", "response": map[string]any{}})
 				return
 			}
@@ -162,7 +169,15 @@ func newProvider(t *testing.T, b *backend, mod func(*technitium.Config)) *techni
 func TestConformanceToken(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, nil)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, zone, name string, values ...string) error {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, v := range values {
+				b.zones[zone] = append(b.zones[zone], rec{name: name, typ: "A", val: v, ttl: 60})
+			}
+			return nil
+		}})
 	if b.queryToken {
 		t.Fatal("credentials were sent in the URL query")
 	}
@@ -242,5 +257,61 @@ func TestContextAndConfig(t *testing.T) {
 	}
 	if _, err := technitium.New(technitium.Config{URL: "http://dns.example.test", Token: "t"}); err == nil {
 		t.Fatal("plain http to public name accepted")
+	}
+}
+
+func TestUpdatePreservesUnmanagedFields(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.zones["example.test"] = []rec{{name: "a.example.test", typ: "A", val: "192.0.2.1", ttl: 777, disabled: true, comments: "keep me"}}
+	p := newProvider(t, b, nil)
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "a.example.test", Type: "A", Value: "192.0.2.2"}); err != nil {
+		t.Fatal(err)
+	}
+	got := b.zones["example.test"][0]
+	if got.val != "192.0.2.2" || got.ttl != 777 || !got.disabled || got.comments != "keep me" {
+		t.Fatalf("update reset fields: %+v", got)
+	}
+}
+
+func TestMultiValueUpdateRefusedAndDeleteExact(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.zones["example.test"] = []rec{{name: "m.example.test", typ: "A", val: "192.0.2.1"}, {name: "m.example.test", typ: "A", val: "192.0.2.2"}}
+	p := newProvider(t, b, nil)
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.9"}); err == nil || !strings.Contains(err.Error(), "2 values") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestListingFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	for name, raw := range map[string]string{
+		"empty object": `{}`, "ok without response": `{"status":"ok"}`, "no records": `{"status":"ok","response":{"zone":{}}}`,
+		"null records": `{"status":"ok","response":{"records":null}}`,
+	} {
+		b := newBackend()
+		b.rawGet = raw
+		p := newProvider(t, b, nil)
+		if recs, err := p.ListRecords(ctx, "example.test"); err == nil {
+			t.Errorf("%s: accepted, recs=%v", name, recs)
+		}
+	}
+}
+
+func TestSessionTokenScrubbedAndFlagsTyped(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	p := newProvider(t, b, func(c *technitium.Config) { c.Token, c.Username, c.Password = "", "admin", password })
+	if err := p.Test(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.status = 500
+	err := p.Test(ctx)
+	if err == nil || strings.Contains(err.Error(), "session-") {
+		t.Fatalf("session token leaked: %v", err)
+	}
+	if _, err := dns.New("technitium", map[string]any{"url": "https://x.example.test", "token": "t", "allow_insecure_http": "yes"}, nil); err == nil {
+		t.Fatal("non-bool flag accepted")
 	}
 }

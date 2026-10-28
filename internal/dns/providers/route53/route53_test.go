@@ -36,14 +36,17 @@ type set struct {
 	name, typ string
 	ttl       int
 	vals      []string
+	alias     bool
 }
 
 type backend struct {
-	mu       sync.Mutex
-	zones    []*zone
-	failCode string // when set, every call fails with this error code
-	slow     time.Duration
-	listed   []string // hosted zone ids whose rrsets were listed
+	mu                  sync.Mutex
+	zones               []*zone
+	failCode            string // when set, every call fails with this error code
+	slow                time.Duration
+	listed              []string // hosted zone ids whose rrsets were listed
+	zonePages, setPages int
+	brokenTrunc         bool // truncated pages without a continuation marker
 }
 
 func newBackend() *backend {
@@ -63,6 +66,10 @@ func (b *backend) zone(id string) *zone {
 	}
 	return nil
 }
+
+// norm mirrors Route 53 name handling: case-insensitive, always stored with a
+// trailing dot.
+func norm(n string) string { return strings.TrimSuffix(strings.ToLower(n), ".") + "." }
 
 func xmlErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "text/xml")
@@ -106,11 +113,34 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/2013-04-01")
 	switch {
 	case path == "/hostedzone" && r.Method == "GET":
+		start := 0
+		if m := r.URL.Query().Get("marker"); m != "" {
+			for i, z := range b.zones {
+				if z.id == m {
+					start = i
+				}
+			}
+		}
+		per := 1 // truncate after every zone
+		if m := r.URL.Query().Get("maxitems"); m == "1" {
+			per = 1
+		}
+		end := start + per
+		if end > len(b.zones) {
+			end = len(b.zones)
+		}
+		b.zonePages++
 		fmt.Fprintf(w, `<ListHostedZonesResponse %s><HostedZones>`, ns)
-		for _, z := range b.zones {
+		for _, z := range b.zones[start:end] {
 			fmt.Fprintf(w, `<HostedZone><Id>/hostedzone/%s</Id><Name>%s</Name><CallerReference>c</CallerReference><Config><PrivateZone>%v</PrivateZone></Config><ResourceRecordSetCount>0</ResourceRecordSetCount></HostedZone>`, z.id, z.name, z.private)
 		}
-		fmt.Fprintf(w, `</HostedZones><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListHostedZonesResponse>`)
+		fmt.Fprintf(w, `</HostedZones>`)
+		if end < len(b.zones) {
+			fmt.Fprintf(w, `<IsTruncated>true</IsTruncated><NextMarker>%s</NextMarker>`, b.zones[end].id)
+		} else {
+			fmt.Fprint(w, `<IsTruncated>false</IsTruncated>`)
+		}
+		fmt.Fprintf(w, `<MaxItems>%d</MaxItems></ListHostedZonesResponse>`, per)
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/hostedzone/"), "/")
@@ -135,12 +165,16 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return all[i].typ < all[j].typ
 		})
-		sn, st := q.Get("name"), q.Get("type")
+		sn, st := norm(q.Get("name")), q.Get("type")
+		if q.Get("name") == "" {
+			sn = ""
+		}
 		start := 0
 		for start < len(all) && (all[start].name < sn || (all[start].name == sn && all[start].typ < st)) {
 			start++
 		}
-		per := 3 // force pagination
+		per := 2 // force pagination
+		b.setPages++
 		if m := q.Get("maxitems"); m == "1" {
 			per = 1
 		}
@@ -150,6 +184,10 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, `<ListResourceRecordSetsResponse %s><ResourceRecordSets>`, ns)
 		for _, s := range all[start:end] {
+			if s.alias {
+				fmt.Fprintf(w, `<ResourceRecordSet><Name>%s</Name><Type>%s</Type><AliasTarget><HostedZoneId>Z9</HostedZoneId><DNSName>lb.example.test.</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget></ResourceRecordSet>`, s.name, s.typ)
+				continue
+			}
 			fmt.Fprintf(w, `<ResourceRecordSet><Name>%s</Name><Type>%s</Type><TTL>%d</TTL><ResourceRecords>`, s.name, s.typ, s.ttl)
 			for _, v := range s.vals {
 				fmt.Fprintf(w, `<ResourceRecord><Value>%s</Value></ResourceRecord>`, v)
@@ -157,7 +195,9 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, `</ResourceRecords></ResourceRecordSet>`)
 		}
 		fmt.Fprint(w, `</ResourceRecordSets>`)
-		if end < len(all) {
+		if end < len(all) && b.brokenTrunc {
+			fmt.Fprint(w, `<IsTruncated>true</IsTruncated>`)
+		} else if end < len(all) {
 			fmt.Fprintf(w, `<IsTruncated>true</IsTruncated><NextRecordName>%s</NextRecordName><NextRecordType>%s</NextRecordType>`, all[end].name, all[end].typ)
 		} else {
 			fmt.Fprint(w, `<IsTruncated>false</IsTruncated>`)
@@ -171,6 +211,7 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, c := range cb.Changes {
+			c.Set.Name = norm(c.Set.Name)
 			key := c.Set.Name + "|" + c.Set.Type
 			var vals []string
 			for _, rr := range c.Set.Records {
@@ -182,9 +223,9 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					xmlErr(w, 400, "InvalidChangeBatch", "Tried to create resource record set but it already exists")
 					return
 				}
-				z.sets[key] = &set{c.Set.Name, c.Set.Type, c.Set.TTL, vals}
+				z.sets[key] = &set{name: c.Set.Name, typ: c.Set.Type, ttl: c.Set.TTL, vals: vals}
 			case "UPSERT":
-				z.sets[key] = &set{c.Set.Name, c.Set.Type, c.Set.TTL, vals}
+				z.sets[key] = &set{name: c.Set.Name, typ: c.Set.Type, ttl: c.Set.TTL, vals: vals}
 			case "DELETE":
 				if _, ok := z.sets[key]; !ok {
 					xmlErr(w, 400, "InvalidChangeBatch", "not found")
@@ -197,6 +238,13 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		xmlErr(w, 404, "NoSuchHostedZone", "bad route")
 	}
+}
+
+func (b *backend) seed(zid, name string, values ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := norm(name) // the real service stores names with a trailing dot
+	b.zone(zid).sets[n+"|A"] = &set{name: n, typ: "A", ttl: 300, vals: values}
 }
 
 func newProvider(t *testing.T, b *backend, mod func(*route53.Config)) *route53.Provider {
@@ -217,7 +265,11 @@ func newProvider(t *testing.T, b *backend, mod func(*route53.Config)) *route53.P
 func TestConformance(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, nil)
-	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
+			b.seed("ZEXAMPLE", name, values...)
+			return nil
+		}})
 	// all rrset activity for example.test went to the public longest-suffix zone
 	for _, id := range b.listed {
 		if id == "ZTEST" || id == "ZPRIV" {
@@ -315,7 +367,7 @@ func TestContextTimeout(t *testing.T) {
 func TestMultiValueSetAndWildcardEscaping(t *testing.T) {
 	ctx := context.Background()
 	b := newBackend()
-	b.zone("ZEXAMPLE").sets[`foreign.example.test.|A`] = &set{`foreign.example.test.`, "A", 60, []string{"192.0.2.7", "192.0.2.8"}}
+	b.zone("ZEXAMPLE").sets[`foreign.example.test.|A`] = &set{name: `foreign.example.test.`, typ: "A", ttl: 60, vals: []string{"192.0.2.7", "192.0.2.8"}}
 	p := newProvider(t, b, nil)
 	recs, _ := p.ListRecords(ctx, "example.test")
 	if len(recs) != 2 {
@@ -332,7 +384,7 @@ func TestMultiValueSetAndWildcardEscaping(t *testing.T) {
 	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "*.example.test", Type: "A", Value: "192.0.2.9"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := b.zone("ZEXAMPLE").sets[`\052.example.test|A`]; !ok {
+	if _, ok := b.zone("ZEXAMPLE").sets[`\052.example.test.|A`]; !ok {
 		var keys []string
 		for k := range b.zone("ZEXAMPLE").sets {
 			keys = append(keys, k)
@@ -361,5 +413,68 @@ func TestNoEndpointOverrideInSchema(t *testing.T) {
 		if f.Name == "endpoint" || f.Name == "api_url" {
 			t.Fatalf("user-configurable endpoint %q in schema", f.Name)
 		}
+	}
+}
+
+func TestPaginationCoversAllPages(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	for i := 0; i < 8; i++ {
+		b.seed("ZEXAMPLE", fmt.Sprintf("h%d.example.test", i), "192.0.2.1")
+	}
+	p := newProvider(t, b, nil)
+	recs, err := p.ListRecords(ctx, "example.test")
+	if err != nil || len(recs) != 8 {
+		t.Fatalf("recs=%d err=%v", len(recs), err)
+	}
+	if b.zonePages < 3 || b.setPages < 3 {
+		t.Fatalf("pagination not exercised: zone pages %d, set pages %d", b.zonePages, b.setPages)
+	}
+}
+
+func TestUpdateRefusesMultiValueAndAlias(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	b.seed("ZEXAMPLE", "m.example.test.", "192.0.2.1", "192.0.2.2")
+	p := newProvider(t, b, nil)
+	_, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.99"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "2 values") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := b.zone("ZEXAMPLE").sets["m.example.test.|A"].vals; len(got) != 2 {
+		t.Fatalf("set changed: %v", got)
+	}
+	// deleting one value keeps the other (trailing-dot seed vs. undotted request)
+	if err := p.DeleteRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.zone("ZEXAMPLE").sets["m.example.test.|A"].vals; len(got) != 1 || got[0] != "192.0.2.2" {
+		t.Fatalf("vals = %v", got)
+	}
+	// single value: update allowed
+	if _, err := p.UpdateRecord(ctx, "example.test", dns.Record{Name: "m.example.test", Type: "A", Value: "192.0.2.50"}); err != nil {
+		t.Fatal(err)
+	}
+	// alias set refused
+	b.zone("ZEXAMPLE").sets["al.example.test.|A"] = &set{name: "al.example.test.", typ: "A", alias: true}
+	_, err = p.UpdateRecord(ctx, "example.test", dns.Record{Name: "al.example.test", Type: "A", Value: "192.0.2.3"})
+	if !errors.Is(err, dns.ErrRecordExists) || !strings.Contains(err.Error(), "alias") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTXTNotSupportedAndBrokenPagination(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend()
+	p := newProvider(t, b, nil)
+	if _, err := p.CreateRecord(ctx, "example.test", dns.Record{Name: "t.example.test", Type: "TXT", Value: "v"}); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("err = %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		b.seed("ZEXAMPLE", fmt.Sprintf("x%d.example.test", i), "192.0.2.1")
+	}
+	b.brokenTrunc = true
+	if _, err := p.ListRecords(ctx, "example.test"); err == nil || !strings.Contains(err.Error(), "next") {
+		t.Fatalf("truncated page without marker accepted: %v", err)
 	}
 }

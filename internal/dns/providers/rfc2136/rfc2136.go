@@ -71,7 +71,7 @@ type Provider struct {
 	addr    string
 	keyName string
 	alg     string
-	secret  string
+	secret  secrets.Secret
 	timeout time.Duration
 }
 
@@ -104,7 +104,7 @@ func New(c Config) (*Provider, error) {
 	}
 	return &Provider{
 		addr: net.JoinHostPort(host, port), keyName: mdns.Fqdn(strings.ToLower(c.KeyName)),
-		alg: full, secret: c.KeySecret.Reveal(), timeout: to,
+		alg: full, secret: c.KeySecret, timeout: to,
 	}, nil
 }
 
@@ -112,14 +112,14 @@ func (p *Provider) Type() string                   { return Type }
 func (p *Provider) Capabilities() dns.Capabilities { return staticCaps }
 
 func (p *Provider) scrub(s string) string {
-	if p.secret != "" {
-		s = strings.ReplaceAll(s, p.secret, "[redacted]")
+	if v := p.secret.Reveal(); v != "" {
+		s = strings.ReplaceAll(s, v, "[redacted]")
 	}
 	return s
 }
 
 func (p *Provider) client() *mdns.Client {
-	return &mdns.Client{Net: "tcp", Timeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret}}
+	return &mdns.Client{Net: "tcp", Timeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret.Reveal()}}
 }
 
 func (p *Provider) sign(m *mdns.Msg) *mdns.Msg {
@@ -141,6 +141,9 @@ func (p *Provider) exchange(ctx context.Context, op string, m *mdns.Msg) (*mdns.
 			return nil, fmt.Errorf("rfc2136: %s: %w", op, context.DeadlineExceeded)
 		}
 		return nil, fmt.Errorf("rfc2136: %s: %s", op, p.scrub(err.Error()))
+	}
+	if r.IsTsig() == nil {
+		return nil, fmt.Errorf("rfc2136: %s: server response is not TSIG-signed; refusing it", op)
 	}
 	return r, p.rcodeErr(op, r)
 }
@@ -249,45 +252,53 @@ func fromRR(rr mdns.RR) (dns.Record, bool) {
 	return rec, true
 }
 
-// ListRecords lists the zone by AXFR (TSIG-signed). The server must allow
-// transfers to the key.
+// ListRecords lists the zone by AXFR (TSIG-signed; every message must verify).
+// The server must allow transfers to the key. The connection is closed when
+// ctx is cancelled.
 func (p *Provider) ListRecords(ctx context.Context, zone string) ([]dns.Record, error) {
 	m := new(mdns.Msg)
 	m.SetAxfr(fqdn(zone))
 	p.sign(m)
-	t := &mdns.Transfer{DialTimeout: p.timeout, ReadTimeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret}}
-	ch, err := t.In(m, p.addr)
+	nc, err := (&net.Dialer{Timeout: p.timeout}).DialContext(ctx, "tcp", p.addr)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("rfc2136: list records: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("rfc2136: list records: %s", p.scrub(err.Error()))
 	}
-	type result struct {
-		recs []dns.Record
-		err  error
+	defer nc.Close()
+	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
+	defer stop()
+	t := &mdns.Transfer{Conn: &mdns.Conn{Conn: nc}, ReadTimeout: p.timeout, TsigSecret: map[string]string{p.keyName: p.secret.Reveal()}}
+	ch, err := t.In(m, p.addr)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("rfc2136: list records: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("rfc2136: list records: %s", p.scrub(err.Error()))
 	}
-	done := make(chan result, 1)
-	go func() {
-		var res result
-		for env := range ch {
-			if env.Error != nil {
-				if res.err == nil {
-					res.err = fmt.Errorf("rfc2136: list records (AXFR): %s; the server must allow zone transfers to the TSIG key (allow-transfer)", p.scrub(env.Error.Error()))
-				}
-				continue // drain
+	var recs []dns.Record
+	var firstErr error
+	for env := range ch {
+		if env.Error != nil {
+			if firstErr == nil {
+				firstErr = env.Error
 			}
-			for _, rr := range env.RR {
-				if r, ok := fromRR(rr); ok {
-					res.recs = append(res.recs, r)
-				}
+			continue // drain
+		}
+		for _, rr := range env.RR {
+			if r, ok := fromRR(rr); ok {
+				recs = append(recs, r)
 			}
 		}
-		done <- res
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("rfc2136: list records: %w", ctx.Err())
-	case res := <-done:
-		return res.recs, res.err
 	}
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("rfc2136: list records: %w", ctx.Err())
+	}
+	if firstErr != nil {
+		return nil, fmt.Errorf("rfc2136: list records (AXFR): %s; the server must allow zone transfers to the TSIG key (allow-transfer) and sign every response", p.scrub(firstErr.Error()))
+	}
+	return recs, nil
 }
 
 func (p *Provider) lookup(ctx context.Context, name, typ string) ([]dns.Record, error) {
@@ -327,11 +338,28 @@ func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) 
 	if err != nil {
 		return dns.Record{}, err
 	}
-	if len(cur) > 0 {
-		if len(cur) == 1 && cur[0].Value == r.Value {
-			return cur[0], nil
+	for _, c := range cur {
+		if c.Value == r.Value {
+			return c, nil
 		}
+	}
+	if len(cur) > 0 {
 		return dns.Record{}, dns.ErrRecordExists
+	}
+	// a CNAME cannot coexist with other data at the same name; servers ignore
+	// such updates silently, so check first
+	others := []string{"CNAME"}
+	if r.Type == "CNAME" {
+		others = []string{"A", "AAAA", "TXT"}
+	}
+	for _, t := range others {
+		o, err := p.lookup(ctx, r.Name, t)
+		if err != nil {
+			return dns.Record{}, err
+		}
+		if len(o) > 0 {
+			return dns.Record{}, fmt.Errorf("rfc2136: %s already has a %s record, which cannot coexist with %s: %w", r.Name, t, r.Type, dns.ErrRecordExists)
+		}
 	}
 	if err := p.update(ctx, "create record "+r.Name, zone, func(m *mdns.Msg) { m.Insert([]mdns.RR{rr}) }); err != nil {
 		return dns.Record{}, err
@@ -355,6 +383,9 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if len(cur) == 0 {
 		return dns.Record{}, dns.ErrNotFound
 	}
+	if len(cur) != 1 {
+		return dns.Record{}, fmt.Errorf("rfc2136: %s %s set has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, len(cur), dns.ErrRecordExists)
+	}
 	// one UPDATE message: replace the whole RRset atomically
 	if err := p.update(ctx, "update record "+r.Name, zone, func(m *mdns.Msg) {
 		m.RemoveRRset([]mdns.RR{rr})
@@ -377,3 +408,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	// RR-exact removal: a stored record with a different value is untouched.
 	return p.update(ctx, "delete record "+r.Name, zone, func(m *mdns.Msg) { m.Remove([]mdns.RR{rr}) })
 }
+
+// String and GoString keep credentials out of any formatted output of the
+// provider (unexported struct fields are printed raw by fmt, bypassing the
+// redaction of secrets.Secret).
+func (p *Provider) String() string   { return "rfc2136.Provider" }
+func (p *Provider) GoString() string { return "rfc2136.Provider" }

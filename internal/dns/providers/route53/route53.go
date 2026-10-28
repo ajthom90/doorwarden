@@ -33,6 +33,9 @@ import (
 // Type is the registry name.
 const Type = "route53"
 
+// maxPages bounds list pagination so a misbehaving server cannot loop forever.
+const maxPages = 1000
+
 var staticCaps = dns.Capabilities{WildcardA: true, MultiZone: true, Update: true, TTL: true}
 
 func init() {
@@ -80,7 +83,7 @@ type Config struct {
 type Provider struct {
 	cl      *r53.Client
 	pinned  string
-	secrets []string
+	secrets []secrets.Secret
 
 	mu    sync.Mutex
 	cache map[string]string // zone -> hosted zone id
@@ -94,14 +97,14 @@ func New(ctx context.Context, c Config) (*Provider, error) {
 		region = "us-east-1"
 	}
 	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	var sec []string
+	var sec []secrets.Secret
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
 		if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 			return nil, errors.New("route53: access key ID and secret access key must be set together")
 		}
 		opts = append(opts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(c.AccessKeyID.Reveal(), c.SecretAccessKey.Reveal(), "")))
-		sec = []string{c.AccessKeyID.Reveal(), c.SecretAccessKey.Reveal()}
+		sec = []secrets.Secret{c.AccessKeyID, c.SecretAccessKey}
 	}
 	if c.Endpoint != "" {
 		opts = append(opts, awsconfig.WithRetryMaxAttempts(1))
@@ -128,8 +131,8 @@ func (p *Provider) Capabilities() dns.Capabilities {
 
 func (p *Provider) scrub(s string) string {
 	for _, x := range p.secrets {
-		if x != "" {
-			s = strings.ReplaceAll(s, x, "[redacted]")
+		if v := x.Reveal(); v != "" {
+			s = strings.ReplaceAll(s, v, "[redacted]")
 		}
 	}
 	return s
@@ -164,7 +167,10 @@ type hostedZone struct {
 func (p *Provider) listZones(ctx context.Context) ([]hostedZone, error) {
 	var out []hostedZone
 	var marker *string
-	for {
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return nil, fmt.Errorf("route53: list hosted zones: more than %d pages; refusing to continue", maxPages)
+		}
 		resp, err := p.cl.ListHostedZones(ctx, &r53.ListHostedZonesInput{Marker: marker})
 		if err != nil {
 			return nil, p.wrapCtx(ctx, "list hosted zones", err)
@@ -177,8 +183,11 @@ func (p *Provider) listZones(ctx context.Context) ([]hostedZone, error) {
 				private: priv,
 			})
 		}
-		if !resp.IsTruncated || resp.NextMarker == nil {
+		if !resp.IsTruncated {
 			return out, nil
+		}
+		if resp.NextMarker == nil || (marker != nil && *marker == *resp.NextMarker) {
+			return nil, errors.New("route53: list hosted zones: truncated response without a usable next marker")
 		}
 		marker = resp.NextMarker
 	}
@@ -268,7 +277,10 @@ func unescName(n string) string {
 func (p *Provider) allSets(ctx context.Context, zid string) ([]types.ResourceRecordSet, error) {
 	var out []types.ResourceRecordSet
 	in := &r53.ListResourceRecordSetsInput{HostedZoneId: aws.String(zid)}
-	for {
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return nil, fmt.Errorf("route53: list records: more than %d pages; refusing to continue", maxPages)
+		}
 		resp, err := p.cl.ListResourceRecordSets(ctx, in)
 		if err != nil {
 			return nil, p.wrapCtx(ctx, "list records", err)
@@ -276,6 +288,9 @@ func (p *Provider) allSets(ctx context.Context, zid string) ([]types.ResourceRec
 		out = append(out, resp.ResourceRecordSets...)
 		if !resp.IsTruncated {
 			return out, nil
+		}
+		if resp.NextRecordName == nil || resp.NextRecordType == "" {
+			return nil, errors.New("route53: list records: truncated response without a next record marker")
 		}
 		in.StartRecordName, in.StartRecordType, in.StartRecordIdentifier = resp.NextRecordName, resp.NextRecordType, resp.NextRecordIdentifier
 	}
@@ -348,7 +363,21 @@ func ttlOf(r dns.Record) int64 {
 	return int64(r.TTL)
 }
 
+// checkType restricts writes to the types whose Route 53 value syntax is
+// verbatim. TXT needs RFC-style double quoting in 255-byte chunks and is not
+// handled yet, so it is rejected instead of being written wrongly.
+func checkType(r dns.Record) error {
+	switch r.Type {
+	case "A", "AAAA", "CNAME":
+		return nil
+	}
+	return fmt.Errorf("route53: record type %q is not supported for writes (A, AAAA, CNAME)", r.Type)
+}
+
 func (p *Provider) CreateRecord(ctx context.Context, zone string, r dns.Record) (dns.Record, error) {
+	if err := checkType(r); err != nil {
+		return dns.Record{}, err
+	}
 	zid, err := p.zoneID(ctx, zone)
 	if err != nil {
 		return dns.Record{}, err
@@ -375,6 +404,9 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if r.ID != "" {
 		return dns.Record{}, dns.ErrNotFound // route53 never issues record IDs
 	}
+	if err := checkType(r); err != nil {
+		return dns.Record{}, err
+	}
 	zid, err := p.zoneID(ctx, zone)
 	if err != nil {
 		return dns.Record{}, err
@@ -386,6 +418,12 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 	if cur == nil {
 		return dns.Record{}, dns.ErrNotFound
 	}
+	if cur.AliasTarget != nil {
+		return dns.Record{}, fmt.Errorf("route53: %s %s is an alias record set; refusing to modify it: %w", r.Name, r.Type, dns.ErrRecordExists)
+	}
+	if n := len(cur.ResourceRecords); n != 1 {
+		return dns.Record{}, fmt.Errorf("route53: %s %s set has %d values; refusing to modify values doorwarden does not manage: %w", r.Name, r.Type, n, dns.ErrRecordExists)
+	}
 	r.TTL = int(ttlOf(r))
 	if err := p.change(ctx, zid, types.ChangeActionUpsert, newSet(r, int64(r.TTL)), "update record "+r.Name); err != nil {
 		return dns.Record{}, err
@@ -396,6 +434,9 @@ func (p *Provider) UpdateRecord(ctx context.Context, zone string, r dns.Record) 
 func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) error {
 	if r.ID != "" {
 		return nil // never issued: nothing can match
+	}
+	if err := checkType(r); err != nil {
+		return err
 	}
 	zid, err := p.zoneID(ctx, zone)
 	if err != nil {
@@ -424,3 +465,9 @@ func (p *Provider) DeleteRecord(ctx context.Context, zone string, r dns.Record) 
 	upd.ResourceRecords = rest
 	return p.change(ctx, zid, types.ChangeActionUpsert, upd, "delete record value "+r.Name)
 }
+
+// String and GoString keep credentials out of any formatted output of the
+// provider (unexported struct fields are printed raw by fmt, bypassing the
+// redaction of secrets.Secret).
+func (p *Provider) String() string   { return "route53.Provider" }
+func (p *Provider) GoString() string { return "route53.Provider" }

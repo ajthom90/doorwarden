@@ -16,7 +16,10 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/ajthom90/doorwarden/internal/secrets"
 )
 
 const (
@@ -51,7 +54,9 @@ type Client struct {
 	HC      *http.Client
 	MaxBody int64
 	// Secrets are scrubbed from every error string this client returns.
-	Secrets []string
+	// Set before use; add later (session tokens) with AddSecret.
+	Secrets []secrets.Secret
+	smu     sync.RWMutex
 }
 
 // New builds a client for base (scheme://host[:port][/prefix]).
@@ -118,11 +123,20 @@ func privateHost(h string) bool {
 // Close drops idle connections.
 func (c *Client) Close() { c.HC.CloseIdleConnections() }
 
+// AddSecret registers another value to scrub (for example a session token).
+func (c *Client) AddSecret(s secrets.Secret) {
+	c.smu.Lock()
+	c.Secrets = append(c.Secrets, s)
+	c.smu.Unlock()
+}
+
 // Scrub replaces every configured secret in s.
 func (c *Client) Scrub(s string) string {
+	c.smu.RLock()
+	defer c.smu.RUnlock()
 	for _, sec := range c.Secrets {
-		if sec != "" {
-			s = strings.ReplaceAll(s, sec, "[redacted]")
+		if v := sec.Reveal(); v != "" {
+			s = strings.ReplaceAll(s, v, "[redacted]")
 		}
 	}
 	return s
@@ -254,4 +268,17 @@ func trunc(s string) string {
 		s = s[:200] + "..."
 	}
 	return s
+}
+
+// BoolOption reads an optional bool config key; a non-bool value is an error.
+func BoolOption(cfg map[string]any, key string) (bool, error) {
+	v, ok := cfg[key]
+	if !ok || v == nil {
+		return false, nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, fmt.Errorf("config field %q must be a bool", key)
+	}
+	return b, nil
 }
