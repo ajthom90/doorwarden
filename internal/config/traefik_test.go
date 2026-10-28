@@ -7,7 +7,8 @@ import (
 
 func TestTraefikDefaults(t *testing.T) {
 	c := mustLoad(t, base)
-	want := Traefik{DynamicDir: "/etc/traefik/dynamic", EntryPoint: "websecure", CertPathPrefix: "/certs"}
+	want := Traefik{DynamicDir: "/etc/traefik/dynamic", EntryPoint: "websecure", CertPathPrefix: "/certs",
+		TraefikTLS: TraefikTLS{TLSMinVersion: "VersionTLS12"}}
 	if !reflect.DeepEqual(c.Traefik, want) {
 		t.Fatalf("got %+v", c.Traefik)
 	}

@@ -62,6 +62,8 @@ type Traefik struct {
 	// ExternalMiddlewares allowlists qualified references (name@provider)
 	// to middlewares defined outside doorwarden (e.g. crowdsec@docker).
 	ExternalMiddlewares []string `yaml:"external_middlewares"`
+	// TraefikTLS: tls_min_version, sni_strict, serve_expired (tls.go).
+	TraefikTLS `yaml:",inline"`
 }
 
 type Zone struct {
@@ -191,6 +193,7 @@ func (c *Config) applyDefaults() {
 	if c.Traefik.CertPathPrefix == "" {
 		c.Traefik.CertPathPrefix = "/certs"
 	}
+	c.Traefik.TraefikTLS.applyDefaults()
 	if c.Settings.GracePeriod == 0 {
 		c.Settings.GracePeriod = 24 * time.Hour
 	}
