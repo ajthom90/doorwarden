@@ -802,7 +802,8 @@ func TestGatherObserved(t *testing.T) {
 	f2.FailNext("ListRecords", errors.New("unreachable"))
 	provs := map[string]dns.Provider{dzp: f1, "p2": f2}
 	zones := []ZoneRef{{dzp, "Example.Test."}, {dzp, dz}, {"p2", "other.test"}, {"p3", "third.test"}}
-	owned, foreign, errs := GatherObserved(ctx, provs, st, zones, 0)
+	obs, errs := GatherObserved(ctx, provs, st, zones, 0)
+	owned, foreign := obs.Owned, obs.Foreign
 	if len(owned) != 3 || owned[0].OwnerKey != "docker:app" || owned[0].Provider != dzp ||
 		owned[1].Provider != "oldp" || owned[2].OwnerKey != "docker:x" { // rows survive a failed listing
 		t.Fatalf("owned %+v", owned)
@@ -825,7 +826,8 @@ func TestGatherObserved(t *testing.T) {
 	}
 
 	// an empty successful listing is present and empty
-	_, foreign, errs = GatherObserved(ctx, map[string]dns.Provider{"p2": f2}, st, []ZoneRef{{"p2", "empty.test"}}, 0)
+	obs, errs = GatherObserved(ctx, map[string]dns.Provider{"p2": f2}, st, []ZoneRef{{"p2", "empty.test"}}, 0)
+	foreign = obs.Foreign
 	if v, ok := foreign["p2/empty.test"]; !ok || len(v) != 0 || len(errs) != 0 {
 		t.Fatalf("foreign %+v errs %v", foreign, errs)
 	}
@@ -837,8 +839,9 @@ func TestGatherObservedOwnershipReadFails(t *testing.T) {
 	st := openStore(t)
 	f1 := fake.New(true)
 	bad := &listFailStore{OwnershipStore: st}
-	owned, foreign, errs := GatherObserved(context.Background(), map[string]dns.Provider{dzp: f1}, bad, []ZoneRef{{dzp, dz}}, 0)
-	if len(owned) != 0 || len(foreign) != 0 || len(errs) != 1 {
+	obs, errs := GatherObserved(context.Background(), map[string]dns.Provider{dzp: f1}, bad, []ZoneRef{{dzp, dz}}, 0)
+	owned, foreign := obs.Owned, obs.Foreign
+	if len(owned) != 0 || len(foreign) != 0 || len(errs) != 1 || len(obs.OwnedMissing) != 0 || len(obs.OwnedDrifted) != 0 {
 		t.Fatalf("owned %+v foreign %+v errs %v", owned, foreign, errs)
 	}
 	if n := len(f1.Calls()); n != 0 {

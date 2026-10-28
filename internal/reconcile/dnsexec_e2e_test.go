@@ -23,6 +23,7 @@ type world struct {
 	cfg    *config.Config
 	st     *store.Store
 	fk     *fake.Fake
+	prov   dns.Provider // fk, or a test wrapper around it
 	runner *Runner
 	// clock is the executors' now: each cycle sets it to the plan's time.
 	clock time.Time
@@ -30,9 +31,17 @@ type world struct {
 
 func newWorld(t *testing.T, mode string) *world {
 	t.Helper()
+	return newWorldWith(t, mode, func(f *fake.Fake) dns.Provider { return f })
+}
+
+// newWorldWith is newWorld with the provider wrapped (both the gather and
+// the executor use the wrapper).
+func newWorldWith(t *testing.T, mode string, wrap func(*fake.Fake) dns.Provider) *world {
+	t.Helper()
 	w := &world{t: t, cfg: dnsCfg(dnsZoneCfg(dz, mode)), st: openStore(t), fk: fake.New(true), clock: t0}
+	w.prov = wrap(w.fk)
 	now := func() time.Time { return w.clock }
-	de, err := NewDNSExecutor(DNSExecutorConfig{Config: w.cfg, Providers: map[string]dns.Provider{dzp: w.fk},
+	de, err := NewDNSExecutor(DNSExecutorConfig{Config: w.cfg, Providers: map[string]dns.Provider{dzp: w.prov},
 		Store: w.st, Activity: w.st, Now: now})
 	if err != nil {
 		t.Fatal(err)
@@ -53,8 +62,10 @@ func (w *world) observe(ctx context.Context) Observed {
 		w.t.Fatal(err)
 	}
 	known, lk := ObservedFromRoutes(routes)
-	owned, foreign, _ := GatherObserved(ctx, map[string]dns.Provider{dzp: w.fk}, w.st, DNSZoneRefs(w.cfg), 0)
-	return Observed{Owned: owned, Foreign: foreign, Known: known, LastKnown: lk}
+	dobs, _ := GatherObserved(ctx, map[string]dns.Provider{dzp: w.prov}, w.st, DNSZoneRefs(w.cfg), 0)
+	o := Observed{Known: known, LastKnown: lk}
+	dobs.Fill(&o)
+	return o
 }
 
 func (w *world) cycle(now time.Time, desired ...model.Service) ([]Action, error) {

@@ -203,6 +203,12 @@ func (p *planner) planOrphans(entries []entry, winners map[string]claimant) {
 				base.Kind, base.Svc, base.Reason = DNSCancelRemoval, copySvc(ow.svc), "record is wanted again"
 				p.emit(base)
 			}
+			if !ensured[rk] && sameValue(o.Value, z.value) {
+				// a hostname loser's wanted row (a winner's was checked by
+				// ensureRecord): report drift, repair it when missing
+				oc, sv := o, ow.svc
+				p.ownedPresence(z, &oc, owner, &sv)
+			}
 			continue
 		}
 		if ensured[rk] {

@@ -89,6 +89,9 @@ func sum(a Action) string {
 	if a.Backend != nil {
 		s += fmt.Sprintf(" ->%s:%d", a.Backend.Host, a.Backend.Port)
 	}
+	if a.Repair {
+		s += " repair"
+	}
 	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
 }
 

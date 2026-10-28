@@ -92,6 +92,13 @@ type Action struct {
 	// NewOwner is the owner key a DNSReassign transfers the row to (the
 	// service key of Svc).
 	NewOwner string
+	// Repair marks a DNSEnsure that re-creates an owned record which a
+	// successful listing showed missing at the provider (Observed.
+	// OwnedMissing). Record carries the stored row's identity (ID = the row's
+	// provider record ID, the stored value). The executor re-checks the row
+	// and its own listing, never writes over a record it does not own, and
+	// bounds attempts with a backoff (see doc.go).
+	Repair bool
 	// Names are the certificate names for CertEnsure; Issuer its issuer key.
 	Names  []string
 	Issuer string
@@ -146,6 +153,21 @@ type Observed struct {
 	LastKnown map[string]model.Backend
 	// Known maps a service key to a previously published service.
 	Known map[string]KnownService
+	// OwnedMissing holds OwnedRowKey of every Owned row whose normalized
+	// name+type is absent from a SUCCESSFUL listing of its provider/zone.
+	// Rows of a pair that was not listed are never in it (unknown).
+	OwnedMissing map[string]bool
+	// OwnedDrifted maps OwnedRowKey of every Owned row whose name+type is
+	// listed but with none of the records carrying the stored value, to
+	// what is listed there (normalized). Informational: Plan reports it and
+	// never overwrites it.
+	OwnedDrifted map[string][]dns.Record
+}
+
+// OwnedRowKey identifies an ownership row in Observed.OwnedMissing and
+// Observed.OwnedDrifted: provider|zone|name|TYPE, normalized.
+func OwnedRowKey(provider, zone, name, typ string) string {
+	return provider + "|" + normName(zone) + "|" + normName(name) + "|" + normType(typ)
 }
 
 // WildcardOwnerKey is the owner_key used for a zone's "*.zone" record.

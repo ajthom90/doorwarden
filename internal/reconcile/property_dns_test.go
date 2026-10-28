@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/config"
+	"github.com/ajthom90/doorwarden/internal/dns"
 	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/store"
 )
@@ -298,5 +299,142 @@ func TestPropertyDNSOrphanInvariants(t *testing.T) {
 		if v == 0 {
 			t.Errorf("%s is 0: the check never ran", n)
 		}
+	}
+}
+
+// genDriftProp extends a genDNSProp case with drift: rows of listed zones
+// are randomly missing at the provider or changed out of band, and foreign
+// records (a CNAME, or a record of the row's type) randomly sit at owned
+// names. It draws from r only after genDNSProp, so the base cases are the
+// same as TestPropertyDNSOrphanInvariants'.
+func genDriftProp(r *rand.Rand) dnsPropCase {
+	c := genDNSProp(r)
+	c.obs.OwnedMissing, c.obs.OwnedDrifted = map[string]bool{}, map[string][]dns.Record{}
+	for _, o := range c.obs.Owned {
+		if _, ok := c.obs.Foreign[o.Provider+"/"+o.Zone]; !ok {
+			continue // not listed: unknown
+		}
+		k := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+		switch r.Intn(6) {
+		case 0, 1, 2:
+			c.obs.OwnedMissing[k] = true
+			c.desc = append(c.desc, "missing "+k)
+		case 3:
+			c.obs.OwnedDrifted[k] = []dns.Record{{ID: "x", Name: o.Name, Type: o.Type, Value: ipFX}}
+			c.desc = append(c.desc, "drifted "+k)
+		}
+		if r.Intn(6) == 0 {
+			typ := []string{"CNAME", "AAAA", "A", "TXT"}[r.Intn(4)]
+			if typ == o.Type {
+				continue // a record at an owned name+type is never foreign
+			}
+			f := dns.Record{ID: "f", Name: o.Name, Type: typ, Value: "foreign.test"}
+			c.obs.Foreign["dnsp/"+o.Zone] = append(c.obs.Foreign["dnsp/"+o.Zone], f)
+			c.desc = append(c.desc, "foreign "+o.Name+" "+typ)
+		}
+	}
+	return c
+}
+
+func TestPropertyDNSRepairInvariants(t *testing.T) {
+	var repaired, completeChecked, drifted int
+	for seed := int64(0); seed < dnsPropSeeds; seed++ {
+		r := rand.New(rand.NewSource(seed))
+		c := genDriftProp(r)
+		acts := Plan(c.desired, c.obs, c.cfg, t0)
+		fail := func(f string, a ...any) {
+			t.Helper()
+			t.Fatalf("seed %d: %s\ncase %v\nunavailable %v\nacts %v", seed, fmt.Sprintf(f, a...), c.desc, c.unavailable, sums(acts))
+		}
+		checkNoEnsureAndRemoval(t, acts)
+		present := map[string]model.Service{}
+		for _, s := range c.desired {
+			present[s.Key] = s
+		}
+		zoneVal := func(zn string) string {
+			if zn == "example.test" {
+				return c.cfg.Zones[0].TargetIP
+			}
+			return target
+		}
+		blocked := func(o store.DNSRecord) bool {
+			for _, f := range c.obs.Foreign["dnsp/"+o.Zone] {
+				if f.Name == o.Name && (f.Type == o.Type || f.Type == "CNAME") {
+					return true
+				}
+			}
+			return false
+		}
+		ensuredSlot := map[string]int{}
+		for _, a := range ofKind(acts, DNSEnsure) {
+			ensuredSlot[OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)]++
+		}
+		got := map[string]int{}
+		for _, a := range acts {
+			if !a.Repair {
+				continue
+			}
+			if a.Kind != DNSEnsure {
+				fail("Repair on %s", sum(a))
+			}
+			var o *store.DNSRecord
+			for i := range c.obs.Owned {
+				x := &c.obs.Owned[i]
+				if x.Provider == a.Provider && x.Zone == a.Zone && x.Name == a.Record.Name && x.Type == a.Record.Type {
+					o = x
+				}
+			}
+			if o == nil {
+				fail("repair of a row that is not owned: %s", sum(a))
+			}
+			k := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+			got[k]++
+			repaired++
+			if got[k] > 1 || ensuredSlot[k] > 1 {
+				fail("two ensures for one row: %s", sum(a))
+			}
+			if !c.obs.OwnedMissing[k] || c.obs.OwnedDrifted[k] != nil {
+				fail("repair of a row that is not missing: %s", sum(a))
+			}
+			if a.Owner != o.OwnerKey || a.Record.ID != o.ProviderRecordID || a.Record.Value != o.Value || a.Record.Value != zoneVal(o.Zone) {
+				fail("repair does not carry the stored row: %s", sum(a))
+			}
+			if blocked(*o) {
+				fail("repair over a foreign record: %s", sum(a))
+			}
+			if strings.HasPrefix(o.Name, "*.") {
+				if o.OwnerKey != WildcardOwnerKey(o.Zone) || c.modes[o.Zone] != "wildcard" {
+					fail("repair of a wildcard row outside wildcard mode or not zone-owned: %s", sum(a))
+				}
+				continue
+			}
+			s, isPresent := present[o.OwnerKey]
+			if !isPresent || !propWanted(c, s, *o) || propProtected(c, s) || c.unavailable[s.Source] {
+				fail("repair for an orphan, protected or unavailable owner: %s", sum(a))
+			}
+		}
+		for _, o := range c.obs.Owned {
+			k := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+			if c.obs.OwnedDrifted[k] != nil {
+				drifted++
+				if ensuredSlot[k] > 0 {
+					fail("ensure over a record changed out of band: %s", k)
+				}
+				continue
+			}
+			s, isPresent := present[o.OwnerKey]
+			if !c.obs.OwnedMissing[k] || !isPresent || !propWanted(c, s, o) || propProtected(c, s) ||
+				o.Value != zoneVal(o.Zone) || blocked(o) {
+				continue
+			}
+			completeChecked++
+			if got[k] != 1 {
+				fail("wanted missing row %s not repaired", k)
+			}
+		}
+	}
+	t.Logf("repaired %d, complete-checked %d, drifted %d", repaired, completeChecked, drifted)
+	if repaired == 0 || completeChecked == 0 || drifted == 0 {
+		t.Error("a check never ran")
 	}
 }

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -82,6 +83,18 @@ type DNSExecutorConfig struct {
 	Now func() time.Time
 	// CallTimeout bounds each provider call; 0 means DefaultDNSCallTimeout.
 	CallTimeout time.Duration
+	// RepairState keeps the drift-repair backoff (kv). nil means Store, when
+	// it implements RepairStateStore (*store.Store does); without either,
+	// every repair is refused.
+	RepairState RepairStateStore
+}
+
+// RepairStateStore is a small key/value store (*store.Store implements it
+// with its kv table) holding the per-record drift-repair backoff.
+type RepairStateStore interface {
+	GetSetting(ctx context.Context, key string) (string, bool, error)
+	SetSetting(ctx context.Context, key, value string) error
+	DeleteSetting(ctx context.Context, key string) error
 }
 
 type dnsZone struct{ name, provider, mode string }
@@ -116,6 +129,14 @@ type dnsZone struct{ name, provider, mode string }
 //     deleted again (by its returned ID, or by exact name/type/value when
 //     the provider returned none, which the listing proved was free) unless
 //     an ownership row now references it, and an error names the record.
+//
+// DNSEnsure with Repair (an owned record the listing showed missing): the
+// sameValue early return is bypassed. The stored row must still match the
+// action (owner, value, provider ID, no schedule), the per-record backoff
+// must be due, and a FRESH listing must show neither our record (present:
+// no-op, backoff reset) nor any record blocking the name (Conflict,
+// ErrForeignRecord); then the guarded create re-creates it and refreshes the
+// same row. See the package documentation, "Drift repair".
 //
 // DNSDelete: only a row for (provider, zone, name, type) whose owner key
 // equals Action.Owner is deleted, using the STORED ID, name, type and value
@@ -163,7 +184,7 @@ type dnsZone struct{ name, provider, mode string }
 // ownership row is written from that record (its provider ID may be empty),
 // the action succeeds, a warn activity says "write accepted but
 // unconfirmed; will verify on a later cycle" and LastWarnings lists it; the
-// next cycles' drift check verifies the record exists (see Repair). This
+// next cycles' drift check verifies the record exists (Repair above). This
 // holds for a plain create, a re-create, the create step of a replace and a
 // restore. An UpdateRecord answering it with such a record keeps the row's
 // OLD value (storing the returned provider ID, if any) so the next plan
@@ -196,6 +217,7 @@ type DNSExecutor struct {
 	log       *slog.Logger
 	now       func() time.Time
 	timeout   time.Duration
+	repairKV  RepairStateStore
 
 	mu       sync.Mutex // serializes Apply (the Runner already does)
 	warnings []DNSWarning
@@ -223,6 +245,10 @@ func NewDNSExecutor(cfg DNSExecutorConfig) (*DNSExecutor, error) {
 	}
 	if e.timeout <= 0 {
 		e.timeout = DefaultDNSCallTimeout
+	}
+	e.repairKV = cfg.RepairState
+	if e.repairKV == nil {
+		e.repairKV, _ = cfg.Store.(RepairStateStore)
 	}
 	for n, p := range cfg.Providers {
 		if p != nil {
@@ -398,6 +424,9 @@ func (b *dnsBatch) apply(ctx context.Context, a Action) error {
 		return b.setRemoval(ctx, t, a)
 	case DNSReassign:
 		return b.reassign(ctx, t, a)
+	}
+	if a.Repair {
+		return b.repair(ctx, t, a)
 	}
 	return b.ensure(ctx, t)
 }
@@ -1103,6 +1132,11 @@ func (b *dnsBatch) dry(ctx context.Context, a Action) {
 		msg = fmt.Sprintf("dry run: would delete %s %s at %s (provider id %q)", t, row.Value, where, row.ProviderRecordID)
 	case t.value == "":
 		msg = fmt.Sprintf("dry run: would refuse %s at %s: record has no value", t, where)
+	case a.Repair && repairStale(row, t, a) != "":
+		msg = fmt.Sprintf("dry run: would not re-create %s at %s: %s", t, where, repairStale(row, t, a))
+	case a.Repair:
+		msg = fmt.Sprintf("dry run: would re-create missing owned record %s %s at %s (owner %s), subject to its backoff; foreign-record check not performed in dry run",
+			t, t.value, where, t.owner)
 	case row == nil:
 		msg = fmt.Sprintf("dry run: would create %s %s at %s (owner %s); pre-create foreign-record check not performed in dry run",
 			t, t.value, where, t.owner)
@@ -1189,34 +1223,201 @@ func DNSZoneRefs(cfg *config.Config) []ZoneRef {
 	return out
 }
 
-// GatherObserved builds Observed.Owned and Observed.Foreign. owned is EVERY
+// Drift repair backoff: attempts are spaced repairBackoffMin << (attempts-1),
+// capped at repairBackoffMax; a state older than repairStateStale (since its
+// last attempt) is ignored, so a new incident starts again at the minimum.
+const (
+	repairBackoffMin = time.Minute
+	repairBackoffMax = time.Hour
+	repairStateStale = 2 * time.Hour
+)
+
+// repairState is the kv value under repairKey (unix seconds).
+type repairState struct {
+	Attempts int   `json:"attempts"`
+	NextAt   int64 `json:"next_at"`
+	LastAt   int64 `json:"last_at"`
+}
+
+// repairKey is the kv key of a record's repair backoff.
+func repairKey(provider, zone, name, typ string) string {
+	return "dns/repair/" + provider + "/" + normName(zone) + "/" + normName(name) + "/" + normType(typ)
+}
+
+func repairDelay(attempts int) time.Duration {
+	if attempts < 1 {
+		return 0
+	}
+	if attempts > 7 { // 1m << 6 already exceeds the cap
+		return repairBackoffMax
+	}
+	return min(repairBackoffMin<<(attempts-1), repairBackoffMax)
+}
+
+// repairStale reports why a Repair action no longer matches the stored row
+// ("" when it does): the row must exist, belong to the action's owner, hold
+// the action's value and provider ID (Record.ID) and have no removal
+// scheduled.
+func repairStale(row *store.DNSRecord, t dnsTarget, a Action) string {
+	switch {
+	case row == nil:
+		return "no ownership row"
+	case row.OwnerKey != t.owner:
+		return "owned by " + row.OwnerKey + ", not " + t.owner
+	case !sameValue(row.Value, t.value):
+		return "the stored value is now " + row.Value
+	case strings.TrimSpace(a.Record.ID) != row.ProviderRecordID:
+		return fmt.Sprintf("the stored provider id is now %q", row.ProviderRecordID)
+	case row.RemovedAfter != nil:
+		return "its removal is scheduled"
+	}
+	return ""
+}
+
+// repair re-creates an owned record a listing showed missing (a DNSEnsure
+// with Repair). Unlike a plain ensure it does not stop at an up-to-date
+// row: after the stale-plan check and the backoff it re-lists the zone;
+// our record present (by stored ID, or by value when the row has none) is a
+// no-op that resets the backoff; any other record blocking the name is a
+// Conflict (ErrForeignRecord); otherwise the guarded create runs and the
+// same row is refreshed. Every attempt that reaches the listing counts.
+func (b *dnsBatch) repair(ctx context.Context, t dnsTarget, a Action) error {
+	e := b.e
+	if t.value == "" {
+		return fmt.Errorf("%w: record has no value", ErrDNSRefused)
+	}
+	row, err := e.ownedRow(ctx, t)
+	if err != nil {
+		return err
+	}
+	if why := repairStale(row, t, a); why != "" {
+		e.activity(ctx, "info", fmt.Sprintf("not re-creating %s at %s/%s: %s (the plan is stale)", t, t.provider, t.zone, why))
+		return nil
+	}
+	if e.repairKV == nil {
+		e.activity(ctx, "warn", fmt.Sprintf("refused to re-create missing %s at %s/%s: no store for the repair backoff", t, t.provider, t.zone))
+		return fmt.Errorf("%w: no repair backoff store", ErrDNSRefused)
+	}
+	key := repairKey(t.provider, t.zone, t.name, t.typ)
+	now := e.now()
+	st, err := loadRepairState(ctx, e.repairKV, key, now)
+	if err != nil {
+		return fmt.Errorf("reading the repair backoff of %s: %w", t, err) // never unbounded
+	}
+	if st.Attempts > 0 && now.Unix() < st.NextAt {
+		e.log.DebugContext(ctx, "owned DNS record missing; repair not due yet", "provider", t.provider, "zone", t.zone,
+			"name", t.name, "type", t.typ, "attempts", st.Attempts, "next_at", time.Unix(st.NextAt, 0).UTC())
+		return nil
+	}
+	bump := func() error {
+		st.Attempts++
+		st.LastAt, st.NextAt = now.Unix(), now.Add(repairDelay(st.Attempts)).Unix()
+		v, _ := json.Marshal(st)
+		if err := e.repairKV.SetSetting(context.WithoutCancel(ctx), key, string(v)); err != nil {
+			return fmt.Errorf("recording the repair attempt of %s: %w", t, err)
+		}
+		return nil
+	}
+	delete(b.listings, t.provider+"/"+t.zone) // re-list: the plan's listing may be stale
+	l := b.listing(ctx, t)
+	if l.err != nil {
+		e.activity(ctx, "warn", fmt.Sprintf("not re-creating missing %s at %s/%s: listing the zone failed: %v", t, t.provider, t.zone, l.err))
+		return errors.Join(fmt.Errorf("%w: %w", ErrListingUnavailable, l.err), bump())
+	}
+	stored := dns.Record{ID: row.ProviderRecordID, Name: t.name, Type: t.typ, Value: row.Value}
+	for _, r := range l.recs {
+		if normName(r.Name) == t.name && normType(r.Type) == t.typ && isOwn(r, stored) {
+			if err := e.repairKV.DeleteSetting(context.WithoutCancel(ctx), key); err != nil {
+				e.log.WarnContext(ctx, "resetting the DNS repair backoff failed", "key", key, "error", err)
+			}
+			e.activity(ctx, "info", fmt.Sprintf("%s at %s/%s is present at the provider after all (provider id %q); nothing re-created",
+				t, t.provider, t.zone, r.ID))
+			return nil
+		}
+	}
+	for _, r := range l.recs {
+		if !blocks(r, t) {
+			continue
+		}
+		e.activity(ctx, "warn", fmt.Sprintf("conflict: not re-creating missing %s at %s/%s: foreign record %s %s %s (id %q) exists; adopt or remove it",
+			t, t.provider, t.zone, normName(r.Name), normType(r.Type), r.Value, r.ID))
+		return errors.Join(fmt.Errorf("%w: %s %s %s (id %q)", ErrForeignRecord, normName(r.Name), normType(r.Type), r.Value, r.ID), bump())
+	}
+	if err := bump(); err != nil {
+		return err // without a recorded attempt the backoff cannot hold: create nothing
+	}
+	e.activity(ctx, "warn", fmt.Sprintf("owned record %s %s at %s/%s (owner %s, provider id %q) is missing at the provider; re-creating it (attempt %d)",
+		t, row.Value, t.provider, t.zone, t.owner, row.ProviderRecordID, st.Attempts))
+	_, err = b.doCreate(ctx, t, row)
+	return err
+}
+
+// loadRepairState reads key; absent, unreadable JSON or a state older than
+// repairStateStale is a fresh state.
+func loadRepairState(ctx context.Context, kv RepairStateStore, key string, now time.Time) (repairState, error) {
+	v, ok, err := kv.GetSetting(ctx, key)
+	if err != nil || !ok {
+		return repairState{}, err
+	}
+	var st repairState
+	if json.Unmarshal([]byte(v), &st) != nil || st.Attempts < 0 || now.Sub(time.Unix(st.LastAt, 0)) > repairStateStale {
+		return repairState{}, nil
+	}
+	return st, nil
+}
+
+// DNSObservation is what GatherObserved saw; Fill copies it into an
+// Observed.
+type DNSObservation struct {
+	Owned        []store.DNSRecord
+	Foreign      map[string][]dns.Record
+	OwnedMissing map[string]bool
+	OwnedDrifted map[string][]dns.Record
+}
+
+// Fill sets o's Owned, Foreign, OwnedMissing and OwnedDrifted.
+func (d DNSObservation) Fill(o *Observed) {
+	o.Owned, o.Foreign, o.OwnedMissing, o.OwnedDrifted = d.Owned, d.Foreign, d.OwnedMissing, d.OwnedDrifted
+}
+
+// GatherObserved builds Observed.Owned, Foreign, OwnedMissing and
+// OwnedDrifted. Owned is EVERY
 // ownership row in the store, of any provider or zone, including rows under
 // a provider or zone no pair names (Plan reports those with a Skip and never
-// removes them). When the rows cannot be read, owned is empty and foreign is
+// removes them). When the rows cannot be read, Owned is empty and Foreign is
 // empty for every pair (nothing is known: Plan creates and removes nothing).
-// foreign covers the given provider/zone pairs (deduplicated after
+// Foreign covers the given provider/zone pairs (deduplicated after
 // normalizing the zone) and is keyed
 // provider+"/"+zone and holds the provider's listing minus the records that
-// have an ownership row (matched on normalized name and type), records of
+// have an ownership row (matched on normalized name and type, whatever their
+// value: a record at an owned name+type is never foreign, so the executor's
+// own listing, not Foreign, is what guards a repair), records of
 // every type included, names and types normalized. A pair whose listing or
 // ownership rows could not be read, or whose provider is missing, is ABSENT
-// from foreign (unknown: Plan then creates nothing there) and its error is
-// returned in errs. A successful empty listing is present and empty. Each
-// listing runs under timeout (0 means DefaultDNSCallTimeout).
+// from Foreign (unknown: Plan then creates nothing there) and its error is
+// returned in errs. A successful empty listing is present and empty.
+//
+// For each pair listed successfully, every row of that pair is classified:
+// no listed record at its name+type puts it in OwnedMissing; listed records
+// there, none with the stored value, put it in OwnedDrifted; otherwise it is
+// present. Rows of a pair that was not listed are in neither. Each listing
+// runs under timeout (0 means DefaultDNSCallTimeout).
 func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st OwnershipStore, zones []ZoneRef,
-	timeout time.Duration) (owned []store.DNSRecord, foreign map[string][]dns.Record, errs []error) {
+	timeout time.Duration) (obs DNSObservation, errs []error) {
 	if timeout <= 0 {
 		timeout = DefaultDNSCallTimeout
 	}
-	foreign = map[string][]dns.Record{}
+	obs.Foreign = map[string][]dns.Record{}
+	obs.OwnedMissing = map[string]bool{}
+	obs.OwnedDrifted = map[string][]dns.Record{}
 	if st == nil {
-		return nil, foreign, []error{errors.New("no ownership store")}
+		return obs, []error{errors.New("no ownership store")}
 	}
 	all, err := st.ListAllOwnedRecords(ctx)
 	if err != nil {
-		return nil, foreign, []error{fmt.Errorf("reading ownership rows: %w", err)}
+		return obs, []error{fmt.Errorf("reading ownership rows: %w", err)}
 	}
-	owned = all
+	obs.Owned = all
 	seen := map[string]bool{}
 	for _, zr := range zones {
 		zn := normName(zr.Zone)
@@ -1238,21 +1439,46 @@ func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st O
 			continue
 		}
 		mine := map[string]bool{}
+		var rows []store.DNSRecord
 		for _, r := range all {
 			if r.Provider == zr.Provider && normName(r.Zone) == zn {
 				mine[normName(r.Name)+" "+normType(r.Type)] = true
+				rows = append(rows, r)
 			}
 		}
 		out := make([]dns.Record, 0, len(recs))
+		at := map[string][]dns.Record{}
 		for _, r := range recs {
 			r.Name, r.Type = normName(r.Name), normType(r.Type)
-			if !mine[r.Name+" "+r.Type] {
+			k := r.Name + " " + r.Type
+			if mine[k] {
+				at[k] = append(at[k], r)
+			} else {
 				out = append(out, r)
 			}
 		}
-		foreign[key] = out
+		obs.Foreign[key] = out
+		for _, r := range rows {
+			listed := at[normName(r.Name)+" "+normType(r.Type)]
+			rk := OwnedRowKey(r.Provider, r.Zone, r.Name, r.Type)
+			switch {
+			case len(listed) == 0:
+				obs.OwnedMissing[rk] = true
+			case !anySameValue(listed, r.Value):
+				obs.OwnedDrifted[rk] = listed
+			}
+		}
 	}
-	return owned, foreign, errs
+	return obs, errs
+}
+
+func anySameValue(rs []dns.Record, v string) bool {
+	for _, r := range rs {
+		if sameValue(r.Value, v) {
+			return true
+		}
+	}
+	return false
 }
 
 // DNSWarning is a typed, non-failing outcome of the last Apply: a provider

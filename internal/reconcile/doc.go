@@ -192,7 +192,8 @@
 // Published hostname. The record is A (or AAAA for an IPv6 target_ip) with
 // value target_ip; an unparsable target_ip yields a Skip and no DNS action
 // (routes and certs proceed). An owned row for the same (provider, zone, name,
-// type) with an equal value means nothing to do; with another value, DNSEnsure
+// type) with an equal value means nothing to do (unless the listing shows it
+// missing or changed: see Drift repair); with another value, DNSEnsure
 // carries the row's provider record ID (update). Otherwise a listed record
 // with the same name and the same type, or a CNAME, that is not owned yields
 // Conflict ("foreign record exists") and no DNSEnsure, even if its value is
@@ -377,6 +378,70 @@
 // is for the UI/admin only; reconcile never calls it (its only row deletion
 // is store.DeleteOwnedRecordIfDue).
 //
+// # Drift repair
+//
+// GatherObserved classifies every ownership row of a provider/zone it listed
+// successfully: no listed record at the row's normalized name+type puts its
+// OwnedRowKey in Observed.OwnedMissing; listed records there, none with the
+// stored value, put it in Observed.OwnedDrifted; rows of a pair whose listing
+// failed (or that was not listed) are in neither (unknown, never repaired).
+// GatherObserved strips from Foreign every record at an owned name+type,
+// whatever its value, so Plan cannot tell a foreign record there from ours:
+// the executor's own listing is the load-bearing guard of a repair.
+//
+// Plan, for a WANTED owned row with the zone's desired value:
+//   - drifted: a Skip "owned record ... changed out of band (the provider has
+//     X, doorwarden stored Y); not overwriting it" each cycle; never a write.
+//     A row whose desired value also changed is updated only when the
+//     provider already lists the desired value (our own unconfirmed update);
+//     any other out-of-band value is a Skip.
+//   - missing: DNSEnsure{Repair: true} carrying the stored row's identity
+//     (Record.ID = its provider ID, its value, Owner = its owner), emitted
+//     every cycle while it stays missing. Wanted means: the owner is a
+//     present, cleanly Published service from an available source and the
+//     row is its per-host record in a per-host zone (a hostname winner via
+//     ensureRecord, a loser via planOrphans), or the row is the "*.zone" row
+//     owned by WildcardOwnerKey in a wildcard zone with a routed service. A
+//     listed foreign record at the name (same type, or a CNAME) makes it a
+//     Conflict instead. Never repaired: orphans (absent owner, or one that no
+//     longer wants the row), protected owners (present but not cleanly
+//     Published), owners whose source is Unavailable, zones with records
+//     mode off, rows under another provider or an unconfigured zone, and
+//     zones without a listing. A scheduled wanted row is cancelled
+//     (DNSCancelRemoval runs first) and repaired in the same plan.
+//
+// The executor (DNSEnsure with Repair) does not stop at an up-to-date row:
+//  1. stale-plan check: the stored row must still exist with the action's
+//     owner, value and provider ID and no removal scheduled; otherwise
+//     nothing happens (info activity);
+//  2. backoff (kv key dns/repair/<provider>/<zone>/<name>/<type>, JSON
+//     {attempts, next_at, last_at} in unix seconds, via RepairStateStore):
+//     not due means no provider call at all. Attempt n is followed by a wait
+//     of 1m << (n-1), capped at 1h. A state whose last attempt is more than
+//     2h old is ignored (a new incident starts at 1m). Without a state store
+//     the repair is refused (ErrDNSRefused): attempts are never unbounded;
+//  3. the zone is RE-LISTED (the batch cache is dropped): a failed listing
+//     counts an attempt and returns ErrListingUnavailable; our record present
+//     (same name and type and our stored ID, or our value when the row has
+//     no ID) is a no-op that deletes the backoff state; any other record
+//     blocking the name (same type, even with an identical value, or a
+//     CNAME) counts an attempt, is a Conflict activity and ErrForeignRecord;
+//  4. otherwise the attempt is recorded (a failure to record it creates
+//     nothing) and the guarded create runs; the SAME row is refreshed
+//     (CreatedAt kept, new provider ID), with the usual rollback.
+//
+// Every attempt that reaches the listing counts, successful or not; only the
+// executor seeing our record present resets the state (plus the 2h
+// staleness). After a successful repair the plan no longer emits the repair,
+// so its state stays in kv until it goes stale (harmless: ignored after 2h;
+// a recurrence within 2h continues the backoff where it was).
+//
+// The unconfirmed-write contract feeds this: a create that answered
+// dns.ErrUnconfirmed with a usable record wrote its ownership row; if it
+// never landed the next listing shows the row missing and it is repaired;
+// if it landed but a lagging listing hides it, the repair's own listing (or
+// the provider's idempotent create) finds it and nothing is duplicated.
+//
 // # Execution
 //
 // Dry run records activity and calls no provider: MultiExecutor never
@@ -387,8 +452,10 @@
 // persist ScheduleRemoval/CancelRemoval; forget a service's Known entry once
 // its RouteRemove was applied (removal past grace, or a conflict loser);
 // pass Observed.Owned (with RemovedAfter) as EVERY ownership row in the
-// store, not only the configured provider/zone pairs (GatherObserved does
-// both); register the DNS executor for every kind in DNSActionKinds
+// store, not only the configured provider/zone pairs, plus Foreign,
+// OwnedMissing and OwnedDrifted (GatherObserved does all of it:
+// DNSObservation.Fill); give the DNS executor a RepairStateStore (a
+// *store.Store as its Store is enough) or every repair is refused; register the DNS executor for every kind in DNSActionKinds
 // (RegisterDNSExecutor; it persists, reassigns and forgets ownership rows
 // itself) and the route executor for RouteWrite, RouteRemove,
 // ScheduleRemoval and CancelRemoval (its store must implement

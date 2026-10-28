@@ -48,6 +48,8 @@ type planner struct {
 	mwValid    map[string]bool
 	mwExternal []string
 	out        []Action
+	// presenceChecked: OwnedRowKey of rows ownedPresence already handled.
+	presenceChecked map[string]bool
 }
 
 // Plan computes the actions that bring the world in line with desired. It is
@@ -401,7 +403,9 @@ func (p *planner) planZone(z *zoneInfo, hosts []string) {
 
 // ensureRecord emits DNSEnsure for name unless an owned record already has
 // the desired value, or Conflict if a foreign record holds the name. key is
-// the service key ("" for the wildcard record).
+// the service key ("" for the wildcard record). An owned record with the
+// desired value that a listing showed missing is repaired (see
+// ownedPresence).
 func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) {
 	owner := key
 	if owner == "" {
@@ -415,6 +419,9 @@ func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) 
 	want := dns.Record{Name: name, Type: z.recType, Value: z.value}
 	if o := p.owned(z, name, z.recType); o != nil {
 		if sameValue(o.Value, z.value) {
+			if o.OwnerKey == owner {
+				p.ownedPresence(z, o, key, s)
+			}
 			return // idempotent; ownership transfer between keys is not the plan's job
 		}
 		if o.OwnerKey != owner {
@@ -425,30 +432,100 @@ func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) 
 					name, z.recType, o.OwnerKey, o.OwnerKey)})
 			return
 		}
+		if d, ok := p.obs.OwnedDrifted[OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)]; ok && !anySameValue(d, z.value) {
+			// Changed out of band to neither the stored nor the desired
+			// value: someone else's edit is never overwritten. (Listed with
+			// the desired value is our own unconfirmed update: the update is
+			// repeated, idempotently.)
+			p.emit(p.driftSkip(z, o, key, s, d))
+			return
+		}
 		want.ID = o.ProviderRecordID
 		p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 			Record: &want, Owner: owner, Reason: "owned record has a different value"})
 		return
 	}
-	listing, listed := p.foreign[z.provider+"/"+z.name]
-	if !listed {
+	if _, listed := p.foreign[z.provider+"/"+z.name]; !listed {
 		p.emit(Action{Kind: Skip, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 			Reason: fmt.Sprintf("foreign records for %s/%s unknown; not creating %s", z.provider, z.name, name)})
 		return
 	}
-	for _, f := range listing {
-		ft := normType(f.Type)
-		if normName(f.Name) != name || (ft != z.recType && ft != "CNAME") || p.owned(z, name, ft) != nil {
-			continue
-		}
-		fr := dns.Record{ID: f.ID, Name: normName(f.Name), Type: ft, Value: f.Value, TTL: f.TTL}
+	if fr := p.foreignBlocker(z, name); fr != nil {
 		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
-			Record: &fr, Owner: owner,
+			Record: fr, Owner: owner,
 			Reason: fmt.Sprintf("foreign record exists: %s %s %s (adopt or skip it)", fr.Name, fr.Type, fr.Value)})
 		return
 	}
 	p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 		Record: &want, Owner: owner})
+}
+
+// foreignBlocker returns the first listed foreign record at name that a
+// create of the zone's record type would collide with (same type, or a
+// CNAME), or nil.
+func (p *planner) foreignBlocker(z *zoneInfo, name string) *dns.Record {
+	for _, f := range p.foreign[z.provider+"/"+z.name] {
+		ft := normType(f.Type)
+		if normName(f.Name) != name || (ft != z.recType && ft != "CNAME") || p.owned(z, name, ft) != nil {
+			continue
+		}
+		return &dns.Record{ID: f.ID, Name: normName(f.Name), Type: ft, Value: f.Value, TTL: f.TTL}
+	}
+	return nil
+}
+
+// ownedPresence checks a wanted owned row o (owner o.OwnerKey, value equal to
+// the zone's desired value) against the provider listing: changed out of
+// band is reported with a Skip and never overwritten; missing is repaired
+// with DNSEnsure{Repair: true} carrying the stored row's identity, unless
+// the owner's source is unavailable or a foreign record now holds the name
+// (Conflict). s is the owner's service (nil for the wildcard row).
+func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service) {
+	rk := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+	if p.presenceChecked[rk] {
+		return // once per row (a winner's row is not re-checked for its owner as a loser)
+	}
+	if p.presenceChecked == nil {
+		p.presenceChecked = map[string]bool{}
+	}
+	p.presenceChecked[rk] = true
+	if d, ok := p.obs.OwnedDrifted[rk]; ok {
+		p.emit(p.driftSkip(z, o, key, s, d))
+		return
+	}
+	if !p.obs.OwnedMissing[rk] {
+		return
+	}
+	if s != nil && (s.Source == "" || p.obs.Unavailable[s.Source]) {
+		return // the owner's state is unknown this cycle
+	}
+	if _, listed := p.foreign[z.provider+"/"+z.name]; !listed {
+		return // unknown: never repair blind
+	}
+	name := normName(o.Name)
+	if fr := p.foreignBlocker(z, name); fr != nil {
+		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Record: fr, Owner: o.OwnerKey,
+			Reason: fmt.Sprintf("owned record %s %s is missing and a foreign record exists: %s %s %s; not re-creating it (adopt or remove it)",
+				name, z.recType, fr.Name, fr.Type, fr.Value)})
+		return
+	}
+	p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+		Record: &dns.Record{ID: o.ProviderRecordID, Name: name, Type: z.recType, Value: z.value}, Owner: o.OwnerKey,
+		Repair: true, Reason: "owned record is missing at the provider; re-creating it"})
+}
+
+// driftSkip reports an owned record whose value was changed out of band.
+func (p *planner) driftSkip(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service, listed []dns.Record) Action {
+	vals := make([]string, 0, len(listed))
+	for _, r := range listed {
+		vals = append(vals, r.Value)
+	}
+	name := normName(o.Name)
+	rec := dns.Record{ID: o.ProviderRecordID, Name: name, Type: normType(o.Type), Value: o.Value}
+	return Action{Kind: Skip, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider, Record: &rec,
+		Owner: o.OwnerKey, Reason: fmt.Sprintf("owned record %s %s changed out of band (the provider has %s, doorwarden stored %s); not overwriting it",
+			name, rec.Type, strings.Join(vals, ", "), o.Value)}
 }
 
 // owned returns the ownership row for (provider, zone, name, type), if any.
