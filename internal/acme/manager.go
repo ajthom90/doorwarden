@@ -406,6 +406,10 @@ type Result struct {
 	// Skipped is true when the certificate was intentionally not renewed
 	// (imported, staging/production mismatch, zone without issuer).
 	Skipped bool
+	// Dropped lists requested names that were not valid host names (see
+	// canonName) and were left out of the request; the rest proceeded. A
+	// warning is logged for each.
+	Dropped []string
 }
 
 // Issue orders the certificate for req, which must resolve to exactly one
@@ -416,7 +420,7 @@ func (m *Manager) Issue(ctx context.Context, req IssueRequest) (*Bundle, error) 
 }
 
 func (m *Manager) issue(ctx context.Context, req IssueRequest) (*Bundle, error) {
-	z, sets, err := m.resolveRequest(req)
+	z, sets, _, err := m.resolveRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -433,31 +437,38 @@ func (m *Manager) IssueAll(ctx context.Context, req IssueRequest) []Result {
 }
 
 func (m *Manager) issueAll(ctx context.Context, req IssueRequest) []Result {
-	z, sets, err := m.resolveRequest(req)
+	z, sets, dropped, err := m.resolveRequest(req)
 	if err != nil {
-		return []Result{{Zone: normName(req.Zone), Names: req.Names, Err: err}}
+		return []Result{{Zone: normName(req.Zone), Names: req.Names, Err: err, Dropped: dropped}}
 	}
 	out := make([]Result, 0, len(sets))
 	for _, s := range sets {
-		out = append(out, m.issueSet(ctx, z, s, certID(z.Name, s), false))
+		r := m.issueSet(ctx, z, s, certID(z.Name, s), false)
+		r.Dropped = dropped
+		out = append(out, r)
 	}
 	return out
 }
 
-func (m *Manager) resolveRequest(req IssueRequest) (config.Zone, [][]string, error) {
+// resolveRequest plans req's name sets. Invalid names are dropped (and
+// logged as a warning); they are returned so callers can report them.
+func (m *Manager) resolveRequest(req IssueRequest) (config.Zone, [][]string, []string, error) {
 	z, ok := m.zone(req.Zone)
 	if !ok {
-		return z, nil, fmt.Errorf("acme: zone %q is not configured", req.Zone)
+		return z, nil, nil, fmt.Errorf("acme: zone %q is not configured", req.Zone)
 	}
 	if z.Certificate.Issuer == "" {
-		return z, nil, ErrNoIssuer
+		return z, nil, nil, ErrNoIssuer
 	}
 	strategy := req.Strategy
 	if strategy == "" {
 		strategy = zoneStrategy(z)
 	}
-	sets, err := planSets(z.Name, req.Names, strategy, zoneChallenge(z))
-	return z, sets, err
+	sets, dropped, err := planSets(z.Name, req.Names, strategy, zoneChallenge(z))
+	for _, d := range dropped {
+		m.log.Warn("acme: invalid certificate name dropped", "zone", normName(z.Name), "name", fmt.Sprintf("%q", d))
+	}
+	return z, sets, dropped, err
 }
 
 // effectiveDirectory resolves an issuer's directory, honoring an explicit
@@ -1000,7 +1011,10 @@ func (m *Manager) renewNow(ctx context.Context, certID string) Result {
 		return Result{CertID: certID, Zone: r.Zone, Names: rowNames(r), Err: ErrNoIssuer}
 	}
 	names := rowNames(r)
-	if _, err := planSets(z.Name, names, StrategySAN, zoneChallenge(z)); err != nil {
+	if _, dropped, err := planSets(z.Name, names, StrategySAN, zoneChallenge(z)); err != nil || len(dropped) > 0 {
+		if err == nil {
+			err = &nameError{name: dropped[0], why: "stored certificate name is no longer valid"}
+		}
 		return Result{CertID: certID, Zone: r.Zone, Names: names, Err: err}
 	}
 	if r.Managed && !r.NotAfter.IsZero() {

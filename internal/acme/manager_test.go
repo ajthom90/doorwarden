@@ -538,3 +538,23 @@ func TestIssueRejectsBadRequests(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 }
+
+// A bad name in a request is dropped (warning logged, reported in Result),
+// the valid names are still ordered.
+func TestIssueAllDropsInvalidNames(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	res := h.m.IssueAll(ctx, IssueRequest{Zone: "other.test", Names: []string{"a.other.test", "bad_name.other.test", "b.other.test\n"}})
+	if len(res) != 1 || res[0].Err != nil || strings.Join(res[0].Names, ",") != "a.other.test" {
+		t.Fatalf("%+v", res)
+	}
+	if strings.Join(res[0].Dropped, "|") != "bad_name.other.test|b.other.test\n" {
+		t.Fatalf("dropped %q", res[0].Dropped)
+	}
+	if h.ca.count() != 1 || strings.Join(h.ca.last().Names, ",") != "a.other.test" {
+		t.Fatal("wrong orders")
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "invalid certificate name dropped") || !strings.Contains(logs, `b.other.test\\n`) {
+		t.Fatalf("no warning: %s", logs)
+	}
+}

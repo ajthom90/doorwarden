@@ -66,7 +66,7 @@ func (m *Manager) importPEM(ctx context.Context, zone string, fullchainPEM, keyP
 		return nil, errors.New("acme: import: certificate has no DNS names")
 	}
 	for _, n := range names {
-		if err := checkName(z, n); err != nil {
+		if _, err := checkName(z, n); err != nil {
 			return nil, fmt.Errorf("acme: import: %w", err)
 		}
 	}
@@ -201,7 +201,7 @@ func (m *Manager) zoneFor(names []string) string {
 		zn := normName(z.Name)
 		ok := len(names) > 0
 		for _, n := range names {
-			if checkName(zn, n) != nil {
+			if _, err := checkName(zn, n); err != nil {
 				ok = false
 				break
 			}
