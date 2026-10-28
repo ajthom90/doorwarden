@@ -1,4 +1,7 @@
 // Package config loads and validates the proxypilot YAML configuration.
+//
+// Note: in flow-style mappings placeholders must be quoted ({k: "${V}"}),
+// because braces are YAML syntax.
 package config
 
 import (
@@ -74,6 +77,7 @@ type StaticService struct {
 	Name     string `yaml:"name"`
 	Host     string `yaml:"host"`
 	Upstream string `yaml:"upstream"`
+	Port     int    `yaml:"port"`
 }
 
 type Settings struct {

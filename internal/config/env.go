@@ -35,17 +35,30 @@ func substituteEnv(in string, env func(string) (string, bool)) (string, error) {
 }
 
 // substituteNode expands variables only inside string scalar values of the
-// node tree (never keys, comments or non-string scalars). Results stay plain
-// strings and are never re-parsed. Missing variables are collected in missing.
+// node tree (never keys, comments or non-string scalars). Missing variables
+// are collected in missing. Under the top-level "providers" subtree results
+// are always plain strings. Elsewhere, an unquoted scalar that is exactly one
+// placeholder takes the type (bool/int/float only) its substituted text
+// resolves to; quoted or mixed text always stays a string. Substituted text
+// is never re-parsed as YAML structure.
 func substituteNode(n *yaml.Node, env func(string) (string, bool), missing *[]string) {
+	walkNode(n, env, missing, true, false)
+}
+
+func walkNode(n *yaml.Node, env func(string) (string, bool), missing *[]string, top, strOnly bool) {
 	switch n.Kind {
-	case yaml.DocumentNode, yaml.SequenceNode:
+	case yaml.DocumentNode:
 		for _, c := range n.Content {
-			substituteNode(c, env, missing)
+			walkNode(c, env, missing, top, strOnly)
+		}
+	case yaml.SequenceNode:
+		for _, c := range n.Content {
+			walkNode(c, env, missing, false, strOnly)
 		}
 	case yaml.MappingNode:
-		for i := 1; i < len(n.Content); i += 2 { // skip keys
-			substituteNode(n.Content[i], env, missing)
+		for i := 0; i+1 < len(n.Content); i += 2 { // skip keys
+			so := strOnly || (top && n.Content[i].Value == "providers")
+			walkNode(n.Content[i+1], env, missing, false, so)
 		}
 	case yaml.ScalarNode:
 		if n.ShortTag() != "!!str" || !envRe.MatchString(n.Value) {
@@ -60,8 +73,32 @@ func substituteNode(n *yaml.Node, env func(string) (string, bool), missing *[]st
 			}
 			return
 		}
+		tag := "!!str"
+		if !strOnly && n.Style == 0 && envRe.FindString(n.Value) == n.Value {
+			tag = resolveScalar(out)
+		}
 		n.Value = out
-		n.Tag = "!!str"
-		n.Style = yaml.DoubleQuotedStyle
+		n.Tag = tag
+		if tag == "!!str" {
+			n.Style = yaml.DoubleQuotedStyle
+		}
 	}
+}
+
+// resolveScalar returns !!bool, !!int or !!float if s on its own is exactly
+// such a YAML scalar, otherwise !!str.
+func resolveScalar(s string) string {
+	var d yaml.Node
+	if err := yaml.Unmarshal([]byte(s), &d); err != nil || d.Kind != yaml.DocumentNode || len(d.Content) != 1 {
+		return "!!str"
+	}
+	c := d.Content[0]
+	if c.Kind != yaml.ScalarNode || c.Value != s {
+		return "!!str"
+	}
+	switch t := c.ShortTag(); t {
+	case "!!bool", "!!int", "!!float":
+		return t
+	}
+	return "!!str"
 }

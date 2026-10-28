@@ -196,3 +196,71 @@ func TestValidateNilCaps(t *testing.T) {
 		t.Fatalf("errs = %v", errs)
 	}
 }
+
+func TestTypedSubstitution(t *testing.T) {
+	yml := base + "settings:\n  dry_run: ${DRY}\n  poll_interval: ${POLL}\nstatic:\n  - name: ${N}\n    port: ${PORT}\n"
+	c, err := loadStr(t, yml, map[string]string{"DRY": "true", "POLL": "45s", "N": "123", "PORT": "8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Settings.DryRun || c.Settings.PollInterval.String() != "45s" {
+		t.Fatalf("settings = %+v", c.Settings)
+	}
+	if c.Static[0].Name != "123" || c.Static[0].Port != 8080 {
+		t.Fatalf("static = %+v", c.Static[0])
+	}
+}
+
+func TestTypedZoneNameFromInt(t *testing.T) {
+	yml := strings.Replace(base, "name: example.test", "name: ${N}", 1)
+	c, err := loadStr(t, yml, map[string]string{"N": "123"})
+	if err != nil || c.Zones[0].Name != "123" {
+		t.Fatalf("err=%v c=%+v", err, c)
+	}
+}
+
+func TestQuotedPlaceholderStaysString(t *testing.T) {
+	_, err := loadStr(t, base+"settings:\n  dry_run: \"${DRY}\"\n", map[string]string{"DRY": "true"})
+	if err == nil || !strings.Contains(err.Error(), "dry_run") && !strings.Contains(err.Error(), "bool") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMixedPlaceholderStaysString(t *testing.T) {
+	_, err := loadStr(t, base+"settings:\n  dry_run: x${DRY}\n", map[string]string{"DRY": "true"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestProvidersAlwaysStrings(t *testing.T) {
+	for _, v := range []string{"true", "123", "null", "1.5"} {
+		c := tokenWith(t, `"${T}"`, map[string]string{"T": v})
+		if got := c.Providers["cf"].Extra["api_token"]; got != v {
+			t.Errorf("T=%s became %#v", v, got)
+		}
+	}
+}
+
+func TestTypedPlainStillSafe(t *testing.T) {
+	for _, v := range []string{"abc #x", "a: b", "null", "~", "x\ny: 1"} {
+		_, err := loadStr(t, base+"static:\n  - name: ${S}\n", map[string]string{"S": v})
+		if err != nil {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+	c, _ := loadStr(t, base+"static:\n  - name: ${S}\n", map[string]string{"S": "abc #x"})
+	if c.Static[0].Name != "abc #x" {
+		t.Fatalf("got %q", c.Static[0].Name)
+	}
+}
+
+func TestProvidersBlockPlainStaysString(t *testing.T) {
+	yml := "providers:\n  cf:\n    type: cloudflare\n    api_token: ${T}\n"
+	for _, v := range []string{"true", "123"} {
+		c, err := loadStr(t, yml, map[string]string{"T": v})
+		if err != nil || c.Providers["cf"].Extra["api_token"] != v {
+			t.Fatalf("T=%s err=%v c=%+v", v, err, c)
+		}
+	}
+}
