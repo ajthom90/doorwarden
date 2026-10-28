@@ -8,15 +8,23 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/ajthom90/doorwarden/internal/model"
 )
 
 // ErrRouteNotFound is returned by SetRouteRemoval when no route exists for
 // the key. Nothing is written in that case.
 var ErrRouteNotFound = errors.New("store: route not found")
 
+// ErrInvalidRoute is wrapped by UpsertRoute when the route fails validation.
+var ErrInvalidRoute = errors.New("store: invalid route")
+
 // Route is one persisted route, keyed by service key. It is the source of
 // truth the Traefik writer renders from; only the reconciler's route actions
 // change it.
+//
+// Host is stored unbracketed (an IPv6 literal is "2001:db8::1", never
+// "[2001:db8::1]"); URL builders MUST use net.JoinHostPort(Host, port).
 type Route struct {
 	Key, Source, Zone, Hostname, Scheme, Host string
 	Port                                      int
@@ -33,23 +41,21 @@ func normRouteName(n string) string {
 	return strings.TrimRight(strings.ToLower(strings.TrimSpace(n)), ".")
 }
 
-// normalize returns r with names normalized, or an error if r cannot be
-// routed. A route with an empty backend can never be persisted.
+// normalize returns r with zone/hostname normalized and a bracketed IPv6
+// host unbracketed, or an ErrInvalidRoute error if r cannot be routed. A
+// route with an empty or invalid backend can never be persisted. The backend
+// check is model.ValidateBackend, the same predicate the reconcile plan uses.
 func (r Route) normalize() (Route, error) {
-	r.Key = strings.TrimSpace(r.Key)
-	r.Source = strings.TrimSpace(r.Source)
 	r.Zone = normRouteName(r.Zone)
 	r.Hostname = normRouteName(r.Hostname)
-	r.Scheme = strings.ToLower(strings.TrimSpace(r.Scheme))
-	r.Host = strings.TrimSpace(r.Host)
 	var probs []string
-	if r.Key == "" {
-		probs = append(probs, "empty key")
+	if r.Key == "" || strings.TrimSpace(r.Key) != r.Key {
+		probs = append(probs, "key must be non-empty without surrounding whitespace")
 	}
 	// An empty source would make the reconciler treat the route as "source
 	// unknown" forever, so it could never be removed.
-	if r.Source == "" {
-		probs = append(probs, "empty source")
+	if r.Source == "" || strings.TrimSpace(r.Source) != r.Source {
+		probs = append(probs, "source must be non-empty without surrounding whitespace")
 	}
 	if r.Zone == "" {
 		probs = append(probs, "empty zone")
@@ -57,18 +63,13 @@ func (r Route) normalize() (Route, error) {
 	if r.Hostname == "" {
 		probs = append(probs, "empty hostname")
 	}
-	if r.Scheme != "http" && r.Scheme != "https" {
-		probs = append(probs, fmt.Sprintf("scheme %q must be http or https", r.Scheme))
-	}
-	if r.Host == "" {
-		probs = append(probs, "empty backend host")
-	}
-	if r.Port < 1 || r.Port > 65535 {
-		probs = append(probs, fmt.Sprintf("backend port %d out of range 1..65535", r.Port))
+	if err := model.ValidateBackend(model.Backend{Scheme: r.Scheme, Host: r.Host, Port: r.Port}); err != nil {
+		probs = append(probs, err.Error())
 	}
 	if len(probs) > 0 {
-		return r, fmt.Errorf("store: invalid route %q: %s", r.Key, strings.Join(probs, "; "))
+		return r, fmt.Errorf("%w %q: %s", ErrInvalidRoute, r.Key, strings.Join(probs, "; "))
 	}
+	r.Host = model.UnbracketHost(r.Host)
 	return r, nil
 }
 
@@ -80,8 +81,12 @@ func boolInt(b bool) int {
 }
 
 // UpsertRoute inserts or replaces the route for r.Key after normalizing
-// (zone/hostname lowercase without trailing dot, scheme lowercase) and
-// validating it; an invalid route returns an error and writes nothing.
+// (zone/hostname lowercase without trailing dot, IPv6 host unbracketed) and
+// validating it; an invalid route returns an ErrInvalidRoute error and
+// writes nothing. Key, source and scheme are not normalized: surrounding
+// whitespace or an uppercase scheme is invalid. When nothing but UpdatedAt
+// would change, nothing is written, so UpdatedAt is the time of the last
+// change.
 // r.RemovedAfter is ignored: an existing removal schedule is preserved and a
 // new row starts without one (use SetRouteRemoval). A zero UpdatedAt is
 // stored as the current time.
@@ -107,7 +112,11 @@ func (s *Store) UpsertRoute(ctx context.Context, r Route) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
 		ON CONFLICT(key) DO UPDATE SET source=excluded.source, zone=excluded.zone, hostname=excluded.hostname,
 			scheme=excluded.scheme, host=excluded.host, port=excluded.port, skip_verify=excluded.skip_verify,
-			websockets=excluded.websockets, middlewares_json=excluded.middlewares_json, updated_at=excluded.updated_at`,
+			websockets=excluded.websockets, middlewares_json=excluded.middlewares_json, updated_at=excluded.updated_at
+		WHERE source IS NOT excluded.source OR zone IS NOT excluded.zone OR hostname IS NOT excluded.hostname
+			OR scheme IS NOT excluded.scheme OR host IS NOT excluded.host OR port IS NOT excluded.port
+			OR skip_verify IS NOT excluded.skip_verify OR websockets IS NOT excluded.websockets
+			OR middlewares_json IS NOT excluded.middlewares_json`,
 		r.Key, r.Source, r.Zone, r.Hostname, r.Scheme, r.Host, r.Port, boolInt(r.SkipVerify), boolInt(r.Websockets),
 		string(mwJSON), toUnix(upd))
 	return err
@@ -115,7 +124,7 @@ func (s *Store) UpsertRoute(ctx context.Context, r Route) error {
 
 // DeleteRoute removes the route for key; absent is not an error.
 func (s *Store) DeleteRoute(ctx context.Context, key string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM routes WHERE key = ?`, strings.TrimSpace(key))
+	_, err := s.db.ExecContext(ctx, `DELETE FROM routes WHERE key = ?`, key)
 	return err
 }
 
@@ -123,7 +132,7 @@ func (s *Store) DeleteRoute(ctx context.Context, key string) error {
 // of key's route. It returns ErrRouteNotFound, writing nothing, when there is
 // no route for key.
 func (s *Store) SetRouteRemoval(ctx context.Context, key string, at *time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE routes SET removed_after = ? WHERE key = ?`, nullTime(at), strings.TrimSpace(key))
+	res, err := s.db.ExecContext(ctx, `UPDATE routes SET removed_after = ? WHERE key = ?`, nullTime(at), key)
 	if err != nil {
 		return err
 	}
@@ -167,7 +176,7 @@ func scanRoute(sc rowScanner) (Route, error) {
 
 // GetRoute returns the route for key; ok is false when there is none.
 func (s *Store) GetRoute(ctx context.Context, key string) (Route, bool, error) {
-	r, err := scanRoute(s.db.QueryRowContext(ctx, `SELECT `+routeCols+` FROM routes WHERE key = ?`, strings.TrimSpace(key)))
+	r, err := scanRoute(s.db.QueryRowContext(ctx, `SELECT `+routeCols+` FROM routes WHERE key = ?`, key))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Route{}, false, nil
 	}

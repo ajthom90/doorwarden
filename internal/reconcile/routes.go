@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/model"
@@ -25,12 +24,15 @@ type RouteStore interface {
 // set. Register it in a MultiExecutor for RouteWrite, RouteRemove,
 // ScheduleRemoval and CancelRemoval; other kinds are ignored.
 //
-//   - RouteWrite upserts the route for Action.Key from Action.Zone/Host,
-//     Action.Svc (Source; Options.Websockets and Options.Middlewares) and
-//     Action.Backend (Scheme, Host, Port, SkipVerify). Backend is required: a
-//     nil Backend, an empty host or a port outside 1..65535 (or a nil Svc) is
-//     an error and nothing is written. An empty Scheme is stored as "http"
-//     (the sources' default). A scheduled removal is preserved.
+//   - RouteWrite for a service whose State is not Published is a no-op: the
+//     persisted set already holds the route as last written, and a Stopped
+//     or Error service's labels (name, middlewares, websockets) are not
+//     trustworthy. Otherwise it upserts the route for Action.Key from
+//     Action.Zone/Host, Action.Svc (Source; Options.Websockets and
+//     Options.Middlewares) and Action.Backend (Scheme, Host, Port,
+//     SkipVerify). Backend is required: a nil Backend or Svc, or a backend
+//     failing model.ValidateBackend (store.ErrInvalidRoute) is an error and
+//     nothing is written. A scheduled removal is preserved.
 //   - RouteRemove deletes the route (absent is not an error). It is the ONLY
 //     way a route leaves the set.
 //   - ScheduleRemoval persists Action.RemovedAfter (required);
@@ -70,6 +72,11 @@ func (e *routeExecutor) Apply(ctx context.Context, actions []Action, dryRun bool
 func (e *routeExecutor) apply(ctx context.Context, a Action) error {
 	switch a.Kind {
 	case RouteWrite:
+		if a.Svc != nil && a.Svc.State != model.StatePublished {
+			// Stopped/Error RouteWrites carry the service's CURRENT labels
+			// (name, middlewares, ...); only Published may change a route.
+			return nil
+		}
 		r, err := routeFromAction(a, e.now())
 		if err != nil {
 			return err
@@ -104,16 +111,9 @@ func routeFromAction(a Action, now time.Time) (store.Route, error) {
 		return store.Route{}, errors.New("RouteWrite without a service")
 	}
 	b := *a.Backend
-	if !authoritative(b) || b.Port > 65535 {
-		return store.Route{}, fmt.Errorf("RouteWrite with a non-routable backend (host %q, port %d)", b.Host, b.Port)
-	}
-	scheme := strings.ToLower(strings.TrimSpace(b.Scheme))
-	if scheme == "" {
-		scheme = "http"
-	}
-	return store.Route{
+	return store.Route{ // validated by the store (model.ValidateBackend)
 		Key: a.Key, Source: a.Svc.Source, Zone: a.Zone, Hostname: a.Host,
-		Scheme: scheme, Host: b.Host, Port: b.Port, SkipVerify: b.SkipVerify,
+		Scheme: b.Scheme, Host: b.Host, Port: b.Port, SkipVerify: b.SkipVerify,
 		Websockets:  a.Svc.Options.Websockets,
 		Middlewares: append([]string(nil), a.Svc.Options.Middlewares...),
 		UpdatedAt:   now,

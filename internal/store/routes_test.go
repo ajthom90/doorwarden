@@ -18,7 +18,7 @@ func TestRoutesUpsertListGetDelete(t *testing.T) {
 	ctx := context.Background()
 	b := sampleRoute("docker:b", "b.example.test", 8081)
 	a := Route{Key: "docker:a", Source: "docker", Zone: "Example.Test.", Hostname: "A.Example.Test.",
-		Scheme: "HTTPS", Host: "198.51.100.6", Port: 8443, SkipVerify: true, Websockets: true,
+		Scheme: "https", Host: "198.51.100.6", Port: 8443, SkipVerify: true, Websockets: true,
 		Middlewares: []string{"auth@file", "gzip"}, UpdatedAt: t0}
 	for _, r := range []Route{b, a} {
 		if err := s.UpsertRoute(ctx, r); err != nil {
@@ -30,7 +30,7 @@ func TestRoutesUpsertListGetDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantA := a
-	wantA.Zone, wantA.Hostname, wantA.Scheme = "example.test", "a.example.test", "https"
+	wantA.Zone, wantA.Hostname = "example.test", "a.example.test"
 	if want := []Route{wantA, b}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("list\n got %+v\nwant %+v", got, want)
 	}
@@ -117,7 +117,19 @@ func TestUpsertRouteRejectsInvalid(t *testing.T) {
 	s, _ := openTemp(t)
 	ctx := context.Background()
 	mut := map[string]func(*Route){
-		"empty key":      func(r *Route) { r.Key = " " },
+		"empty key":      func(r *Route) { r.Key = "" },
+		"blank key":      func(r *Route) { r.Key = " " },
+		"padded key":     func(r *Route) { r.Key = " docker:a" },
+		"padded source":  func(r *Route) { r.Source = "docker " },
+		"upper scheme":   func(r *Route) { r.Scheme = "HTTP" },
+		"h2c scheme":     func(r *Route) { r.Scheme = "h2c" },
+		"host space":     func(r *Route) { r.Host = "a b" },
+		"host padded":    func(r *Route) { r.Host = " app" },
+		"host newline":   func(r *Route) { r.Host = "app\n" },
+		"host slash":     func(r *Route) { r.Host = "app/x" },
+		"host at":        func(r *Route) { r.Host = "u@app" },
+		"host port":      func(r *Route) { r.Host = "app:8080" },
+		"ipv4 port":      func(r *Route) { r.Host = "198.51.100.5:80" },
 		"empty source":   func(r *Route) { r.Source = "" },
 		"empty zone":     func(r *Route) { r.Zone = "." },
 		"empty hostname": func(r *Route) { r.Hostname = "" },
@@ -131,8 +143,8 @@ func TestUpsertRouteRejectsInvalid(t *testing.T) {
 	for name, m := range mut {
 		r := sampleRoute("docker:a", "a.example.test", 80)
 		m(&r)
-		if err := s.UpsertRoute(ctx, r); err == nil {
-			t.Errorf("%s: accepted %+v", name, r)
+		if err := s.UpsertRoute(ctx, r); !errors.Is(err, ErrInvalidRoute) {
+			t.Errorf("%s: want ErrInvalidRoute, got %v for %+v", name, err, r)
 		}
 	}
 	if got, _ := s.ListRoutes(ctx); len(got) != 0 {
@@ -212,5 +224,72 @@ func TestRoutesMigrationAppliesOnDBAt0002(t *testing.T) {
 	s2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='routes' AND name='routes_hostname'`).Scan(&idx)
 	if idx != 1 {
 		t.Fatal("routes_hostname index missing")
+	}
+}
+
+func TestUpsertRouteHostForms(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	cases := map[string]string{ // input -> stored
+		"2001:db8::1":   "2001:db8::1",
+		"[2001:db8::1]": "2001:db8::1", // stored unbracketed
+		"app":           "app",
+		"198.51.100.5":  "198.51.100.5",
+	}
+	i := 0
+	for in, want := range cases {
+		i++
+		r := sampleRoute("docker:h"+string(rune('a'+i)), "h.example.test", 80)
+		r.Host = in
+		if err := s.UpsertRoute(ctx, r); err != nil {
+			t.Fatalf("%q rejected: %v", in, err)
+		}
+		g, _, _ := s.GetRoute(ctx, r.Key)
+		if g.Host != want {
+			t.Errorf("%q stored as %q, want %q", in, g.Host, want)
+		}
+	}
+}
+
+func TestUpsertRouteUnchangedIsNoop(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	r := sampleRoute("docker:a", "a.example.test", 80)
+	r.Middlewares = []string{"m"}
+	if err := s.UpsertRoute(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	same := r
+	same.UpdatedAt = t0.Add(time.Hour)
+	same.Hostname = "A.example.test." // normalizes to the same value
+	if err := s.UpsertRoute(ctx, same); err != nil {
+		t.Fatal(err)
+	}
+	if g, _, _ := s.GetRoute(ctx, "docker:a"); !g.UpdatedAt.Equal(t0) {
+		t.Fatalf("unchanged upsert bumped updated_at: %v", g.UpdatedAt)
+	}
+	// each field change does write
+	changes := map[string]func(*Route){
+		"source": func(r *Route) { r.Source = "other" }, "zone": func(r *Route) { r.Zone = "other.test" },
+		"hostname": func(r *Route) { r.Hostname = "b.example.test" }, "scheme": func(r *Route) { r.Scheme = "https" },
+		"host": func(r *Route) { r.Host = "198.51.100.9" }, "port": func(r *Route) { r.Port = 81 },
+		"skip": func(r *Route) { r.SkipVerify = true }, "ws": func(r *Route) { r.Websockets = true },
+		"mw": func(r *Route) { r.Middlewares = nil },
+	}
+	n := 0
+	for name, m := range changes {
+		n++
+		c := r
+		m(&c)
+		c.UpdatedAt = t0.Add(time.Duration(n) * time.Hour)
+		if err := s.UpsertRoute(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		if g, _, _ := s.GetRoute(ctx, "docker:a"); !g.UpdatedAt.Equal(c.UpdatedAt) {
+			t.Errorf("%s change not written: %+v", name, g)
+		}
+		if err := s.UpsertRoute(ctx, r); err != nil { // restore
+			t.Fatal(err)
+		}
 	}
 }

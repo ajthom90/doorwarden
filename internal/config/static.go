@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -101,7 +100,7 @@ func (s StaticService) Problems() []string {
 					add("port %d conflicts with upstream port %d", s.Port, n)
 				}
 			}
-			if !validHost(u.Hostname()) {
+			if !model.ValidHost(u.Hostname()) {
 				add("upstream host %q is invalid", u.Hostname())
 			}
 			if s.Scheme != "" && s.Scheme != u.Scheme {
@@ -109,21 +108,13 @@ func (s StaticService) Problems() []string {
 			}
 		}
 	}
-	if host != "" && !validHostField(host) {
+	if host != "" && !model.ValidHost(host) {
 		add("host %q must be a bare hostname or IP (no scheme, path, whitespace or :port)", host)
 	}
 	if s.SkipVerify && (s.Scheme == "http" || upScheme == "http") {
 		add("skip_verify requires https but scheme/upstream is http")
 	}
 	return out
-}
-
-func validHostField(h string) bool {
-	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
-		ip := net.ParseIP(h[1 : len(h)-1])
-		return ip != nil && ip.To4() == nil
-	}
-	return validHost(h)
 }
 
 func validID(id string) bool {
@@ -140,28 +131,4 @@ func validID(id string) bool {
 
 func nameChar(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-'
-}
-
-// validHost accepts an IP literal (IPv6 unbracketed) or a hostname made of
-// [A-Za-z0-9._-] with non-empty labels of at most 63 chars that neither start
-// nor end with '-', and at most 253 chars in total. The host flows into proxy
-// configuration, so everything else is rejected.
-func validHost(h string) bool {
-	if net.ParseIP(h) != nil {
-		return true
-	}
-	if h == "" || len(h) > 253 {
-		return false
-	}
-	for _, l := range strings.Split(h, ".") {
-		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
-			return false
-		}
-		for i := 0; i < len(l); i++ {
-			if !nameChar(l[i]) || l[i] == '.' {
-				return false
-			}
-		}
-	}
-	return true
 }

@@ -110,16 +110,31 @@ func TestRouteExecutorRejectsMissingBackend(t *testing.T) {
 	}
 }
 
-func TestRouteExecutorEmptySchemeDefaultsToHTTP(t *testing.T) {
+func TestRouteExecutorRejectsEmptyScheme(t *testing.T) {
 	st := openStore(t)
 	s := pub("docker:app", "app", "example.test", 8080)
 	b := model.Backend{Host: "198.51.100.5", Port: 8080}
 	if err := NewRouteExecutor(st, fixedNow(t0)).Apply(context.Background(),
-		[]Action{routeWrite(s, "example.test", "app.example.test", &b)}, false); err != nil {
-		t.Fatal(err)
+		[]Action{routeWrite(s, "example.test", "app.example.test", &b)}, false); !errors.Is(err, store.ErrInvalidRoute) {
+		t.Fatalf("want ErrInvalidRoute, got %v", err)
 	}
-	if got := listRoutes(t, st); len(got) != 1 || got[0].Scheme != "http" {
+	if got := listRoutes(t, st); len(got) != 0 {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestRouteExecutorNonPublishedWriteIsNoop(t *testing.T) {
+	cs := &countingStore{RouteStore: openStore(t)}
+	ex := NewRouteExecutor(cs, fixedNow(t0))
+	for _, st := range []string{model.StateStopped, model.StateError, model.StatePending, model.StateDiscovered, ""} {
+		s := pub("docker:app", "app", "example.test", 8080)
+		s.State = st
+		if err := ex.Apply(context.Background(), []Action{routeWrite(s, "example.test", "app.example.test", &s.Backend)}, false); err != nil {
+			t.Fatalf("%q: %v", st, err)
+		}
+	}
+	if cs.writes != 0 || len(listRoutes(t, cs)) != 0 {
+		t.Fatalf("non-published RouteWrite wrote: writes=%d", cs.writes)
 	}
 }
 
@@ -460,3 +475,85 @@ func (f failingStore) UpsertRoute(context.Context, store.Route) error           
 func (f failingStore) DeleteRoute(context.Context, string) error                 { return f.err }
 func (f failingStore) SetRouteRemoval(context.Context, string, *time.Time) error { return f.err }
 func (f failingStore) ListRoutes(context.Context) ([]store.Route, error)         { return nil, f.err }
+
+func TestE2ENonPublishedNeverRewritesRoute(t *testing.T) {
+	e := newE2E(t)
+	app := pub("docker:app", "app", "example.test", 8080)
+	app.Options = model.Options{Middlewares: []string{"auth@file"}, Websockets: true}
+	e.cycle([]model.Service{app})
+	want := e.mustRoute("docker:app")
+	if !reflect.DeepEqual(want.Middlewares, []string{"auth@file"}) {
+		t.Fatalf("published route %+v", want)
+	}
+
+	// stopped, labels dropped the middleware and websockets
+	e.now = t0.Add(time.Hour)
+	stopped := svc("docker:app", "app", "example.test", model.StateStopped, "", 0)
+	acts := e.cycle([]model.Service{stopped})
+	if len(ofKind(acts, RouteWrite)) != 1 {
+		t.Fatalf("plan should still emit RouteWrite for stopped: %v", sums(acts))
+	}
+	if got := e.mustRoute("docker:app"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stopped rewrote route\n got %+v\nwant %+v", got, want)
+	}
+
+	// stopped with a renamed name label: hostname unchanged
+	e.now = t0.Add(2 * time.Hour)
+	renamed := svc("docker:app", "renamed", "example.test", model.StateStopped, "", 0)
+	e.cycle([]model.Service{renamed})
+	if got := e.mustRoute("docker:app"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("renamed stopped rewrote route: %+v", got)
+	}
+
+	// error state (bad scheme label; options not parsed): unchanged
+	e.now = t0.Add(3 * time.Hour)
+	errd := svc("docker:app", "app", "example.test", model.StateError, "", 0)
+	errd.Backend.Scheme = "http"
+	e.cycle([]model.Service{errd})
+	if got := e.mustRoute("docker:app"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("error state rewrote route: %+v", got)
+	}
+
+	// back to Published with a changed middleware set: only now it changes
+	e.now = t0.Add(4 * time.Hour)
+	app2 := pub("docker:app", "app", "example.test", 8080)
+	app2.Options = model.Options{Middlewares: []string{"auth@file", "gzip@file"}}
+	e.cycle([]model.Service{app2})
+	got := e.mustRoute("docker:app")
+	if !reflect.DeepEqual(got.Middlewares, []string{"auth@file", "gzip@file"}) || got.Websockets || !got.UpdatedAt.Equal(e.now) {
+		t.Fatalf("published change not applied: %+v", got)
+	}
+}
+
+func TestE2EInvalidBackendWinnerDoesNotEvictLoser(t *testing.T) {
+	for name, mut := range map[string]func(*model.Backend){
+		"h2c scheme": func(b *model.Backend) { b.Scheme = "h2c" },
+		"port 70000": func(b *model.Backend) { b.Port = 70000 },
+		"host:port":  func(b *model.Backend) { b.Host = "198.51.100.9:80" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newE2E(t)
+			dock := pub("docker:app", "app", "example.test", 8080)
+			e.cycle([]model.Service{dock})
+			before := e.mustRoute("docker:app")
+
+			e.now = t0.Add(time.Hour)
+			stat := pub("static:app", "app", "example.test", 9000)
+			mut(&stat.Backend)
+			acts := e.cycle([]model.Service{dock, stat})
+			assertNone(t, acts, RouteRemove)
+			if inv := ofKind(forKey(acts, "static:app"), Invalid); len(inv) != 1 {
+				t.Fatalf("want static:app Invalid, got %v", sums(acts))
+			}
+			if rw := ofKind(acts, RouteWrite); len(rw) != 0 {
+				t.Fatalf("unexpected RouteWrite %v", sums(rw))
+			}
+			if got := e.mustRoute("docker:app"); !reflect.DeepEqual(got, before) {
+				t.Fatalf("loser route changed: %+v", got)
+			}
+			if _, ok := e.route("static:app"); ok {
+				t.Fatal("invalid winner persisted")
+			}
+		})
+	}
+}

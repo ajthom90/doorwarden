@@ -219,7 +219,7 @@ func (p *planner) planService(e entry) bool {
 		b, ok := p.routeBackend(s)
 		if !ok {
 			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: s.Key, Svc: copySvc(s),
-				Reason: "published service has no backend (host/port) and no last-known backend"})
+				Reason: "published service has no valid backend (" + backendProblem(s.Backend) + ") and no last-known backend"})
 			return false
 		}
 		if z.mode == "per-host" {
@@ -435,7 +435,10 @@ func sortedKnown(m map[string]KnownService) []KnownService {
 	return out
 }
 
-func authoritative(b model.Backend) bool { return b.Host != "" && b.Port > 0 }
+// authoritative reports whether b is routable. It is model.ValidateBackend,
+// the same predicate the route store enforces, so a RouteWrite the plan
+// emits is never rejected by the store for its backend.
+func authoritative(b model.Backend) bool { return model.ValidateBackend(b) == nil }
 
 func sameValue(a, b string) bool {
 	if a == b {
@@ -484,4 +487,11 @@ func sortActions(as []Action) {
 		}
 		return false
 	})
+}
+
+func backendProblem(b model.Backend) string {
+	if err := model.ValidateBackend(b); err != nil {
+		return err.Error()
+	}
+	return "ok"
 }

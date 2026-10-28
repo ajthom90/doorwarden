@@ -60,16 +60,22 @@
 // only Conflict; when the winner goes away the loser wins again and gets its
 // route back.
 //
-// States: only Published services get DNSEnsure/CertEnsure. A Published
-// service whose backend is not authoritative (empty host or port 0) uses its
-// last-known backend. Stopped and Error services carry no authoritative
-// backend: if previously published (in Known) and a last-known backend
-// exists, RouteWrite carries the LAST-KNOWN backend (so a writer that renders
-// all routes each cycle keeps the route); without one a Skip is emitted and
-// nothing is removed. Pending, Discovered and the rest emit nothing.
-// RouteRemove is the only signal that removes a route: route executors must
-// not remove a route merely because no RouteWrite for it appeared. Route
-// identity is the service key.
+// States: only Published services get DNSEnsure/CertEnsure. A backend is
+// authoritative (routable) when it passes model.ValidateBackend (scheme http
+// or https, valid host, port 1..65535), the same predicate the route store
+// enforces. A Published service whose backend is not authoritative uses its
+// last-known backend, else it is Invalid. Stopped and Error services carry no
+// authoritative backend: if previously published (in Known) and a last-known
+// backend exists, RouteWrite carries the LAST-KNOWN backend; without one a
+// Skip is emitted and nothing is removed. Pending, Discovered and the rest
+// emit nothing. Such a RouteWrite also carries the service's CURRENT labels
+// (name, so Host; middlewares; websockets), which are not trustworthy while
+// it is stopped or errored, so the route executor (NewRouteExecutor) treats
+// a RouteWrite for a non-Published service as a no-op: the route is left as
+// last written, and only a Published service can change it. RouteRemove is
+// the only signal that removes a route: route executors must not remove a
+// route merely because no RouteWrite for it appeared. Route identity is the
+// service key.
 //
 // Records (zones[].records.mode): "off" and unset emit no DNS actions (routes
 // and certs still happen). "wildcard": one "*.zone" record per zone that has
@@ -127,7 +133,8 @@
 // Known gaps, resolved conservatively: when a published service changes
 // hostname or zone, the old per-host record stays owned and is not deleted;
 // when a published service becomes Pending (fingerprint changed) its route is
-// left as last written, not removed.
+// left as last written, not removed; likewise a Stopped/Error service's route
+// is left as last written (its RouteWrite is a no-op in the route executor).
 //
 // # Execution
 //
