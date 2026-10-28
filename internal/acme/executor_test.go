@@ -84,7 +84,6 @@ func TestExecutorTimeoutDoesNotBlockLoop(t *testing.T) {
 	h := newHarness(t, cfg, nil)
 	block := make(chan struct{})
 	h.ca.block = block
-	defer close(block)
 	e := NewCertExecutor(h.m)
 	start := time.Now()
 	err := e.Apply(ctx, []reconcile.Action{certEnsure("example.test", "*.example.test", "example.test")}, false)
@@ -94,6 +93,14 @@ func TestExecutorTimeoutDoesNotBlockLoop(t *testing.T) {
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("blocked")
 	}
+	// Let the background order finish and persist before TempDir cleanup.
+	close(block)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if rows, _ := h.st.ListCerts(ctx); len(rows) == 1 && rows[0].Status == StatusValid {
+			return
+		}
+	}
+	t.Fatal("background order result not persisted")
 }
 
 func TestFailureNotifies(t *testing.T) {

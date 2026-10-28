@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -242,3 +243,5 @@ type errTest string
 func (e errTest) Error() string { return string(e) }
 
 func fmtS(f string, a ...any) string { return fmt.Sprintf(f, a...) }
+
+func decodeB64(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }

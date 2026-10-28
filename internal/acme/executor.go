@@ -55,7 +55,7 @@ func (e *CertExecutor) Apply(ctx context.Context, actions []reconcile.Action, dr
 func (e *CertExecutor) apply(ctx context.Context, a reconcile.Action) (errs []error) {
 	defer func() {
 		if p := recover(); p != nil {
-			errs = append(errs, fmt.Errorf("acme: certificate for %s panicked: %v", a.Zone, p))
+			errs = append(errs, errors.New(truncate(e.m.red.redact(fmt.Sprintf("acme: certificate for %s panicked: %v", a.Zone, p)))))
 		}
 	}()
 	ictx, cancel := context.WithTimeout(ctx, e.m.issueTimeout)

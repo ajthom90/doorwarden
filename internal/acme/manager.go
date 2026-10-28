@@ -175,6 +175,7 @@ type Manager struct {
 	issueTimeout   time.Duration
 	renewBefore    time.Duration
 	log            *slog.Logger
+	red            *redactor
 
 	// obtain places one ACME order (lego by default; replaced in tests).
 	obtain func(ctx context.Context, o order) (obtained, error)
@@ -273,12 +274,19 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 	if m.log == nil {
 		m.log = slog.Default()
 	}
+	m.red = newRedactor()
+	m.red.parent = globalRedactor
+	m.log = slog.New(redactHandler{inner: m.log.Handler(), r: m.red})
+	if m.notifier != nil {
+		m.notifier = redactNotifier{inner: m.notifier, r: m.red}
+	}
+	m.registerConfigSecrets()
 	m.obtain = m.legoObtain
 	if err := errors.Join(ValidateConfig(mc.Config, mc.HTTP01Provider != nil)...); err != nil {
 		return nil, err
 	}
 	legoLogOnce.Do(func() {
-		legolog.Logger = slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug)
+		legolog.Logger = slog.NewLogLogger(redactHandler{inner: slog.Default().Handler(), r: globalRedactor}, slog.LevelDebug)
 	})
 	return m, nil
 }
@@ -403,6 +411,11 @@ type Result struct {
 // Issue orders the certificate for req, which must resolve to exactly one
 // order (use IssueAll for per-host lists and san sets above 100 names).
 func (m *Manager) Issue(ctx context.Context, req IssueRequest) (*Bundle, error) {
+	b, err := m.issue(ctx, req)
+	return b, m.red.safeErr(err)
+}
+
+func (m *Manager) issue(ctx context.Context, req IssueRequest) (*Bundle, error) {
 	z, sets, err := m.resolveRequest(req)
 	if err != nil {
 		return nil, err
@@ -416,6 +429,10 @@ func (m *Manager) Issue(ctx context.Context, req IssueRequest) (*Bundle, error) 
 
 // IssueAll orders every certificate req resolves to, one after another.
 func (m *Manager) IssueAll(ctx context.Context, req IssueRequest) []Result {
+	return m.safeResults(m.issueAll(ctx, req))
+}
+
+func (m *Manager) issueAll(ctx context.Context, req IssueRequest) []Result {
 	z, sets, err := m.resolveRequest(req)
 	if err != nil {
 		return []Result{{Zone: normName(req.Zone), Names: req.Names, Err: err}}
@@ -659,12 +676,12 @@ func (m *Manager) OrdersLastWeek(ctx context.Context, issuer string) (int, error
 	return n, nil
 }
 
-func truncErr(err error) string {
-	s := strings.ToValidUTF8(err.Error(), "?")
-	if len(s) > maxErrorLen {
-		s = s[:maxErrorLen] + "..."
+// safeResults redacts the error text of every result.
+func (m *Manager) safeResults(rs []Result) []Result {
+	for i := range rs {
+		rs[i].Err = m.red.safeErr(rs[i].Err)
 	}
-	return s
+	return rs
 }
 
 // rateLimitPark returns how long to park after err, or 0 when err is not a
@@ -742,7 +759,7 @@ func validationFailure(err error) bool {
 // certificate's files, expiry and path are left untouched.
 func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer string, dir directory, id string, names []string, cause error) Result {
 	now := m.now()
-	msg := truncErr(cause)
+	msg := m.red.errText(cause)
 	park := rateLimitPark(cause, now)
 	m.stateMu.Lock()
 	var a attemptState
@@ -793,7 +810,8 @@ func (m *Manager) recordFailure(ctx context.Context, z config.Zone, issuer strin
 			NotAfter: row.NotAfter, Message: msg, NextAttempt: a.NextAttempt})
 	}
 	return Result{CertID: id, Zone: row.Zone, Names: append([]string(nil), names...),
-		Err: fmt.Errorf("acme: order for %s failed: %s", strings.Join(names, ","), msg), NextAttempt: a.NextAttempt}
+		Err:         &redactedError{msg: truncate(m.red.redact(fmt.Sprintf("acme: order for %s failed: %s", strings.Join(names, ","), msg))), cause: cause},
+		NextAttempt: a.NextAttempt}
 }
 
 func (m *Manager) recordSuccess(ctx context.Context, z config.Zone, issuer string, dir directory, id string, names []string, ob obtained) Result {
@@ -878,6 +896,10 @@ func rowNames(r store.Cert) []string {
 // all certificates, and returns one Result per certificate it considered
 // (due ones, renewed or not). Imported certificates are never renewed here.
 func (m *Manager) Renew(ctx context.Context) []Result {
+	return m.safeResults(m.renew(ctx))
+}
+
+func (m *Manager) renew(ctx context.Context) []Result {
 	rows, err := m.st.ListCerts(ctx)
 	if err != nil {
 		return []Result{{Err: fmt.Errorf("acme: list certs: %w", err)}}
@@ -962,6 +984,10 @@ func (m *Manager) notifyExpiry(ctx context.Context, r store.Cert, now time.Time)
 // explicit switch to managed: its zone must have an issuer, and on success
 // the row becomes managed=true with the same id.
 func (m *Manager) RenewNow(ctx context.Context, certID string) Result {
+	return m.safeResults([]Result{m.renewNow(ctx, certID)})[0]
+}
+
+func (m *Manager) renewNow(ctx context.Context, certID string) Result {
 	r, ok, err := m.certRow(ctx, certID)
 	if err != nil {
 		return Result{CertID: certID, Err: err}
@@ -995,6 +1021,11 @@ func (m *Manager) RenewNow(ctx context.Context, certID string) Result {
 // issuer (same ids, so Traefik's paths do not change). It never runs on its
 // own. to must be "production".
 func (m *Manager) SwitchIssuer(ctx context.Context, issuer, to string) ([]Result, error) {
+	out, err := m.switchIssuer(ctx, issuer, to)
+	return m.safeResults(out), m.red.safeErr(err)
+}
+
+func (m *Manager) switchIssuer(ctx context.Context, issuer, to string) ([]Result, error) {
 	if to != "production" {
 		return nil, fmt.Errorf("acme: can only switch to production, not %q", to)
 	}
@@ -1056,6 +1087,9 @@ func (m *Manager) dnsChallengeProvider(name string) (challenge.Provider, error) 
 	if len(ignored) > 0 {
 		m.log.Debug("acme: provider settings not used by the lego provider", "provider", name, "type", pc.Type, "keys", strings.Join(ignored, ","))
 	}
+	for _, v := range env {
+		m.red.add(v)
+	}
 	p, err := withEnv(env, func() (challenge.Provider, error) { return m.providerByName(pc.Type) })
 	if err != nil {
 		return nil, fmt.Errorf("acme: challenge provider %q (%s): %w", name, pc.Type, err)
@@ -1100,6 +1134,7 @@ func (m *Manager) accountKey(ctx context.Context, issuer string) (*ecdsa.Private
 		if err != nil {
 			return nil, errors.New("acme: stored account key is corrupt")
 		}
+		m.red.addPEM(plain)
 		return k, nil
 	}
 	k, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
@@ -1110,7 +1145,9 @@ func (m *Manager) accountKey(ctx context.Context, issuer string) (*ecdsa.Private
 	if err != nil {
 		return nil, err
 	}
-	sealed, err := m.box.Seal(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}))
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+	m.red.addPEM(keyPEM)
+	sealed, err := m.box.Seal(keyPEM)
 	if err != nil {
 		return nil, err
 	}

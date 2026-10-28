@@ -39,6 +39,11 @@ const maxPEMSize = 1 << 20
 // are never renewed automatically; see RenewNow. Re-importing the same leaf
 // is idempotent (same id).
 func (m *Manager) ImportPEM(ctx context.Context, zone string, fullchainPEM, keyPEM []byte) (*ImportResult, error) {
+	ir, err := m.importPEM(ctx, zone, fullchainPEM, keyPEM)
+	return ir, m.red.safeErr(err)
+}
+
+func (m *Manager) importPEM(ctx context.Context, zone string, fullchainPEM, keyPEM []byte) (*ImportResult, error) {
 	z := normName(zone)
 	if _, ok := m.zone(z); !ok {
 		return nil, fmt.Errorf("acme: zone %q is not configured", zone)
@@ -114,6 +119,14 @@ func certNames(c *x509.Certificate) []string {
 // containing all its names. One ImportResult per directory; a failing
 // directory does not stop the others.
 func (m *Manager) ImportNPMDir(ctx context.Context, dir string) ([]ImportResult, error) {
+	rs, err := m.importNPMDir(ctx, dir)
+	for i := range rs {
+		rs[i].Err = m.red.safeErr(rs[i].Err)
+	}
+	return rs, m.red.safeErr(err)
+}
+
+func (m *Manager) importNPMDir(ctx context.Context, dir string) ([]ImportResult, error) {
 	if fileExists(filepath.Join(dir, FullchainFile)) {
 		return []ImportResult{m.importDir(ctx, dir)}, nil
 	}
@@ -172,7 +185,7 @@ func (m *Manager) importDir(ctx context.Context, dir string) ImportResult {
 		r.Err = fmt.Errorf("acme: import %s: no configured zone contains all of %s", dir, strings.Join(certNames(leaf), ","))
 		return r
 	}
-	ir, err := m.ImportPEM(ctx, zone, chain, key)
+	ir, err := m.importPEM(ctx, zone, chain, key)
 	if err != nil {
 		r.Err = fmt.Errorf("acme: import %s: %w", dir, err)
 		return r
