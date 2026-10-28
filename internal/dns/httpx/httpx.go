@@ -148,7 +148,7 @@ func (c *Client) wrap(err error) error {
 }
 
 // Do sends a request. body (if non-nil) is JSON-encoded; out (if non-nil) is
-// JSON-decoded from the response. query may be nil. The response status is
+// JSON-decoded from the response. A url.Values body is sent form-encoded. query may be nil. The response status is
 // returned even on error when a response was received.
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, hdr http.Header, body, out any) (int, error) {
 	u := *c.Base
@@ -157,7 +157,10 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		u.RawQuery = query.Encode()
 	}
 	var rd io.Reader
-	if body != nil {
+	ctype := "application/json"
+	if form, ok := body.(url.Values); ok {
+		rd, ctype = strings.NewReader(form.Encode()), "application/x-www-form-urlencoded"
+	} else if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return 0, err
@@ -170,7 +173,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", ctype)
 	}
 	for k, v := range hdr {
 		req.Header[k] = v
