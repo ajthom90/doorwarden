@@ -318,27 +318,93 @@ func TestKeyValueScrubPattern(t *testing.T) {
 }
 
 // Only credentials are registered as secrets: a short Additional setting
-// (a TTL) causes no warning, and a base URL is not scrubbed from messages.
+// (a TTL) causes no warning, and a non-credential base URL is not scrubbed.
 func TestOnlyCredentialSettingsRegistered(t *testing.T) {
 	cfg := testConfig()
 	cfg.Providers["cf"] = config.ProviderCfg{Type: "cloudflare", Extra: map[string]any{
 		"cf_dns_api_token": "cf-secret-token", "cloudflare_ttl": 120, "cloudflare_propagation_timeout": "300",
+		"cloudflare_base_url": "https://cfapi.example.test/client/v4",
 	}}
-	cfg.Providers["pd"] = config.ProviderCfg{Type: "pdns", Extra: map[string]any{
-		"pdns_api_url": "https://pdns.example.test:8081", "pdns_api_key": "pdns-key-value",
-	}}
-	cfg.Zones = append(cfg.Zones, config.Zone{Name: "pd.example.test", TargetIP: "192.0.2.10",
-		Certificate: config.Certificate{Issuer: "le", Strategy: "wildcard", Challenge: "dns-01", DNSProvider: "pd"}})
 	h := newHarness(t, cfg, nil)
 	if l := h.logs.String(); strings.Contains(l, "too short") {
 		t.Fatalf("spurious warning: %s", l)
 	}
-	if _, err := h.m.dnsChallengeProvider("pd"); err != nil {
+	if _, err := h.m.dnsChallengeProvider("cf"); err != nil {
 		t.Fatal(err)
 	}
-	out := h.m.red.redact("dial https://pdns.example.test:8081/api failed; key pdns-key-value 300")
-	if !strings.Contains(out, "pdns.example.test:8081") || strings.Contains(out, "pdns-key-value") || !strings.Contains(out, "300") {
+	out := h.m.red.redact("dial https://cfapi.example.test/client/v4/zones failed; cf-secret-token 300")
+	if !strings.Contains(out, "cfapi.example.test/client/v4") || strings.Contains(out, "cf-secret-token") || !strings.Contains(out, "300") {
 		t.Fatalf("%s", out)
+	}
+}
+
+// A credential whose value is a URL (webhook-style token in the path,
+// query or userinfo) is redacted entirely, including its components, from
+// errors, logs, events and rows.
+func TestCredentialURLValueRedacted(t *testing.T) {
+	cred := "https://hookuser:hookpass99@hooks.example.test/abc/SECRETpath123?sig=QSIGvalue77"
+	cfg := testConfig()
+	cfg.Providers["pd"] = config.ProviderCfg{Type: "pdns", Extra: map[string]any{
+		"pdns_api_url": cred, "pdns_api_key": "pdns-key-value",
+	}}
+	cfg.Zones[0].Certificate.DNSProvider = "pd"
+	parts := []string{"hookpass99", "SECRETpath123", "QSIGvalue77", "hookuser"}
+	// The provider echoes the credential's pieces in odd forms.
+	echo := errors.New("POST hooks.example.test/abc/SECRETpath123 rejected; sig QSIGvalue77 user hookuser:hookpass99 " + url.PathEscape("SECRETpath123"))
+	h := presentingHarness(t, cfg, echo)
+	_, err := h.m.Issue(ctx, wildcardReq())
+	if err == nil {
+		t.Fatal("want failure")
+	}
+	rows, _ := h.st.ListCerts(ctx)
+	evs := h.evs.list()
+	for where, txt := range map[string]string{"err": err.Error(), "log": h.logs.String(), "row": rows[0].LastError, "event": evs[0].Message} {
+		for _, p := range parts {
+			if strings.Contains(txt, p) {
+				t.Errorf("%s leaks %q: %s", where, p, txt)
+			}
+		}
+	}
+}
+
+// Key/value scrubbing: quoted values are redacted up to the matching
+// (unescaped) closing quote, unquoted ones up to whitespace or '&' (commas
+// and quotes inside do not stop it); nothing of the value remains.
+func TestKeyValueScrubNoRemainder(t *testing.T) {
+	r := newRedactor()
+	for _, tc := range []struct{ in, rest string }{
+		{`token=a1,b2,c3 next`, "b2"},
+		{`key=aq,bq,cq`, "cq"},
+		{`password=pa"ss'wd tail`, "wd"},
+		{`"token":"a,b\"c","x":"keep"`, `c"`},
+		{`{"secret": "x\"y,z"}`, "y,z"},
+		{`password='it\'s,secret' tail`, "s,secret"},
+		{`token: "multi
+line value" tail`, "line value"},
+		{"Authorization: Basic dXNlcjpwYXNz,more", "more"},
+		{"authorization=Bearer abc.def,ghi", "ghi"},
+		{`secret="unterminated, rest of line`, "rest of line"},
+	} {
+		out := r.redact(tc.in)
+		if strings.Contains(out, tc.rest) || !strings.Contains(out, redacted) {
+			t.Errorf("%q -> %q (remainder %q)", tc.in, out, tc.rest)
+		}
+	}
+	for in, want := range map[string]string{
+		`"token":"a,b\"c","x":"keep"`:       `"token":"` + redacted + `","x":"keep"`,
+		`password='it\'s,secret' tail`:      `password='` + redacted + `' tail`,
+		"authorization=Digest u1,more tail": "authorization=" + redacted + " tail",
+		"authorization=opaque,tok tail":     "authorization=" + redacted + " tail",
+	} {
+		if out := r.redact(in); out != want {
+			t.Errorf("%q -> %q, want %q", in, out, want)
+		}
+	}
+	if out := r.redact(`"token":"a,b\"c","x":"keep"`); !strings.Contains(out, `"x":"keep"`) {
+		t.Errorf("next JSON field lost: %s", out)
+	}
+	if out := r.redact("token=abc tail"); !strings.HasSuffix(out, " tail") {
+		t.Errorf("tail lost: %s", out)
 	}
 }
 

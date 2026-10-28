@@ -153,11 +153,97 @@ var (
 	}{
 		{regexp.MustCompile(`(?i)\bBearer\s+\S+`), "Bearer " + redacted},
 		{regexp.MustCompile(`(?i)\bAuthorization:\s*\S+(\s+\S+)?`), "Authorization: " + redacted},
-		{regexp.MustCompile(`(?i)((?:token|secret|key|password|hmac|authorization)["']?\s*[:=]\s*["']?)[^&\s,"']+`), "${1}" + redacted},
-		{regexp.MustCompile(`(?i)("(?:[a-z_]*token|[a-z_]*secret|password|[a-z_]*key|hmac)"\s*:\s*")[^"]*"`), "${1}" + redacted + `"`},
-		{regexp.MustCompile(`(?i)((?:key|token|secret)[a-z_-]*["']?\s*[:=]?\s*["']?)[A-Za-z0-9+/_=-]{32,}`), "${1}" + redacted},
 	}
+	// kvKeyRe finds "<credential word>[quote]<sep>" before a value; the
+	// value itself is delimited by scrubKV (quote-aware), not by a regexp.
+	kvKeyRe = regexp.MustCompile(`(?i)(?:token|secret|key|password|hmac|authorization)["']?\s*[:=]\s*`)
+	// longRunRe: long key-like runs after a credential word, separator
+	// optional (applied last).
+	longRunRe = regexp.MustCompile(`(?i)((?:key|token|secret)[a-z_-]*["']?\s*[:=]?\s*["']?)[A-Za-z0-9+/_=-]{32,}`)
 )
+
+// scrubKV redacts the value after every "<credential word><sep>" in s. A
+// value starting with a quote runs to the matching unescaped quote of the
+// same kind (across lines; without one, to the end of the line) and its
+// body is replaced, quotes kept. An unquoted value runs to whitespace or
+// '&' (commas and quotes inside are part of it); for an authorization
+// value of the form "<Scheme> <credentials>" both words are consumed.
+func scrubKV(s string) string {
+	var b strings.Builder
+	pos := 0
+	for pos < len(s) {
+		loc := kvKeyRe.FindStringIndex(s[pos:])
+		if loc == nil {
+			break
+		}
+		start, end := pos+loc[0], pos+loc[1]
+		b.WriteString(s[pos:end])
+		rest := s[end:]
+		if rest == "" {
+			pos = end
+			break
+		}
+		if q := rest[0]; q == '"' || q == '\'' {
+			i, closed := 1, false
+			for i < len(rest) {
+				if rest[i] == '\\' {
+					i += 2
+					continue
+				}
+				if rest[i] == q {
+					closed = true
+					break
+				}
+				i++
+			}
+			if closed {
+				b.WriteString(string(q) + redacted + string(q))
+				pos = end + i + 1
+			} else {
+				n := strings.IndexByte(rest, '\n')
+				if n < 0 {
+					n = len(rest)
+				}
+				b.WriteString(string(q) + redacted)
+				pos = end + n
+			}
+			continue
+		}
+		n := strings.IndexAny(rest, "& \t\r\n")
+		if n < 0 {
+			n = len(rest)
+		}
+		if n == 0 {
+			pos = end
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(s[start:end]), "authorization") && isSchemeWord(rest[:n]) {
+			// "<Scheme> <credentials>": consume the credentials word too.
+			j := n
+			for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+				j++
+			}
+			if k := strings.IndexAny(rest[j:], "& \t\r\n"); k != 0 && j < len(rest) {
+				if k < 0 {
+					k = len(rest) - j
+				}
+				n = j + k
+			}
+		}
+		b.WriteString(redacted)
+		pos = end + n
+	}
+	b.WriteString(s[pos:])
+	return b.String()
+}
+
+func isSchemeWord(w string) bool {
+	switch strings.ToLower(w) {
+	case "basic", "bearer", "digest", "token", "negotiate", "hmac", "apikey":
+		return true
+	}
+	return false
+}
 
 // sanitizeURL keeps scheme, host and path; drops userinfo, query and
 // fragment ("?[redacted]" marks a removed query). Userinfo is everything
@@ -216,6 +302,8 @@ func (r *redactor) redact(s string) string {
 	for _, p := range scrubRes {
 		s = p.re.ReplaceAllString(s, p.repl)
 	}
+	s = scrubKV(s)
+	s = longRunRe.ReplaceAllString(s, "${1}"+redacted)
 	return s
 }
 
@@ -490,13 +578,6 @@ func secretFileValues(path string) ([]string, error) {
 // keyTokenRe matches base64/hex-like tokens long enough to be key material.
 var keyTokenRe = regexp.MustCompile(`[A-Za-z0-9+/=_-]{16,}`)
 
-// plainURL reports a URL without userinfo or query: an endpoint, not a
-// credential (redacting it would only remove useful context).
-func plainURL(v string) bool {
-	u, err := url.Parse(v)
-	return err == nil && u.Scheme != "" && u.Host != "" && u.User == nil && u.RawQuery == "" && !strings.Contains(v, "@")
-}
-
 // isCredentialSetting reports whether a provider setting holds a secret:
 // it maps to one of the provider's documented Credentials (or its _FILE
 // form), or its name (setting key or lego variable) looks like one.
@@ -529,10 +610,55 @@ func (m *Manager) registerSetting(cat ChallengeProvider, key, envName, value str
 		m.red.add(vals...)
 		return true
 	}
-	if !isCredentialSetting(cat, key, envName) || plainURL(value) {
-		return true
+	if !isCredentialSetting(cat, key, envName) {
+		return true // Additional settings (TTLs, base URLs) are not secrets
 	}
-	return m.red.add(value)
+	ok := m.red.add(value)
+	m.red.add(urlParts(value)...)
+	return ok
+}
+
+// urlParts returns the secret-bearing components of a URL-shaped credential
+// (userinfo, its user and password, each path segment of 4 or more bytes,
+// each query value), so a provider echoing only part of it is redacted.
+func urlParts(v string) []string {
+	if !strings.Contains(v, "://") {
+		return nil
+	}
+	i := strings.Index(v, "://")
+	rest := v[i+3:]
+	var out []string
+	end := len(rest)
+	if j := strings.IndexAny(rest, "?#"); j >= 0 {
+		end = j
+	}
+	if at := strings.LastIndex(rest[:end], "@"); at >= 0 {
+		ui := rest[:at]
+		out = append(out, ui)
+		if u, p, ok := strings.Cut(ui, ":"); ok {
+			out = append(out, u, p)
+		}
+		rest = rest[at+1:]
+	}
+	u, err := url.Parse(v[:i+3] + rest)
+	if err != nil {
+		return out
+	}
+	for _, seg := range strings.Split(u.EscapedPath(), "/") {
+		if len(seg) >= minSecretLen {
+			out = append(out, seg)
+			if d, err := url.PathUnescape(seg); err == nil {
+				out = append(out, d)
+			}
+		}
+	}
+	for _, vals := range u.Query() {
+		out = append(out, vals...)
+	}
+	if u.Fragment != "" {
+		out = append(out, u.Fragment)
+	}
+	return out
 }
 
 // registerConfigSecrets registers every credential the configuration
