@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-acme/lego/v4/challenge"
 
@@ -143,5 +144,57 @@ func TestPropagationTimeoutWrapper(t *testing.T) {
 	}
 	if to, _ := pt.Timeout(); to != 7*60*1e9 {
 		t.Fatalf("timeout %v", to)
+	}
+}
+
+type plainProvider struct{}
+
+func (plainProvider) Present(_, _, _ string) error { return nil }
+func (plainProvider) CleanUp(_, _, _ string) error { return nil }
+
+type seqProvider struct{ plainProvider }
+
+func (seqProvider) Sequential() time.Duration { return 42 * time.Second }
+
+type seqTimeoutProvider struct{ seqProvider }
+
+func (seqTimeoutProvider) Timeout() (time.Duration, time.Duration) {
+	return time.Minute, 9 * time.Second
+}
+
+// Wrapping a provider for the propagation timeout must keep lego's optional
+// Sequential() interface exactly when the inner provider has it.
+func TestPropagationTimeoutKeepsSequential(t *testing.T) {
+	type sequential interface{ Sequential() time.Duration }
+	for _, tc := range []struct {
+		name     string
+		p        challenge.Provider
+		seq      bool
+		interval time.Duration
+	}{
+		{"plain", plainProvider{}, false, 2 * time.Second},
+		{"sequential", seqProvider{}, true, 2 * time.Second},
+		{"sequential+timeout", seqTimeoutProvider{}, true, 9 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := withPropagationTimeout(tc.p, 5*time.Minute)
+			s, ok := w.(sequential)
+			if ok != tc.seq {
+				t.Fatalf("Sequential exposed=%v, want %v", ok, tc.seq)
+			}
+			if ok && s.Sequential() != 42*time.Second {
+				t.Fatalf("Sequential()=%v", s.Sequential())
+			}
+			pt, ok := w.(challenge.ProviderTimeout)
+			if !ok {
+				t.Fatal("no Timeout")
+			}
+			if to, iv := pt.Timeout(); to != 5*time.Minute || iv != tc.interval {
+				t.Fatalf("Timeout()=%v,%v", to, iv)
+			}
+			if _, ok := withPropagationTimeout(tc.p, 0).(sequential); ok != tc.seq {
+				t.Fatal("zero timeout must return the provider unchanged")
+			}
+		})
 	}
 }

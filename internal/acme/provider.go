@@ -62,6 +62,24 @@ type timeoutProvider struct {
 
 func (t timeoutProvider) Timeout() (time.Duration, time.Duration) { return t.timeout, t.interval }
 
+// sequentialProvider is lego's optional interface (challenge/dns01) asking
+// for the provider's challenges to be solved one at a time.
+type sequentialProvider interface {
+	Sequential() time.Duration
+}
+
+// sequentialTimeoutProvider is timeoutProvider for a provider that is also
+// sequential: wrapping must not hide Sequential() from lego, or providers
+// that cannot hold two TXT records at once would be run in parallel.
+type sequentialTimeoutProvider struct {
+	timeoutProvider
+	seq sequentialProvider
+}
+
+func (s sequentialTimeoutProvider) Sequential() time.Duration { return s.seq.Sequential() }
+
+// withPropagationTimeout overrides p's propagation timeout, keeping p's
+// interval (or 2s) and forwarding the optional Sequential() interface.
 func withPropagationTimeout(p challenge.Provider, timeout time.Duration) challenge.Provider {
 	if timeout <= 0 {
 		return p
@@ -72,5 +90,9 @@ func withPropagationTimeout(p challenge.Provider, timeout time.Duration) challen
 			interval = iv
 		}
 	}
-	return timeoutProvider{Provider: p, timeout: timeout, interval: interval}
+	tp := timeoutProvider{Provider: p, timeout: timeout, interval: interval}
+	if sp, ok := p.(sequentialProvider); ok {
+		return sequentialTimeoutProvider{timeoutProvider: tp, seq: sp}
+	}
+	return tp
 }
