@@ -62,7 +62,11 @@ func (w *world) observe(ctx context.Context) Observed {
 		w.t.Fatal(err)
 	}
 	known, lk := ObservedFromRoutes(routes)
-	dobs, _ := GatherObserved(ctx, map[string]dns.Provider{dzp: w.prov}, w.st, DNSZoneRefs(w.cfg), 0)
+	at := w.clock // the cycle's time (cycle sets it first)
+	if at.IsZero() {
+		at = time.Now()
+	}
+	dobs, _ := GatherObservedAt(ctx, map[string]dns.Provider{dzp: w.prov}, w.st, DNSZoneRefs(w.cfg), 0, at)
 	o := Observed{Known: known, LastKnown: lk}
 	dobs.Fill(&o)
 	return o
@@ -71,6 +75,7 @@ func (w *world) observe(ctx context.Context) Observed {
 func (w *world) cycle(now time.Time, desired ...model.Service) ([]Action, error) {
 	w.t.Helper()
 	ctx := context.Background()
+	w.clock = now
 	return w.reconcileAt(now, desired, w.observe(ctx))
 }
 

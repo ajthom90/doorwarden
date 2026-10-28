@@ -478,12 +478,16 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 		if moved {
 			cfg.Zones[0].TargetIP, val = newTarget, newTarget
 		}
-		ack := r.Intn(4) == 0
-		if ack {
-			obs.RepairMassOK = map[string]time.Time{"dnsp/example.test": t0.Add(-time.Duration(r.Intn(20)) * time.Hour)}
+		now := t0.Add(time.Duration(r.Intn(120)) * time.Minute)
+		ack := false
+		if r.Intn(4) == 0 {
+			at := t0.Add(-time.Duration(r.Intn(26)) * time.Hour)
+			obs.RepairMassOK = map[string]time.Time{"dnsp/example.test": at}
+			ack = massOKValid(at, now)
 		}
+		obs.RepairDue = map[string]bool{}
 		var desired []model.Service
-		var eligibleMissing []string // names of unblocked eligible missing rows
+		var eligibleMissing []string // names of unblocked, due, eligible missing rows
 		var presentChanged []string  // names of eligible present rows needing an update
 		wanted, miss := 0, 0
 		total, pMiss := 1+r.Intn(40), r.Float64()
@@ -505,7 +509,13 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 			}
 			obs.Owned = append(obs.Owned, o)
 			k := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
-			isMissing, blocked, drifted := r.Float64() < pMiss, false, false
+			isMissing, blocked, drifted, notDue := r.Float64() < pMiss, false, false, false
+			switch r.Intn(8) { // a repair backoff, for any row
+			case 0, 1:
+				obs.RepairDue[k], notDue = false, true
+			case 2:
+				obs.RepairDue[k] = true
+			}
 			if isMissing {
 				obs.OwnedMissing[k] = true
 				if r.Intn(8) == 0 {
@@ -521,7 +531,7 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 				wanted++
 				if isMissing {
 					miss++
-					if !blocked {
+					if !blocked && !notDue {
 						eligibleMissing = append(eligibleMissing, o.Name)
 					}
 				} else if !drifted && o.Value != val {
@@ -531,7 +541,7 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 		}
 		r.Shuffle(len(desired), func(i, j int) { desired[i], desired[j] = desired[j], desired[i] })
 		r.Shuffle(len(obs.Owned), func(i, j int) { obs.Owned[i], obs.Owned[j] = obs.Owned[j], obs.Owned[i] })
-		acts := Plan(desired, obs, cfg, t0)
+		acts := Plan(desired, obs, cfg, now)
 		var got, gotPresent []string
 		for _, a := range ofKind(acts, DNSEnsure) {
 			k := OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)
@@ -580,10 +590,16 @@ func TestPropertyDNSRepairBreaker(t *testing.T) {
 			acked++
 		}
 		sort.Strings(eligibleMissing)
-		if len(eligibleMissing) > RepairCapPerZone {
+		if n := len(eligibleMissing); n > RepairCapPerZone {
 			capped++
-			eligibleMissing = eligibleMissing[:RepairCapPerZone]
-		} else if len(eligibleMissing) > 0 {
+			off := RepairRotation("dnsp/example.test", now, n)
+			var w []string
+			for i := 0; i < RepairCapPerZone; i++ {
+				w = append(w, eligibleMissing[(off+i)%n])
+			}
+			sort.Strings(w)
+			eligibleMissing = w
+		} else if n > 0 {
 			under++
 		}
 		if !reflect.DeepEqual(got, eligibleMissing) && (len(got) != 0 || len(eligibleMissing) != 0) {

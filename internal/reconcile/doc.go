@@ -455,9 +455,18 @@
 // acknowledged pair whose remaining missing rows are all blocked by foreign
 // records, or not due, lists nothing and keeps its acknowledgement until it
 // expires (24h at most). Otherwise at most RepairCapPerZone (5) repairs are
-// emitted per pair, the first by (name, type, owner key); the rest follow in
-// later cycles. A wildcard zone has at most one eligible row, so its breaker
-// never trips.
+// emitted per pair, chosen among the DUE rows only: GatherObservedAt reads
+// the repair backoff (below) into Observed.RepairDue (OwnedRowKey -> due at
+// the plan's time; an absent row is due; a state the clock left more than
+// 1h ahead is due so the executor can clamp it). A row waiting for its
+// backoff is skipped silently, takes no slot, and still counts as wanted and
+// missing for the breaker. The due rows are sorted by (name, type, owner
+// key) and the 5 sent are a window starting at RepairRotation(pair, now, n)
+// (wrapping; 0 when all fit): a hash of the pair and the plan's minute, so
+// rows that keep failing without a backoff (repair-class re-creates have
+// none) cannot hold the cap, and no cycle interval locks the window onto
+// the same rows. The rest follow in later cycles. A wildcard zone has at
+// most one eligible row, so its breaker never trips.
 //
 // Repair-class updates (ownedUpdate): a wanted owned row (same owner) whose
 // desired value changed (a target_ip change) is updated, DNSEnsure with the
@@ -546,8 +555,9 @@
 // its RouteRemove was applied (removal past grace, or a conflict loser);
 // pass Observed.Owned (with RemovedAfter) as EVERY ownership row in the
 // store, not only the configured provider/zone pairs, plus Foreign,
-// OwnedMissing, OwnedDrifted and RepairMassOK (GatherObserved does all of
-// it: DNSObservation.Fill); notify an operator for a Skip with
+// OwnedMissing, OwnedDrifted, RepairMassOK and RepairDue (GatherObservedAt
+// at the plan's time does all of it: DNSObservation.Fill; GatherObserved is
+// it at time.Now()); notify an operator for a Skip with
 // Action.Alert set; give the DNS executor a RepairStateStore (a
 // *store.Store as its Store is enough) or every repair is refused; register the DNS executor for every kind in DNSActionKinds
 // (RegisterDNSExecutor; it persists, reassigns and forgets ownership rows

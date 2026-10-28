@@ -72,10 +72,16 @@ func TestPlanRepairBreakerAndCap(t *testing.T) {
 				if len(sk) != 0 {
 					t.Fatalf("breaker tripped: %v", sums(sk))
 				}
-				// the first by name
+				// a window of the missing rows by name, from RepairRotation
+				off := RepairRotation("dnsp/example.test", t0, c.missing)
+				var want []string
+				for i := 0; i < len(r); i++ {
+					want = append(want, fmt.Sprintf("s%02d.example.test", (off+i)%c.missing))
+				}
+				sort.Strings(want)
 				for i, s := range r {
-					if want := fmt.Sprintf("s%02d.example.test", i); !strings.Contains(s, want) {
-						t.Fatalf("repair %d is %s, want %s", i, s, want)
+					if !strings.Contains(s, want[i]+" ") {
+						t.Fatalf("repair %d is %s, want %s (all %v)", i, s, want[i], r)
 					}
 				}
 				return

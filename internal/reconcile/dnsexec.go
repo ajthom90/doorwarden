@@ -1392,7 +1392,7 @@ func (b *dnsBatch) repair(ctx context.Context, t dnsTarget, a Action) error {
 	if err != nil {
 		return fmt.Errorf("reading the repair backoff of %s: %w", t, err) // never unbounded
 	}
-	if st.Attempts > 0 && now.Unix() < st.NextAt {
+	if !repairIsDue(st, now) {
 		e.log.DebugContext(ctx, "owned DNS record missing; repair not due yet", "provider", t.provider, "zone", t.zone,
 			"name", t.name, "type", t.typ, "attempts", st.Attempts, "next_at", time.Unix(st.NextAt, 0).UTC())
 		return nil
@@ -1462,20 +1462,37 @@ func loadRepairState(ctx context.Context, kv RepairStateStore, key string, now t
 	if err != nil || !ok {
 		return repairState{}, err
 	}
-	var st repairState
-	if json.Unmarshal([]byte(v), &st) != nil || st.Attempts < 0 || now.Sub(time.Unix(st.LastAt, 0)) > repairStateStale {
-		return repairState{}, nil
-	}
-	if lim := now.Add(repairBackoffMax).Unix(); st.NextAt > lim {
-		// the clock went back: clamp, and persist it so the wait ends at
-		// most repairBackoffMax after the first read that saw it
-		st.NextAt, st.LastAt = lim, min(st.LastAt, now.Unix())
+	st, clamped := parseRepairState(v, now)
+	if clamped {
+		// the clock went back: persist the clamp so the wait ends at most
+		// repairBackoffMax after the first read that saw it
 		v, _ := json.Marshal(st)
 		if err := kv.SetSetting(context.WithoutCancel(ctx), key, string(v)); err != nil {
 			return repairState{}, err
 		}
 	}
 	return st, nil
+}
+
+// parseRepairState decodes a repair kv value as of now, without writing:
+// unreadable JSON, negative attempts or a state older than repairStateStale
+// is the fresh (zero) state; a NextAt past now+repairBackoffMax is clamped
+// to it (clamped reports that, for the caller to persist).
+func parseRepairState(v string, now time.Time) (st repairState, clamped bool) {
+	if json.Unmarshal([]byte(v), &st) != nil || st.Attempts < 0 || now.Sub(time.Unix(st.LastAt, 0)) > repairStateStale {
+		return repairState{}, false
+	}
+	if lim := now.Add(repairBackoffMax).Unix(); st.NextAt > lim {
+		st.NextAt, st.LastAt = lim, min(st.LastAt, now.Unix())
+		return st, true
+	}
+	return st, false
+}
+
+// repairIsDue reports whether a repair with backoff state rs may be sent at
+// now.
+func repairIsDue(rs repairState, now time.Time) bool {
+	return rs.Attempts <= 0 || now.Unix() >= rs.NextAt
 }
 
 // pendingUpdateTTL: a pending update older than this is ignored.
@@ -1614,13 +1631,14 @@ type DNSObservation struct {
 	OwnedMissing map[string]bool
 	OwnedDrifted map[string][]dns.Record
 	RepairMassOK map[string]time.Time
+	RepairDue    map[string]bool
 }
 
-// Fill sets o's Owned, Foreign, OwnedMissing, OwnedDrifted and
-// RepairMassOK.
+// Fill sets o's Owned, Foreign, OwnedMissing, OwnedDrifted, RepairMassOK
+// and RepairDue.
 func (d DNSObservation) Fill(o *Observed) {
 	o.Owned, o.Foreign, o.OwnedMissing, o.OwnedDrifted = d.Owned, d.Foreign, d.OwnedMissing, d.OwnedDrifted
-	o.RepairMassOK = d.RepairMassOK
+	o.RepairMassOK, o.RepairDue = d.RepairMassOK, d.RepairDue
 }
 
 // GatherObserved builds Observed.Owned, Foreign, OwnedMissing,
@@ -1651,8 +1669,24 @@ func (d DNSObservation) Fill(o *Observed) {
 // *store.Store does), keyed provider+"/"+zone; Plan decides whether it is
 // still valid. When they cannot be read it is empty (the breaker holds) and
 // the error is in errs.
+//
+// GatherObserved is GatherObservedAt at time.Now().
 func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st OwnershipStore, zones []ZoneRef,
 	timeout time.Duration) (obs DNSObservation, errs []error) {
+	return GatherObservedAt(ctx, providers, st, zones, timeout, time.Now())
+}
+
+// GatherObservedAt is GatherObserved that also fills RepairDue as of now
+// (pass the time the plan is made for): for every Owned row with a live
+// repair backoff (kv repair keys, read when st lists kv keys by prefix),
+// whether its next attempt is due. A stale or unparsable state is absent
+// (due); a next attempt dated past now+repairBackoffMax (the clock went
+// back) is due, so the executor gets to persist the clamp, which then holds
+// it at most repairBackoffMax. When the keys cannot be read RepairDue
+// is empty (every row due; the executor still enforces the backoff) and the
+// error is in errs.
+func GatherObservedAt(ctx context.Context, providers map[string]dns.Provider, st OwnershipStore, zones []ZoneRef,
+	timeout time.Duration, now time.Time) (obs DNSObservation, errs []error) {
 	if timeout <= 0 {
 		timeout = DefaultDNSCallTimeout
 	}
@@ -1670,6 +1704,10 @@ func GatherObserved(ctx context.Context, providers map[string]dns.Provider, st O
 	obs.RepairMassOK, err = readRepairMassOK(ctx, st)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("reading mass-repair acknowledgements: %w", err))
+	}
+	obs.RepairDue, err = readRepairDue(ctx, st, all, now)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("reading DNS repair backoff: %w", err))
 	}
 	seen := map[string]bool{}
 	for _, zr := range zones {
@@ -1742,6 +1780,32 @@ func readRepairMassOK(ctx context.Context, st any) (map[string]time.Time, error)
 		at, perr := time.Parse(time.RFC3339, strings.TrimSpace(v))
 		if ok && perr == nil {
 			out[p+"/"+normName(z)] = at
+		}
+	}
+	return out, nil
+}
+
+// readRepairDue maps OwnedRowKey of each row in rows that has a live repair
+// backoff in st's kv to whether its next attempt is due at now.
+func readRepairDue(ctx context.Context, st any, rows []store.DNSRecord, now time.Time) (map[string]bool, error) {
+	out := map[string]bool{}
+	l, ok := st.(repairStateLister)
+	if !ok {
+		return out, nil
+	}
+	kv, err := l.ListSettingsWithPrefix(ctx, "dns/repair/")
+	if err != nil {
+		return out, err
+	}
+	for _, r := range rows {
+		v, ok := kv[repairKey(r.Provider, r.Zone, r.Name, r.Type)]
+		if !ok {
+			continue
+		}
+		// a clamped state (the clock went back) counts as due: only the
+		// executor persists the clamp, so it must get to see the row once
+		if rs, clamped := parseRepairState(v, now); rs.Attempts > 0 {
+			out[OwnedRowKey(r.Provider, r.Zone, r.Name, r.Type)] = clamped || repairIsDue(rs, now)
 		}
 	}
 	return out, nil

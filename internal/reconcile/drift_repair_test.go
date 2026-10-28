@@ -631,11 +631,12 @@ func TestDNSE2EUnconfirmedLandedNoopAndReset(t *testing.T) {
 	if v, ok, _ := w.st.GetSetting(context.Background(), key); !ok || !strings.Contains(v, `"attempts":1`) {
 		t.Fatalf("state %q %v", v, ok)
 	}
-	// cycle 3, within the backoff: the gather lags again; no provider call
+	// cycle 3, within the backoff: the gather lags again; the repair is
+	// not due, so it is not planned (and no provider call)
 	l.setHide("app.example.test", 1)
 	n = len(w.fk.Calls())
 	acts = w.mustCycle(t0.Add(time.Minute+30*time.Second), app)
-	if len(repairs(acts)) != 1 || len(w.writes(n)) != 0 {
+	if len(repairs(acts)) != 0 || len(w.writes(n)) != 0 {
 		t.Fatalf("plan %v writes %v", sums(acts), w.writes(n))
 	}
 	// cycle 4, due: the gather lags, the executor's listing sees it: no-op,

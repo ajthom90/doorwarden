@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net/netip"
 	"sort"
 	"strings"
@@ -647,7 +648,14 @@ func (p *planner) planRepairs() {
 				Provider: rp.provider, Alert: AlertDNSMassMissing, Reason: breakerReason(rp)})
 			continue
 		}
-		c := rp.cands
+		// only due rows take a slot; the rest wait for their backoff (still
+		// counted in wanted/missing above)
+		var c []Action
+		for _, a := range rp.cands {
+			if due, ok := p.obs.RepairDue[OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)]; !ok || due {
+				c = append(c, a)
+			}
+		}
 		if tripped {
 			for i := range c {
 				c[i].Reason += fmt.Sprintf(" (mass repair of %s/%s acknowledged at %s: %d of %d missing)",
@@ -664,10 +672,26 @@ func (p *planner) planRepairs() {
 			}
 			return a.Owner < b.Owner
 		})
+		off := RepairRotation(k, p.now, len(c))
 		for i := 0; i < len(c) && i < RepairCapPerZone; i++ {
-			p.emit(c[i])
+			p.emit(c[(off+i)%len(c)])
 		}
 	}
+}
+
+// RepairRotation is where, in the sorted due repairs of the pair pk
+// (provider+"/"+zone), the RepairCapPerZone repairs sent at now start
+// (wrapping around): 0 when all fit, else a hash of pk and now's minute
+// modulo n. It moves every minute, so rows that fail without a backoff
+// cannot hold the cap forever, and being hashed it never locks onto the
+// same few offsets whatever the cycle interval is.
+func RepairRotation(pk string, now time.Time, n int) int {
+	if n <= RepairCapPerZone {
+		return 0
+	}
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s|%d", pk, now.Unix()/60)
+	return int(h.Sum64() % uint64(n))
 }
 
 // breakerReason is the self-describing text of a breaker Skip: what is

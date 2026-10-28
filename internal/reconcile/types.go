@@ -170,6 +170,12 @@ type Observed struct {
 	// (store.AcknowledgeMassRepair). While it is younger than RepairMassOKTTL
 	// a tripped mass-repair breaker lets the capped repairs through.
 	RepairMassOK map[string]time.Time
+	// RepairDue maps OwnedRowKey of an Owned row with a live repair backoff
+	// (kv dns/repair/...) to whether its next attempt is due at the time
+	// given to GatherObservedAt. A row absent from it is due. Plan spends
+	// the per-zone repair cap only on due rows; a row that is not due is
+	// skipped silently but still counts toward the mass-repair breaker.
+	RepairDue map[string]bool
 }
 
 // OwnedRowKey identifies an ownership row in Observed.OwnedMissing and
