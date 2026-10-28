@@ -46,11 +46,20 @@ type doc struct {
 	} `yaml:"http"`
 }
 
+// mustRender renders and drops KindNoCertificate Problems: the route tests
+// render without certificates; certificate coverage has its own tests
+// (TestRenderNoCertificateForHost).
 func mustRender(t *testing.T, routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Options) (Files, []Problem, doc) {
 	t.Helper()
-	f, probs, err := Render(routes, mw, certs, opts)
+	f, all, err := Render(routes, mw, certs, opts)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var probs []Problem
+	for _, p := range all {
+		if p.Kind != KindNoCertificate {
+			probs = append(probs, p)
+		}
 	}
 	var d doc
 	b := f[RoutesFile]
@@ -486,12 +495,15 @@ func TestRenderTLSFile(t *testing.T) {
       keyFile: /data/certs/a/privkey.pem
     - certFile: /data/certs/b/fullchain.pem
       keyFile: /data/certs/b/privkey.pem
+  options:
+    default:
+      minVersion: VersionTLS12
 `
 	if got := string(f[TLSFile]); got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
 	}
 	f, _, _ = Render(nil, nil, nil, Options{})
-	if got := string(f[TLSFile]); got != Header+"tls: {}\n" {
+	if got := string(f[TLSFile]); got != Header+"tls:\n  options:\n    default:\n      minVersion: VersionTLS12\n" {
 		t.Fatalf("empty tls file %q", got)
 	}
 	f, _, _ = Render(nil, nil, certs[1:2], Options{})

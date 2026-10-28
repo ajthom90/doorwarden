@@ -30,6 +30,14 @@
 //     an invalid one is not rendered and routes using it are skipped.
 //   - Certificates come from tls.certificates in TLSFile; routers carry an
 //     empty "tls: {}" and never a certResolver (Traefik's ACME is not used).
+//     Traefik picks the certificate by SNI. A rendered router whose hostname
+//     no rendered certificate covers gets a KindNoCertificate Problem (it is
+//     still rendered; Traefik serves the default certificate for it).
+//   - TLSFile also carries tls.options.default (minVersion, and sniStrict
+//     only when Options.SNIStrict) and, when Options.DefaultCert is set,
+//     tls.stores.default.defaultCertificate. See tls.go for the selection
+//     policy (CertsFromRows). Certificate paths include the version
+//     directory, so a re-issue changes TLSFile and Traefik reloads.
 package traefik
 
 import (
@@ -67,7 +75,12 @@ const InsecureTransport = "doorwarden-insecure"
 const (
 	DefaultEntryPoint = "websecure"
 	DefaultPathPrefix = "/certs"
+	// DefaultMinTLSVersion is tls.options.default.minVersion.
+	DefaultMinTLSVersion = "VersionTLS12"
 )
+
+// MinTLSVersions are the accepted Options.MinTLSVersion values.
+var MinTLSVersions = []string{"VersionTLS12", "VersionTLS13"}
 
 // Problem kinds.
 const (
@@ -94,8 +107,11 @@ type Files map[string][]byte
 // TLSCert is one certificate for tls.certificates. CertFile and KeyFile are
 // slash-separated paths RELATIVE to Options.PathPrefix, i.e. as Traefik sees
 // them below the certificate mount; no key material is read. An entry
-// without Domains is not rendered.
+// without Domains is not rendered. Domains are the certificate's names
+// (wildcards as "*.zone"); Traefik itself matches on the SANs in the file.
+// ID and Zone identify the store row (informational; set by CertsFromRows).
 type TLSCert struct {
+	ID, Zone          string
 	Domains           []string
 	CertFile, KeyFile string
 }
@@ -114,6 +130,16 @@ type Options struct {
 	// ExternalMiddlewares allowlists qualified references ("name@provider")
 	// to middlewares defined outside doorwarden's definitions.
 	ExternalMiddlewares []string
+	// DefaultCert, when set, becomes tls.stores.default.defaultCertificate
+	// (paths as in TLSCert). nil: none, Traefik generates its own.
+	DefaultCert *TLSCert
+	// MinTLSVersion for tls.options.default: one of MinTLSVersions; default
+	// DefaultMinTLSVersion.
+	MinTLSVersion string
+	// SNIStrict sets tls.options.default.sniStrict: handshakes without SNI
+	// or with a name no certificate matches are rejected instead of getting
+	// the default certificate. Off by default.
+	SNIStrict bool
 }
 
 // Problem reports something not rendered.
@@ -122,11 +148,14 @@ type Problem struct {
 	// Key and Hostname identify the route (empty for definition and cert
 	// problems); Middleware names the reference or definition involved.
 	Key, Hostname, Middleware string
-	Detail                    string
+	// Cert is the certificate row id (certificate problems from
+	// CertsFromRows).
+	Cert   string
+	Detail string
 }
 
 func (p Problem) String() string {
-	return fmt.Sprintf("%s %s %s %s: %s", p.Kind, p.Hostname, p.Key, p.Middleware, p.Detail)
+	return fmt.Sprintf("%s %s %s %s %s: %s", p.Kind, p.Hostname, p.Key, p.Middleware, p.Cert, p.Detail)
 }
 
 // Name returns the Traefik object name (router and service) for a service
@@ -201,11 +230,22 @@ type tlsDoc struct {
 	TLS tlsConf `yaml:"tls"`
 }
 
-// tlsConf holds tls.certificates only. Task 17 hook: the per-zone default
-// certificate (tls.stores.default.defaultCertificate and SNI-default
-// selection) is added here by Task 17; it is deliberately not rendered yet.
+// tlsConf: certificates (SNI-matched), the default options and the default
+// store (see tls.go for why there is one default certificate, not one per
+// zone).
 type tlsConf struct {
-	Certificates []certEntry `yaml:"certificates,omitempty"`
+	Certificates []certEntry          `yaml:"certificates,omitempty"`
+	Options      map[string]tlsOption `yaml:"options"`
+	Stores       map[string]tlsStore  `yaml:"stores,omitempty"`
+}
+
+type tlsOption struct {
+	MinVersion string `yaml:"minVersion"`
+	SNIStrict  bool   `yaml:"sniStrict,omitempty"`
+}
+
+type tlsStore struct {
+	DefaultCertificate certEntry `yaml:"defaultCertificate"`
 }
 
 type certEntry struct {
@@ -290,6 +330,13 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 			return nil, nil, fmt.Errorf("traefik: external middleware: %w", err)
 		}
 	}
+	minVer := opts.MinTLSVersion
+	if minVer == "" {
+		minVer = DefaultMinTLSVersion
+	}
+	if !contains(MinTLSVersions, minVer) {
+		return nil, nil, fmt.Errorf("traefik: min TLS version %q must be one of %s", minVer, strings.Join(MinTLSVersions, ", "))
+	}
 
 	var probs []Problem
 	conf := httpConf{Routers: map[string]router{}, Services: map[string]service{},
@@ -347,22 +394,32 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 	}
 
 	// Certificates.
+	certEntryFor := func(c TLSCert) (certEntry, *Problem) {
+		for _, p := range []string{c.CertFile, c.KeyFile} {
+			if err := cleanPath(p, false); err != nil {
+				return certEntry{}, &Problem{Kind: KindInvalidCert, Cert: c.ID,
+					Detail: fmt.Sprintf("certificate for %s: %s", strings.Join(c.Domains, ","), err)}
+			}
+		}
+		return certEntry{CertFile: path.Join(prefix, c.CertFile), KeyFile: path.Join(prefix, c.KeyFile)}, nil
+	}
 	var entries []certEntry
+	var covered []string // names of the rendered certificates
+	seenEntry := map[certEntry]bool{}
 	for _, c := range certs {
 		if len(c.Domains) == 0 {
 			continue
 		}
-		bad := ""
-		for _, p := range []string{c.CertFile, c.KeyFile} {
-			if err := cleanPath(p, false); err != nil && bad == "" {
-				bad = err.Error()
-			}
-		}
-		if bad != "" {
-			probs = append(probs, Problem{Kind: KindInvalidCert, Detail: fmt.Sprintf("certificate for %s: %s", strings.Join(c.Domains, ","), bad)})
+		e, p := certEntryFor(c)
+		if p != nil {
+			probs = append(probs, *p)
 			continue
 		}
-		entries = append(entries, certEntry{CertFile: path.Join(prefix, c.CertFile), KeyFile: path.Join(prefix, c.KeyFile)})
+		covered = append(covered, c.Domains...)
+		if !seenEntry[e] {
+			seenEntry[e] = true
+			entries = append(entries, e)
+		}
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].CertFile != entries[j].CertFile {
@@ -370,26 +427,50 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 		}
 		return entries[i].KeyFile < entries[j].KeyFile
 	})
+	tc := tlsConf{Certificates: entries,
+		Options: map[string]tlsOption{"default": {MinVersion: minVer, SNIStrict: opts.SNIStrict}}}
+	if d := opts.DefaultCert; d != nil {
+		if e, p := certEntryFor(*d); p != nil {
+			p.Detail = "default " + p.Detail + " (no default certificate rendered)"
+			probs = append(probs, *p)
+		} else {
+			tc.Stores = map[string]tlsStore{"default": {DefaultCertificate: e}}
+		}
+	}
 
+	// Routers whose hostname no rendered certificate covers.
+	for name, r := range conf.Routers {
+		h := strings.TrimSuffix(strings.TrimPrefix(r.Rule, "Host(`"), "`)")
+		if !covers(covered, h) {
+			probs = append(probs, Problem{Kind: KindNoCertificate, Key: seenName[name], Hostname: h,
+				Detail: fmt.Sprintf("no certificate covers %s; Traefik serves the default certificate for it", h)})
+		}
+	}
+
+	sortProblems(probs)
+
+	rb, err := marshal(routesDoc{HTTP: conf})
+	if err != nil {
+		return nil, nil, err
+	}
+	tb, err := marshal(tlsDoc{TLS: tc})
+	if err != nil {
+		return nil, nil, err
+	}
+	return Files{RoutesFile: rb, TLSFile: tb}, probs, nil
+}
+
+// sortProblems orders problems deterministically.
+func sortProblems(probs []Problem) {
 	sort.Slice(probs, func(i, j int) bool {
 		a, b := probs[i], probs[j]
-		for _, c := range [][2]string{{a.Hostname, b.Hostname}, {a.Key, b.Key}, {a.Kind, b.Kind}, {a.Middleware, b.Middleware}, {a.Detail, b.Detail}} {
+		for _, c := range [][2]string{{a.Hostname, b.Hostname}, {a.Key, b.Key}, {a.Cert, b.Cert}, {a.Kind, b.Kind}, {a.Middleware, b.Middleware}, {a.Detail, b.Detail}} {
 			if c[0] != c[1] {
 				return c[0] < c[1]
 			}
 		}
 		return false
 	})
-
-	rb, err := marshal(routesDoc{HTTP: conf})
-	if err != nil {
-		return nil, nil, err
-	}
-	tb, err := marshal(tlsDoc{TLS: tlsConf{Certificates: entries}})
-	if err != nil {
-		return nil, nil, err
-	}
-	return Files{RoutesFile: rb, TLSFile: tb}, probs, nil
 }
 
 // ByHostname groups rows by lowercased hostname. Each group is sorted so

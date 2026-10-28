@@ -248,7 +248,8 @@ func (c *composer) assertAgreesWithPlan(acts []reconcile.Action) {
 	}
 	skipped := map[string]bool{}
 	for _, p := range c.probs {
-		if p.Kind != traefik.KindShadowed && p.Key != "" {
+		// KindNoCertificate is about a route that IS rendered.
+		if p.Kind != traefik.KindShadowed && p.Kind != traefik.KindNoCertificate && p.Key != "" {
 			skipped[p.Key] = true
 		}
 	}

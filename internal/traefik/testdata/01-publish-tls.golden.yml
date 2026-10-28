@@ -3,3 +3,6 @@ tls:
   certificates:
     - certFile: /certs/example.test/fullchain.pem
       keyFile: /certs/example.test/privkey.pem
+  options:
+    default:
+      minVersion: VersionTLS12
