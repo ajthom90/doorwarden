@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -150,6 +151,9 @@ func (c *Client) Call(ctx context.Context, method string, params ...any) (json.R
 		_ = c.dropLocked()
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, ctxErr(cerr, method)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, ctxErr(err, method)
 		}
 		if attempt == 0 && reused {
 			continue // stale connection: reconnect, re-auth and retry once
@@ -313,6 +317,12 @@ func ctxErr(err error, method string) error {
 func ctxOr(ctx context.Context, err error) error {
 	if cerr := ctx.Err(); cerr != nil {
 		return cerr
+	}
+	// The socket deadline is derived from ctx's deadline and can fire a
+	// moment before ctx's own timer; that is still the ctx deadline.
+	var ne net.Error
+	if _, has := ctx.Deadline(); has && errors.As(err, &ne) && ne.Timeout() {
+		return context.DeadlineExceeded
 	}
 	return err
 }
