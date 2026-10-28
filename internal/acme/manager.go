@@ -289,7 +289,7 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 		return nil, err
 	}
 	legoLogOnce.Do(func() {
-		legolog.Logger = slog.NewLogLogger(redactHandler{inner: slog.Default().Handler(), r: globalRedactor}, slog.LevelDebug)
+		legolog.Logger = slog.NewLogLogger(redactHandler{inner: defaultHandler{}, r: globalRedactor}, slog.LevelDebug)
 	})
 	m.cleanupCertDirs(context.Background())
 	return m, nil
@@ -1167,8 +1167,8 @@ func (m *Manager) dnsChallengeProvider(name string) (challenge.Provider, error) 
 	if len(ignored) > 0 {
 		m.log.Debug("acme: provider settings not used by the lego provider", "provider", name, "type", pc.Type, "keys", strings.Join(ignored, ","))
 	}
-	for _, v := range env {
-		m.red.add(v)
+	for k, v := range settings {
+		m.registerSetting(cat, k, settingEnvName(cat, k), v)
 	}
 	p, err := withEnv(env, func() (challenge.Provider, error) { return m.providerByName(pc.Type) })
 	if err != nil {

@@ -3,12 +3,17 @@ package acme
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"log/slog"
 	"net/url"
+	"os"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -18,8 +23,9 @@ import (
 // which (1) rewrites URLs (userinfo, query and fragment removed), (2)
 // replaces every secret value known to the Manager, (3) scrubs generic
 // credential patterns. Truncation happens only after redaction. The raw
-// error is kept in memory only, as the Unwrap target of the returned
-// error, so errors.Is/As keep working.
+// error is kept in memory only: a returned error never unwraps to it;
+// errors.Is is answered through it (sentinels, context errors) and
+// errors.As only for allowlisted types (*DeferredError).
 
 // minSecretLen is the shortest secret that is redacted by value; shorter
 // ones would destroy unrelated text and are reported at construction.
@@ -34,9 +40,43 @@ type redactor struct {
 	mu      sync.RWMutex
 	set     map[string]bool
 	ordered []string // longest first
+	// hex holds lowercase hexadecimal secrets, matched case-insensitively.
+	hex []string
 }
 
 func newRedactor() *redactor { return &redactor{set: map[string]bool{}} }
+
+// encodedForms returns v and the forms it commonly takes inside error text
+// and logs: URL path and query escaping, JSON/Go string escaping and, for
+// values of 8 or more bytes, standard and URL base64 (padded and raw).
+func encodedForms(v string) []string {
+	out := []string{v, url.PathEscape(v), url.QueryEscape(v)}
+	if q := strconv.Quote(v); len(q) >= 2 {
+		out = append(out, q[1:len(q)-1])
+	}
+	if js, err := json.Marshal(v); err == nil && len(js) >= 2 {
+		out = append(out, string(js[1:len(js)-1]))
+	}
+	if len(v) >= 8 {
+		b := []byte(v)
+		out = append(out, base64.StdEncoding.EncodeToString(b), base64.URLEncoding.EncodeToString(b),
+			base64.RawStdEncoding.EncodeToString(b), base64.RawURLEncoding.EncodeToString(b))
+	}
+	return out
+}
+
+func isHex(v string) bool {
+	if len(v) < minSecretLen {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
 
 // globalRedactor knows the secrets of every Manager in the process; it
 // guards lego's package-level logger.
@@ -61,9 +101,17 @@ func (r *redactor) add(vals ...string) bool {
 			ok = false
 			continue
 		}
-		if !r.set[v] {
-			r.set[v] = true
-			changed = true
+		for _, f := range encodedForms(v) {
+			if len(f) >= minSecretLen && !r.set[f] {
+				r.set[f] = true
+				changed = true
+			}
+		}
+		if isHex(v) {
+			lv := strings.ToLower(v)
+			if !slices.Contains(r.hex, lv) {
+				r.hex = append(r.hex, lv)
+			}
 		}
 	}
 	if changed {
@@ -105,23 +153,37 @@ var (
 	}{
 		{regexp.MustCompile(`(?i)\bBearer\s+\S+`), "Bearer " + redacted},
 		{regexp.MustCompile(`(?i)\bAuthorization:\s*\S+(\s+\S+)?`), "Authorization: " + redacted},
-		{regexp.MustCompile(`(?i)(token|secret|key|password|hmac)=[^&\s]+`), "${1}=" + redacted},
+		{regexp.MustCompile(`(?i)((?:token|secret|key|password|hmac|authorization)["']?\s*[:=]\s*["']?)[^&\s,"']+`), "${1}" + redacted},
 		{regexp.MustCompile(`(?i)("(?:[a-z_]*token|[a-z_]*secret|password|[a-z_]*key|hmac)"\s*:\s*")[^"]*"`), "${1}" + redacted + `"`},
 		{regexp.MustCompile(`(?i)((?:key|token|secret)[a-z_-]*["']?\s*[:=]?\s*["']?)[A-Za-z0-9+/_=-]{32,}`), "${1}" + redacted},
 	}
 )
 
 // sanitizeURL keeps scheme, host and path; drops userinfo, query and
-// fragment ("?[redacted]" marks a removed query).
+// fragment ("?[redacted]" marks a removed query). Userinfo is everything
+// between "://" and the LAST '@' before any '?' or '#', so a password
+// containing '@' or '/' is removed entirely, parseable or not.
 func sanitizeURL(raw string) string {
 	trail := ""
 	for strings.HasSuffix(raw, ".") || strings.HasSuffix(raw, ",") || strings.HasSuffix(raw, ")") || strings.HasSuffix(raw, ";") {
 		trail = raw[len(raw)-1:] + trail
 		raw = raw[:len(raw)-1]
 	}
+	user := ""
+	if i := strings.Index(raw, "://"); i >= 0 {
+		rest := raw[i+3:]
+		end := len(rest)
+		if j := strings.IndexAny(rest, "?#"); j >= 0 {
+			end = j
+		}
+		if at := strings.LastIndex(rest[:end], "@"); at >= 0 {
+			raw = raw[:i+3] + rest[at+1:]
+			user = redacted + "@"
+		}
+	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" && u.Opaque != "" {
-		// Unparseable: cut everything after '?' or '#', and userinfo.
+	if err != nil || u.Host == "" && u.Opaque != "" || u.User != nil {
+		// Unparseable: cut everything after '?' or '#'.
 		s := raw
 		if i := strings.IndexAny(s, "?#"); i >= 0 {
 			q := s[i] == '?'
@@ -130,24 +192,13 @@ func sanitizeURL(raw string) string {
 				s += "?" + redacted
 			}
 		}
-		if i := strings.Index(s, "://"); i >= 0 {
-			rest := s[i+3:]
-			end := strings.IndexAny(rest, "/")
-			if end < 0 {
-				end = len(rest)
-			}
-			if at := strings.LastIndex(rest[:end], "@"); at >= 0 {
-				s = s[:i+3] + redacted + "@" + rest[at+1:]
-			}
+		if i := strings.Index(s, "://"); i >= 0 && user != "" {
+			s = s[:i+3] + user + s[i+3:]
 		}
 		return s + trail
 	}
 	hadQuery := u.RawQuery != "" || u.ForceQuery
-	out := u.Scheme + "://"
-	if u.User != nil {
-		out += redacted + "@"
-	}
-	out += u.Host + u.EscapedPath()
+	out := u.Scheme + "://" + user + u.Host + u.EscapedPath()
 	if hadQuery {
 		out += "?" + redacted
 	}
@@ -176,7 +227,41 @@ func (r *redactor) knownSecrets(s string) string {
 			s = strings.ReplaceAll(s, v, redacted)
 		}
 	}
+	for _, h := range r.hex {
+		s = replaceFoldASCII(s, h)
+	}
 	return s
+}
+
+// replaceFoldASCII replaces every ASCII-case-insensitive occurrence of the
+// lowercase needle in s.
+func replaceFoldASCII(s, needle string) string {
+	low := asciiLower(s)
+	if !strings.Contains(low, needle) {
+		return s
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(low, needle)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		b.WriteString(s[:i])
+		b.WriteString(redacted)
+		s, low = s[i+len(needle):], low[i+len(needle):]
+	}
+}
+
+// asciiLower lowercases ASCII letters only, so byte offsets are preserved.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // errText is the redacted, then truncated, text of err. URLs carried by
@@ -220,18 +305,32 @@ func truncate(s string) string {
 	return s
 }
 
-// redactedError carries redacted text; the raw cause stays reachable only
-// through Unwrap (for errors.Is/As), never through Error().
+// redactedError carries redacted text. It deliberately has no Unwrap: the
+// raw cause (whose text or fields may hold secrets) is never handed out.
+// errors.Is is answered through the cause (sentinels, context errors);
+// errors.As only for allowlisted types whose content is already redacted.
 type redactedError struct {
 	msg   string
 	cause error
 }
 
 func (e *redactedError) Error() string { return e.msg }
-func (e *redactedError) Unwrap() error { return e.cause }
 
-// safeErr returns err with redacted text. Sentinels and errors whose text
-// needs no redaction are returned as is.
+// Is reports whether the cause matches target (errors.Is semantics).
+func (e *redactedError) Is(target error) bool { return errors.Is(e.cause, target) }
+
+// As fills target from the cause only for *DeferredError (its texts come
+// from the redacted store); every other type is refused.
+func (e *redactedError) As(target any) bool {
+	switch target.(type) {
+	case **DeferredError:
+		return errors.As(e.cause, target)
+	}
+	return false
+}
+
+// safeErr returns err wrapped as a *redactedError with redacted text (an
+// already wrapped error is returned as is).
 func (r *redactor) safeErr(err error) error {
 	if err == nil {
 		return nil
@@ -239,10 +338,7 @@ func (r *redactor) safeErr(err error) error {
 	if _, ok := err.(*redactedError); ok {
 		return err
 	}
-	if t := r.errText(err); t != err.Error() {
-		return &redactedError{msg: t, cause: err}
-	}
-	return err
+	return &redactedError{msg: r.errText(err), cause: err}
 }
 
 // redactHandler redacts the message and every string, error and
@@ -302,6 +398,38 @@ func (h redactHandler) WithGroup(name string) slog.Handler {
 	return redactHandler{inner: h.inner.WithGroup(name), r: h.r}
 }
 
+// defaultHandler forwards to slog.Default()'s handler as it is at log
+// time, so a default logger installed after the first Manager (lego's
+// logger is a process global set once) still receives lego's output.
+// WithAttrs/WithGroup are recorded and replayed on each record.
+type defaultHandler struct {
+	ops []func(slog.Handler) slog.Handler
+}
+
+func (h defaultHandler) current() slog.Handler {
+	out := slog.Default().Handler()
+	for _, op := range h.ops {
+		out = op(out)
+	}
+	return out
+}
+
+func (h defaultHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return slog.Default().Handler().Enabled(ctx, l)
+}
+
+func (h defaultHandler) Handle(ctx context.Context, rec slog.Record) error {
+	return h.current().Handle(ctx, rec)
+}
+
+func (h defaultHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return defaultHandler{ops: append(slices.Clip(h.ops), func(x slog.Handler) slog.Handler { return x.WithAttrs(as) })}
+}
+
+func (h defaultHandler) WithGroup(name string) slog.Handler {
+	return defaultHandler{ops: append(slices.Clip(h.ops), func(x slog.Handler) slog.Handler { return x.WithGroup(name) })}
+}
+
 // redactNotifier redacts event text before delivery.
 type redactNotifier struct {
 	inner Notifier
@@ -316,11 +444,100 @@ func (n redactNotifier) Notify(ctx context.Context, ev Event) {
 // secretKeyRe matches setting names that hold credentials.
 var secretKeyRe = regexp.MustCompile(`(?i)(token|secret|key|pass|hmac|credential|auth|private)`)
 
+// fileSettingRe matches lego settings whose value names a file holding
+// credentials (<VAR>_FILE, TSIG key files, keytabs, private key and
+// service-account files).
+var fileSettingRe = regexp.MustCompile(`(_FILE|_PATH)$`)
+
+// maxSecretFile bounds a credential file read for redaction.
+const maxSecretFile = 1 << 20
+
+// secretFileValues reads a credential file (regular, at most 1 MiB) and
+// returns its trimmed contents and each trimmed line. The path itself is
+// not a secret and is never returned.
+func secretFileValues(path string) ([]string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxSecretFile+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxSecretFile {
+		return nil, errors.New("file too large")
+	}
+	vals := []string{strings.TrimSpace(string(b))}
+	for _, l := range strings.Split(string(b), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			vals = append(vals, l)
+		}
+	}
+	// Key-like tokens inside config-style files (a TSIG file's
+	// secret "...";, JSON service-account fields).
+	vals = append(vals, keyTokenRe.FindAllString(string(b), -1)...)
+	return vals, nil
+}
+
+// keyTokenRe matches base64/hex-like tokens long enough to be key material.
+var keyTokenRe = regexp.MustCompile(`[A-Za-z0-9+/=_-]{16,}`)
+
+// plainURL reports a URL without userinfo or query: an endpoint, not a
+// credential (redacting it would only remove useful context).
+func plainURL(v string) bool {
+	u, err := url.Parse(v)
+	return err == nil && u.Scheme != "" && u.Host != "" && u.User == nil && u.RawQuery == "" && !strings.Contains(v, "@")
+}
+
+// isCredentialSetting reports whether a provider setting holds a secret:
+// it maps to one of the provider's documented Credentials (or its _FILE
+// form), or its name (setting key or lego variable) looks like one.
+// Additional settings (TTLs, timeouts, base URLs) are not secrets.
+func isCredentialSetting(cat ChallengeProvider, key, envName string) bool {
+	if envName != "" {
+		for _, c := range cat.Credentials {
+			if envName == c || envName == c+"_FILE" {
+				return true
+			}
+		}
+	}
+	return secretKeyRe.MatchString(key) || (envName != "" && secretKeyRe.MatchString(envName))
+}
+
+// registerSetting registers one provider setting's secret value(s): for a
+// file setting the file's contents, otherwise the value itself (unless it
+// is a plain endpoint URL). It returns false when a value is too short to
+// redact.
+func (m *Manager) registerSetting(cat ChallengeProvider, key, envName, value string) bool {
+	if value == "" {
+		return true
+	}
+	if envName != "" && fileSettingRe.MatchString(envName) {
+		vals, err := secretFileValues(value)
+		if err != nil {
+			m.log.Warn("acme: credential file cannot be read for redaction", "setting", key, "err", err.Error())
+			return true
+		}
+		m.red.add(vals...)
+		return true
+	}
+	if !isCredentialSetting(cat, key, envName) || plainURL(value) {
+		return true
+	}
+	return m.red.add(value)
+}
+
 // registerConfigSecrets registers every credential the configuration
-// holds: provider settings whose name looks like a credential or that map
-// to a lego environment variable (all of which are set in the process
-// environment for lego), and EAB values. Values shorter than minSecretLen
-// cannot be redacted and are reported.
+// holds (see registerSetting) and EAB values. Values shorter than
+// minSecretLen cannot be redacted and are reported.
 func (m *Manager) registerConfigSecrets() {
 	names := make([]string, 0, len(m.cfg.Providers))
 	for n := range m.cfg.Providers {
@@ -329,30 +546,18 @@ func (m *Manager) registerConfigSecrets() {
 	sort.Strings(names)
 	for _, n := range names {
 		pc := m.cfg.Providers[n]
-		var mapped map[string]bool
-		if cat, ok := LookupChallengeProvider(pc.Type); ok {
-			mapped = map[string]bool{}
-			for k := range pc.Extra {
-				env, _ := envForSettings(cat, map[string]string{k: "x"})
-				if len(env) > 0 {
-					mapped[k] = true
-				}
-			}
-		}
+		cat, _ := LookupChallengeProvider(pc.Type)
 		keys := make([]string, 0, len(pc.Extra))
 		for k := range pc.Extra {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			if !mapped[k] && !secretKeyRe.MatchString(k) {
-				continue
-			}
 			v, err := m.settingValue(pc.Extra[k])
 			if err != nil || v == "" {
 				continue
 			}
-			if !m.red.add(v) {
+			if !m.registerSetting(cat, k, settingEnvName(cat, k), v) {
 				m.log.Warn("acme: credential is too short to be redacted from errors and logs", "provider", n, "setting", k)
 			}
 		}
@@ -371,4 +576,13 @@ func (m *Manager) registerConfigSecrets() {
 			m.log.Warn("acme: credential is too short to be redacted from errors and logs", "issuer", n, "setting", "eab_hmac")
 		}
 	}
+}
+
+// settingEnvName is the lego variable a setting key maps to ("" if none).
+func settingEnvName(cat ChallengeProvider, key string) string {
+	env, _ := envForSettings(cat, map[string]string{key: "x"})
+	for k := range env {
+		return k
+	}
+	return ""
 }
