@@ -1118,6 +1118,7 @@ func (m *Manager) renew(ctx context.Context) []Result {
 		return []Result{{Err: fmt.Errorf("acme: list certs: %w", err)}}
 	}
 	now := m.now()
+	m.pruneState(ctx, rows, now)
 	var out []Result
 	for _, r := range rows {
 		due := r.NotAfter.IsZero() || r.NotAfter.Sub(now) <= m.renewBefore
@@ -1182,6 +1183,62 @@ func (m *Manager) renew(ctx context.Context) []Result {
 		cancel()
 	}
 	return out
+}
+
+// pruneState deletes kv bookkeeping that can no longer matter: attempt
+// state and expiry notices of certificate ids with no row (unless an order
+// for that id is running: a first issuance has no row yet), expiry notices
+// for an earlier expiry date of a certificate, and failed-validation
+// counters with nothing in the last hour.
+func (m *Manager) pruneState(ctx context.Context, rows []store.Cert, now time.Time) {
+	notAfter := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		notAfter[r.ID] = r.NotAfter.Unix()
+	}
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	del := func(k string) {
+		if err := m.st.DeleteSetting(ctx, k); err != nil {
+			m.log.Warn("acme: prune state", "key", k, "err", err)
+		}
+	}
+	list := func(prefix string) []string {
+		ks, err := m.st.ListSettingKeys(ctx, prefix)
+		if err != nil {
+			m.log.Warn("acme: prune state", "prefix", prefix, "err", err)
+		}
+		return ks
+	}
+	for _, k := range list("acme/attempt/") {
+		id := strings.TrimPrefix(k, "acme/attempt/")
+		if _, ok := notAfter[id]; ok || m.isInFlight(id) {
+			continue
+		}
+		del(k)
+	}
+	for _, k := range list("acme/notified/") {
+		// acme/notified/<id>/<threshold>/<not after>
+		parts := strings.Split(strings.TrimPrefix(k, "acme/notified/"), "/")
+		if len(parts) == 3 {
+			if na, ok := notAfter[parts[0]]; ok && strconv.FormatInt(na, 10) == parts[2] {
+				continue
+			}
+		}
+		del(k)
+	}
+	for _, k := range list("acme/fv/") {
+		var ts []int64
+		if _, err := m.kv.getJSON(ctx, k, &ts); err == nil && len(within(ts, now, time.Hour)) > 0 {
+			continue
+		}
+		del(k)
+	}
+}
+
+func (m *Manager) isInFlight(id string) bool {
+	m.flightMu.Lock()
+	defer m.flightMu.Unlock()
+	return m.inflight[id]
 }
 
 // rowWanted applies ManagerConfig.Wanted to a certificate row.

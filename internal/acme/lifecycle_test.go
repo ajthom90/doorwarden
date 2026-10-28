@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -271,5 +272,61 @@ func TestSwitchOverrideMustMatchConfiguredDirectory(t *testing.T) {
 	h.reopen(t)
 	if _, ok, _ := h.st.GetSetting(ctx, overrideKey("le")); ok {
 		t.Fatal("foreign override kept")
+	}
+}
+
+// Renew prunes bookkeeping of certificates that no longer exist, expiry
+// notices of replaced certificates and expired failed-validation counters.
+func TestRenewPrunesStaleState(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	b, err := h.m.Issue(ctx, wildcardReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := h.row(t, b.ID)
+	old := time.Unix(r.NotAfter.Unix()-86400, 0)
+	now := h.clock.Now()
+	set := map[string]string{
+		attemptKey("ghost-1"):                       `{"failures":2}`,
+		attemptKey(b.ID):                            `{"failures":0}`,
+		notifiedKey("ghost-1", 24*time.Hour, old):   "x",
+		notifiedKey(b.ID, 24*time.Hour, old):        "x",
+		notifiedKey(b.ID, 24*time.Hour, r.NotAfter): "x",
+		fvKey("le", "stale.example.test"):           fmt.Sprintf("[%d]", now.Add(-2*time.Hour).Unix()),
+		fvKey("le", "fresh.example.test"):           fmt.Sprintf("[%d]", now.Add(-time.Minute).Unix()),
+	}
+	for k, v := range set {
+		if err := h.st.SetSetting(ctx, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.m.Renew(ctx)
+	gone := []string{attemptKey("ghost-1"), notifiedKey("ghost-1", 24*time.Hour, old), notifiedKey(b.ID, 24*time.Hour, old), fvKey("le", "stale.example.test")}
+	kept := []string{attemptKey(b.ID), notifiedKey(b.ID, 24*time.Hour, r.NotAfter), fvKey("le", "fresh.example.test")}
+	for _, k := range gone {
+		if _, ok, _ := h.st.GetSetting(ctx, k); ok {
+			t.Errorf("%s not pruned", k)
+		}
+	}
+	for _, k := range kept {
+		if _, ok, _ := h.st.GetSetting(ctx, k); !ok {
+			t.Errorf("%s pruned", k)
+		}
+	}
+}
+
+// The attempt record of a first issuance in progress (no row yet) is kept.
+func TestPruneKeepsInFlightAttempt(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	if !h.m.markInFlight("pending-1") {
+		t.Fatal("mark")
+	}
+	defer h.m.clearInFlight("pending-1")
+	if err := h.st.SetSetting(ctx, attemptKey("pending-1"), `{"failures":1}`); err != nil {
+		t.Fatal(err)
+	}
+	h.m.Renew(ctx)
+	if _, ok, _ := h.st.GetSetting(ctx, attemptKey("pending-1")); !ok {
+		t.Fatal("in-flight attempt pruned")
 	}
 }
