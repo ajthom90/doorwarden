@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -92,11 +93,20 @@ func Load(path string, env func(string) (string, bool)) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	text, err := substituteEnv(string(raw), env)
-	if err != nil {
-		return nil, fmt.Errorf("config %s: %w", path, err)
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	dec := yaml.NewDecoder(bytes.NewReader([]byte(text)))
+	var missing []string
+	substituteNode(&root, env, &missing)
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("config %s: unset environment variable(s) with no default: %s", path, strings.Join(missing, ", "))
+	}
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode config %s: %w", path, err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(out))
 	dec.KnownFields(true)
 	var c Config
 	if err := dec.Decode(&c); err != nil && err != io.EOF {

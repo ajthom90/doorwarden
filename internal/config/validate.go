@@ -12,6 +12,9 @@ type Capabilities struct{ WildcardA bool }
 
 // Validate returns every problem found, not just the first.
 func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) []error {
+	if caps == nil {
+		caps = func(string) (Capabilities, bool) { return Capabilities{}, true }
+	}
 	var errs []error
 	add := func(f string, a ...any) { errs = append(errs, fmt.Errorf(f, a...)) }
 

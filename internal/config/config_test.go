@@ -64,7 +64,7 @@ func hasErr(errs []error, sub string) bool {
 }
 
 func TestEnvSubstitution(t *testing.T) {
-	yml := strings.Replace(base, "api_token: tok", "api_token: ${A}, region: ${B:-x}", 1)
+	yml := strings.Replace(base, "api_token: tok", "api_token: \"${A}\", region: \"${B:-x}\"", 1)
 	c, err := loadStr(t, yml, map[string]string{"A": "secret"})
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestEnvSubstitution(t *testing.T) {
 }
 
 func TestUnsetVarFails(t *testing.T) {
-	yml := strings.Replace(base, "api_token: tok", "api_token: ${UNSET_VAR}", 1)
+	yml := strings.Replace(base, "api_token: tok", "api_token: \"${UNSET_VAR}\"", 1)
 	_, err := loadStr(t, yml, nil)
 	if err == nil || !strings.Contains(err.Error(), "UNSET_VAR") {
 		t.Fatalf("err = %v", err)
@@ -84,8 +84,9 @@ func TestUnsetVarFails(t *testing.T) {
 }
 
 func TestUnknownKeyFails(t *testing.T) {
-	if _, err := loadStr(t, base+"bogus: 1\n", nil); err == nil {
-		t.Fatal("expected error")
+	_, err := loadStr(t, base+"bogus: 1\n", nil)
+	if err == nil || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -141,6 +142,57 @@ func TestUnknownProviderRef(t *testing.T) {
 func TestZoneRequiredFields(t *testing.T) {
 	yml := strings.Replace(base, "target_ip: 192.0.2.10", "target_ip: notip", 1)
 	if errs := mustLoad(t, yml).Validate(caps(true)); !hasErr(errs, "target_ip") {
+		t.Fatalf("errs = %v", errs)
+	}
+}
+
+func tokenWith(t *testing.T, yamlVal string, env map[string]string) *Config {
+	t.Helper()
+	yml := strings.Replace(base, "api_token: tok", "api_token: "+yamlVal, 1)
+	c, err := loadStr(t, yml, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestSecretValuesSurvive(t *testing.T) {
+	for _, v := range []string{"abc #x", "a: b", "*star", "&amp", "!bang", "{x", "[y", "@at", "null", "true", "0123", "line1\nline2\nevil_key: 1", "- item"} {
+		c := tokenWith(t, `"${S}"`, map[string]string{"S": v})
+		if got := c.Providers["cf"].Extra["api_token"]; got != v {
+			t.Errorf("value %q became %#v", v, got)
+		}
+		if len(c.Providers["cf"].Extra) != 1 {
+			t.Errorf("value %q injected keys: %#v", v, c.Providers["cf"].Extra)
+		}
+	}
+}
+
+func TestNoReExpansion(t *testing.T) {
+	c := tokenWith(t, `"${S}"`, map[string]string{"S": "${T}", "T": "boom"})
+	if got := c.Providers["cf"].Extra["api_token"]; got != "${T}" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestUnsetVarInCommentOK(t *testing.T) {
+	if _, err := loadStr(t, "# uses ${NOPE}\n"+base, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnsetVarsAllNamed(t *testing.T) {
+	yml := strings.Replace(base, "api_token: tok", "api_token: \"${M1}-${M2}\"", 1)
+	_, err := loadStr(t, yml, nil)
+	if err == nil || !strings.Contains(err.Error(), "M1") || !strings.Contains(err.Error(), "M2") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestValidateNilCaps(t *testing.T) {
+	yml := strings.Replace(base, "mode: per-host", "mode: wildcard", 1)
+	errs := mustLoad(t, yml).Validate(nil)
+	if !hasErr(errs, "wildcard") {
 		t.Fatalf("errs = %v", errs)
 	}
 }
