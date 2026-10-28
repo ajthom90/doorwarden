@@ -250,3 +250,16 @@ func TestContextTimeout(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestAPIURLRejectedFromConfig(t *testing.T) {
+	_, err := dns.New("cloudflare", map[string]any{"api_token": fakeToken, "api_url": "https://evil.example.test"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), fakeToken) {
+		t.Fatalf("err = %v", err)
+	}
+	sch, _ := dns.SchemaFor("cloudflare")
+	for _, f := range sch.Fields {
+		if f.Name == "api_url" {
+			t.Fatal("api_url in schema")
+		}
+	}
+}

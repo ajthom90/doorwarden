@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -73,7 +74,45 @@ func New(base string, insecureSkipVerify bool, timeout time.Duration) (*Client, 
 		MaxIdleConnsPerHost:   2,
 		IdleConnTimeout:       30 * time.Second,
 	}
-	return &Client{Base: u, HC: &http.Client{Transport: tr, Timeout: timeout}, MaxBody: DefaultMaxBody}, nil
+	hc := &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: refuseCrossHost}
+	return &Client{Base: u, HC: hc, MaxBody: DefaultMaxBody}, nil
+}
+
+// refuseCrossHost stops redirects that leave the original host, so credential
+// headers (X-API-KEY, tokens, cookies) are never forwarded elsewhere.
+func refuseCrossHost(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	if !strings.EqualFold(req.URL.Host, via[0].URL.Host) || req.URL.Scheme != via[0].URL.Scheme {
+		return errors.New("refusing redirect to a different host or scheme")
+	}
+	return nil
+}
+
+// CheckURL validates the user-supplied base URL of a self-hosted provider:
+// http(s), host present, no userinfo. Plain http is allowed only for
+// loopback/private/link-local IPs, dot-less hostnames or "localhost", unless
+// allowInsecureHTTP is set (config "allow_insecure_http").
+func CheckURL(raw string, allowInsecureHTTP bool) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return errors.New("config field \"url\" must be an http(s) URL such as https://host[:port]")
+	}
+	if u.User != nil {
+		return errors.New("config field \"url\" must not embed credentials")
+	}
+	if u.Scheme == "http" && !allowInsecureHTTP && !privateHost(u.Hostname()) {
+		return errors.New("config field \"url\": plain http to a non-private host would send credentials in clear text; use https or set allow_insecure_http: true")
+	}
+	return nil
+}
+
+func privateHost(h string) bool {
+	if ip, err := netip.ParseAddr(h); err == nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	}
+	return h == "localhost" || !strings.Contains(h, ".")
 }
 
 // Close drops idle connections.

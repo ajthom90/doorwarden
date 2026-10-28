@@ -61,3 +61,44 @@ func TestRejectsCredentialsInURL(t *testing.T) {
 		t.Fatal("want error")
 	}
 }
+
+func TestCrossHostRedirectNotFollowed(t *testing.T) {
+	var got string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-API-KEY")
+	}))
+	defer other.Close()
+	// a different host name for the same loopback listener
+	target := strings.Replace(other.URL, "127.0.0.1", "localhost", 1)
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusFound)
+	}))
+	defer src.Close()
+	c, _ := httpx.New(src.URL, false, 0)
+	_, err := c.Do(context.Background(), "GET", "/", nil, http.Header{"X-API-KEY": {"k"}}, nil, nil)
+	if err == nil || got != "" {
+		t.Fatalf("redirect followed: err=%v key=%q", err, got)
+	}
+}
+
+func TestCheckURL(t *testing.T) {
+	ok := []struct {
+		u     string
+		allow bool
+	}{
+		{"https://dns.example.test", false}, {"http://10.0.0.5", false}, {"http://172.16.0.9:80", false},
+		{"http://127.0.0.1:1", false}, {"http://nas", false}, {"http://[fe80::1]:80", false},
+		{"http://dns.example.test", true},
+	}
+	for _, c := range ok {
+		if err := httpx.CheckURL(c.u, c.allow); err != nil {
+			t.Errorf("%s: %v", c.u, err)
+		}
+	}
+	bad := []string{"http://dns.example.test", "http://198.51.100.1", "http://192.0.2.1:8080", "ftp://x", "https://u:p@host", "https://", "host"}
+	for _, u := range bad {
+		if err := httpx.CheckURL(u, false); err == nil {
+			t.Errorf("%s accepted", u)
+		}
+	}
+}

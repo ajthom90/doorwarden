@@ -36,21 +36,23 @@ func init() {
 		if err != nil {
 			return nil, fmt.Errorf("cloudflare: %w", err)
 		}
-		api := DefaultAPI
-		if v, ok := cfg["api_url"].(string); ok && v != "" {
-			api = v
+		// The endpoint is fixed: a user-configurable URL would let a config
+		// edit send the bearer token to any host.
+		if _, present := cfg["api_url"]; present {
+			return nil, errors.New("cloudflare: config field \"api_url\" is not supported (the API endpoint is fixed)")
 		}
-		return New(Config{APIToken: tok, BaseURL: api})
+		return New(Config{APIToken: tok})
 	}, dns.ConfigSchema{Fields: []dns.Field{
 		{Name: "api_token", Secret: true, Required: true, Help: "API token with Zone:Read and DNS:Edit on the zones"},
-		{Name: "api_url", Help: "API base URL (default " + DefaultAPI + "); for testing"},
 	}}, staticCaps)
 }
 
 // Config configures a Provider.
 type Config struct {
 	APIToken secrets.Secret
-	BaseURL  string
+	// BaseURL overrides the API endpoint. Go-level test seam only; it is
+	// deliberately not reachable from user config.
+	BaseURL string
 }
 
 // Provider implements dns.Provider.
