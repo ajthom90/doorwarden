@@ -21,6 +21,7 @@ import (
 	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/secrets"
 	"github.com/ajthom90/doorwarden/internal/store"
+	"gopkg.in/yaml.v3"
 )
 
 func init() { subcommands["certs"] = runCerts }
@@ -90,8 +91,12 @@ func runCertsImportNPM(args []string, out io.Writer) int {
 	noteUnset(unset)
 	dir := *certsDir
 	if dir == "" {
-		// An unset ${VAR} in acme.certs_dir would silently fall back to
-		// the default directory, which the server may not use.
+		// An unset ${VAR} in acme.certs_dir expands to empty: the directory
+		// would silently fall back to the default, or "${DATA_ROOT}/certs"
+		// to "/certs", which the server may not use.
+		if vars := certsDirUnset(*cfgPath, unset); len(vars) > 0 {
+			return fail(fmt.Errorf("acme.certs_dir references unset variable(s) %s; pass -certs-dir or -env-file", strings.Join(vars, ", ")))
+		}
 		if cfg.ACME.CertsDir == "" && len(unset) > 0 {
 			return fail(fmt.Errorf("acme.certs_dir is empty and config variable(s) %s are unset; pass -certs-dir or -env-file", strings.Join(unset, ", ")))
 		}
@@ -105,31 +110,28 @@ func runCertsImportNPM(args []string, out io.Writer) int {
 	var st *store.Store
 	var box *secrets.Box
 	if *dry {
-		// The real run's database checks, without opening it.
+		// The real database, opened read-only, so the dry run makes the same
+		// skip decisions; certificates are validated in memory and nothing
+		// (no file, no key copy, no row) is written. The box is a random
+		// throwaway: no secret is decrypted.
 		if _, err := os.Stat(*dbPath); err != nil {
 			return fail(fmt.Errorf("database %s: %w", *dbPath, err))
 		}
 		if err := checkOwner("database", *dbPath, *allowOwner); err != nil {
 			return fail(err)
 		}
-		// Run the real import into a throwaway store and directory: every
-		// check is the same, nothing real is touched.
-		tmp, err := os.MkdirTemp("", "doorwarden-import-dry-")
-		if err != nil {
-			return fail(err)
-		}
-		defer os.RemoveAll(tmp)
-		if st, err = store.Open(filepath.Join(tmp, "dry.db")); err != nil {
+		if st, err = store.OpenReadOnly(*dbPath); err != nil {
 			return fail(err)
 		}
 		k := make([]byte, 32)
 		if _, err := rand.Read(k); err != nil {
+			st.Close()
 			return fail(err)
 		}
 		if box, err = secrets.NewBox(base64.RawStdEncoding.EncodeToString(k)); err != nil {
+			st.Close()
 			return fail(err)
 		}
-		dir = filepath.Join(tmp, "certs")
 	} else {
 		mk := os.Getenv("DOORWARDEN_MASTER_KEY")
 		if mk == "" {
@@ -149,7 +151,10 @@ func runCertsImportNPM(args []string, out io.Writer) int {
 		}
 	}
 	defer st.Close()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	var opts []acme.ImportOption
+	if *dry {
+		opts = append(opts, acme.ImportDryRun())
+	} else if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fail(fmt.Errorf("creating the certificate directory: %w", err))
 	}
 	sec := &app.SecretStore{KV: st, Box: box}
@@ -166,11 +171,44 @@ func runCertsImportNPM(args []string, out io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	rs, err := mgr.ImportNPMDir(ctx, src)
+	rs, err := mgr.ImportNPMDir(ctx, src, opts...)
 	if err != nil {
 		return fail(err)
 	}
 	return printImport(out, cfg, rs, *dry)
+}
+
+// certsDirUnset returns the unset variables (from unset) that the raw,
+// unexpanded acme.certs_dir references.
+func certsDirUnset(cfgPath string, unset []string) []string {
+	if len(unset) == 0 {
+		return nil
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		ACME struct {
+			CertsDir string `yaml:"certs_dir"`
+		} `yaml:"acme"`
+	}
+	if yaml.Unmarshal(raw, &doc) != nil {
+		return nil
+	}
+	isUnset := map[string]bool{}
+	for _, u := range unset {
+		isUnset[u] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range cliEnvRefRe.FindAllStringSubmatch(doc.ACME.CertsDir, -1) {
+		if isUnset[m[1]] && !seen[m[1]] {
+			seen[m[1]] = true
+			out = append(out, m[1])
+		}
+	}
+	return out
 }
 
 // npmLiveDir maps -npm-dir to what acme.ImportNPMDir takes: one npm-N
@@ -197,11 +235,11 @@ func npmLiveDir(d string) (string, error) {
 }
 
 func printImport(out io.Writer, cfg *config.Config, rs []acme.ImportResult, dry bool) int {
-	verb := "imported"
+	verb, skipVerb := "imported", "skipped"
 	if dry {
-		verb = "would import"
+		verb, skipVerb = "would import", "would skip"
 	}
-	failed, ok, staged := 0, 0, false
+	failed, ok, skipped, staged := 0, 0, 0, false
 	zones := map[string]bool{}
 	for _, r := range rs {
 		if r.Err != nil {
@@ -209,8 +247,14 @@ func printImport(out io.Writer, cfg *config.Config, rs []acme.ImportResult, dry 
 			fmt.Fprintf(out, "FAILED  %s: %v\n", r.Source, r.Err)
 			continue
 		}
-		ok++
 		b := r.Bundle
+		if r.Skipped {
+			skipped++
+			fmt.Fprintf(out, "%s  %s: %s\n  id:        %s\n  not after: %s (stored version, unchanged)\n",
+				skipVerb, r.Source, r.SkipReason, b.ID, b.NotAfter.UTC().Format(time.RFC3339))
+			continue
+		}
+		ok++
 		zones[b.Zone] = true
 		issuer := "unknown"
 		if leaf := leafOf(b.ChainPEM); leaf != nil {
@@ -230,6 +274,9 @@ func printImport(out io.Writer, cfg *config.Config, rs []acme.ImportResult, dry 
 			verb, r.Source, b.ID, b.Zone, strings.Join(b.Names, ", "), b.NotAfter.UTC().Format(time.RFC3339), issuer, state)
 	}
 	fmt.Fprintf(out, "\n%d certificate(s) %s, %d failed.\n", ok, verb, failed)
+	if skipped > 0 {
+		fmt.Fprintf(out, "%d certificate(s) %s: already stored, left unchanged.\n", skipped, skipVerb)
+	}
 	if dry {
 		fmt.Fprintln(out, "Dry run: nothing was written. Run again without -dry-run to import.")
 	}
