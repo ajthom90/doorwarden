@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 	"github.com/ajthom90/doorwarden/internal/store"
 )
 
-// ---- the acknowledgement is cleared at the end of every non-dry cycle ----
+// ---- the acknowledgement is cleared at the end of a non-dry cycle ----
 
 // holdAll gives every owned row of w a repair backoff that is not due for
 // the next hour.
@@ -110,26 +111,60 @@ func TestDNSE2EAckDryCycleKeeps(t *testing.T) {
 	}
 }
 
-// Presence is counted like the plan's: a record of someone else at an owned
-// name and type (another value and ID) does not make the row present.
-func TestDNSExecFinishForeignAtOwnedNameCountsMissing(t *testing.T) {
+// Finish counts missing rows exactly as the plan does (one listing, the
+// same classification): with d of 12 records deleted and c re-created out
+// of band with another value (drifted: wanted, not missing), the ack is
+// cleared iff the plan, given GatherObservedAt's Observed of that listing,
+// does not trip, and the cleared message carries the plan's missing count.
+func TestDNSExecFinishMissingCountMatchesPlan(t *testing.T) {
 	ctx := context.Background()
-	r := newClockRig(t)
-	for i := 0; i < 10; i++ {
-		name := fmt.Sprintf("s%02d.example.test", i)
-		r.addRow(t, name, "A", ip1, "gone-"+name, "docker:"+name)
-		if i < 2 {
-			r.seed(t, name, "A", ip1) // ours by value
-		} else {
-			r.seed(t, name, "A", "198.51.100.99") // foreign
-		}
-	}
-	if err := r.st.SetRepairMassOK(ctx, dzp, dz, t0); err != nil {
-		t.Fatal(err)
-	}
-	r.exec.Finish(ctx)
-	if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); !ok {
-		t.Fatal("cleared while 8 of 10 owned records are not ours at the provider")
+	for _, c := range []struct{ deleted, changed int }{
+		{0, 7}, // 7 changed out of band: drifted, not missing: no trip, cleared
+		{7, 0}, {7, 5}, {4, 4}, {6, 6}, {3, 9}, {12, 0}, {0, 12}, {9, 0}, {5, 0},
+	} {
+		t.Run(fmt.Sprintf("%d deleted %d changed", c.deleted, c.changed), func(t *testing.T) {
+			w, desired := ackWorld(t, 12)
+			recs := w.records()
+			for i, r := range recs {
+				if i >= c.deleted+c.changed {
+					break
+				}
+				if err := w.fk.DeleteRecord(ctx, dz, r); err != nil {
+					t.Fatal(err)
+				}
+				if i >= c.deleted {
+					if _, err := w.fk.CreateRecord(ctx, dz, dns.Record{Name: r.Name, Type: r.Type, Value: "198.51.100.99"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			obs := w.observe(ctx)
+			if len(obs.OwnedMissing) != c.deleted || len(obs.OwnedDrifted) != c.changed {
+				t.Fatalf("gather: missing %d drifted %d", len(obs.OwnedMissing), len(obs.OwnedDrifted))
+			}
+			tripped := len(breakerSkips(Plan(desired, obs, w.cfg, w.clock))) == 1
+			if err := w.st.SetRepairMassOK(ctx, dzp, dz, w.clock); err != nil {
+				t.Fatal(err)
+			}
+			w.de.Finish(ctx)
+			if w.ackPresent() != tripped {
+				t.Fatalf("plan tripped %v, ack kept %v", tripped, w.ackPresent())
+			}
+			if !tripped {
+				msgs, err := w.st.ListActivity(ctx, 50)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := fmt.Sprintf("cleared: %d of 12 owned records missing", c.deleted)
+				found := false
+				for _, m := range msgs {
+					found = found || strings.Contains(m.Message, want)
+				}
+				if !found {
+					t.Fatalf("no activity %q", want)
+				}
+			}
+		})
 	}
 }
 

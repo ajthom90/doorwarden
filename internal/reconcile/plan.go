@@ -642,7 +642,7 @@ func (p *planner) planRepairs() {
 		rp := p.repairPairs[k]
 		ackAt, acked := p.obs.RepairMassOK[k]
 		acked = acked && massOKValid(ackAt, p.now)
-		tripped := rp.missing > repairBreakerMinMissing && 2*rp.missing > rp.wanted
+		tripped := breakerTrips(rp.missing, rp.wanted)
 		if tripped && !acked {
 			p.emit(Action{Kind: Skip, Zone: rp.zone, Host: rp.zone, Key: RepairBreakerKey(rp.provider, rp.zone),
 				Provider: rp.provider, Alert: AlertDNSMassMissing, Reason: breakerReason(rp)})
@@ -692,6 +692,13 @@ func RepairRotation(pk string, now time.Time, n int) int {
 	h := fnv.New64a()
 	fmt.Fprintf(h, "%s|%d", pk, now.Unix()/60)
 	return int(h.Sum64() % uint64(n))
+}
+
+// breakerTrips is the mass-repair breaker condition: more than
+// repairBreakerMinMissing of wanted rows missing, and more than half. The
+// DNS executor's Finish uses it too, to clear acknowledgements.
+func breakerTrips(missing, wanted int) bool {
+	return missing > repairBreakerMinMissing && 2*missing > wanted
 }
 
 // breakerReason is the self-describing text of a breaker Skip: what is

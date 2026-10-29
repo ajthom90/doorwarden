@@ -25,6 +25,7 @@ type world struct {
 	fk     *fake.Fake
 	prov   dns.Provider // fk, or a test wrapper around it
 	runner *Runner
+	de     *DNSExecutor
 	// clock is the executors' now: each cycle sets it to the plan's time.
 	clock time.Time
 }
@@ -52,6 +53,7 @@ func newWorldWith(t *testing.T, mode string, wrap func(*fake.Fake) dns.Provider)
 		m.Handle(k, re)
 	}
 	w.runner = &Runner{Exec: m, Config: w.cfg}
+	w.de = de
 	return w
 }
 

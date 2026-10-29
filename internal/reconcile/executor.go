@@ -113,9 +113,10 @@ func (m *MultiExecutor) Apply(ctx context.Context, actions []Action, dryRun bool
 }
 
 // Finisher is an optional hook of a registered Executor: MultiExecutor
-// calls Finish once at the end of every non-dry Apply (each distinct
-// executor once, in sorted kind order of its first registration), whether
-// or not the plan had an action for it. Never in dry run. The DNS executor
+// calls Finish at the end of a non-dry Apply that was not cut short by
+// ctx.Err() (each distinct executor once, ordered by the smallest action
+// kind name it is registered for), whether or not the plan had an action
+// for it. Never in dry run. The DNS executor
 // uses it to clear mass-repair acknowledgements of recovered zones.
 type Finisher interface {
 	Finish(ctx context.Context)

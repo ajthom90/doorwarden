@@ -346,8 +346,9 @@ func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) 
 	return errors.Join(errs...)
 }
 
-// Finish implements Finisher: MultiExecutor calls it once at the end of
-// every non-dry Apply, whether or not the plan had a DNS action. It runs the
+// Finish implements Finisher: a MultiExecutor holding e calls it once at the
+// end of a non-dry Apply that was not cut short by ctx, whether or not the
+// plan had a DNS action (an e used directly as Runner.Exec never gets it). It runs the
 // repair-state sweep (at most hourly) and clearRecoveredAcks.
 func (e *DNSExecutor) Finish(ctx context.Context) {
 	e.mu.Lock()
@@ -361,12 +362,13 @@ func (e *DNSExecutor) Finish(ctx context.Context) {
 // the zone once (one call per acknowledged pair, every spelling of its key
 // grouped), and when no more than repairBreakerMinMissing, or no more than
 // half, of the pair's ownership rows not scheduled for removal are missing
-// there, it deletes every spelling of the key. A row counts as present only
-// when the listing holds OUR record at its name and type (its provider ID,
-// or its stored value), as the plan's gather does; a foreign record there,
-// or a drifted one, counts as missing, so the acknowledgement is never
-// cleared because of records that are not ours. A failed listing keeps the
-// acknowledgement. Never called in dry run. Best effort, logged.
+// there, it deletes every spelling of the key. Missing is decided by
+// classifyOwned, the same helper GatherObservedAt uses: a row is missing
+// only when NOTHING is listed at its name and type; a record there with
+// another value is drifted, which the plan counts as wanted and not
+// missing, and so does this. The threshold is the plan's breakerTrips,
+// over the rows not scheduled for removal. A failed listing keeps the acknowledgement.
+// Never called in dry run. Best effort, logged.
 func (e *DNSExecutor) clearRecoveredAcks(ctx context.Context) {
 	l, ok := e.repairKV.(repairStateLister)
 	if !ok {
@@ -408,17 +410,16 @@ func (e *DNSExecutor) clearRecoveredAcks(ctx context.Context) {
 			e.log.WarnContext(ctx, "clearing mass-repair acknowledgements: reading ownership rows failed", "provider", provider, "zone", zone, "error", err)
 			continue
 		}
-		total, missing := 0, 0
+		counted := rows[:0:0]
 		for _, r := range rows {
-			if r.RemovedAfter != nil {
-				continue
-			}
-			total++
-			if !ownRecordListed(recs, r) {
-				missing++
+			if r.RemovedAfter == nil {
+				counted = append(counted, r)
 			}
 		}
-		if missing > repairBreakerMinMissing && 2*missing > total {
+		miss := map[string]bool{}
+		classifyOwned(counted, recs, miss, nil)
+		total, missing := len(counted), len(miss)
+		if breakerTrips(missing, total) {
 			continue
 		}
 		keys := byPair[pk]
@@ -427,19 +428,6 @@ func (e *DNSExecutor) clearRecoveredAcks(ctx context.Context) {
 		e.activity(ctx, "info", fmt.Sprintf("mass-repair acknowledgement of %s/%s cleared: %d of %d owned records missing there now (the breaker applies again)",
 			provider, zone, missing, total))
 	}
-}
-
-// ownRecordListed reports whether recs holds row r's own record: same name
-// and type, and r's provider ID or stored value.
-func ownRecordListed(recs []dns.Record, r store.DNSRecord) bool {
-	name, typ, id := normName(r.Name), normType(r.Type), strings.TrimSpace(r.ProviderRecordID)
-	for _, x := range recs {
-		if normName(x.Name) == name && normType(x.Type) == typ &&
-			((id != "" && strings.TrimSpace(x.ID) == id) || sameValue(x.Value, r.Value)) {
-			return true
-		}
-	}
-	return false
 }
 
 // DNSActionKinds are every kind the DNS executor applies. Register the DNS
@@ -1770,38 +1758,57 @@ func GatherObservedAt(ctx context.Context, providers map[string]dns.Provider, st
 			errs = append(errs, fmt.Errorf("%s: listing records: %w", key, err))
 			continue
 		}
-		mine := map[string]bool{}
 		var rows []store.DNSRecord
 		for _, r := range all {
 			if r.Provider == zr.Provider && normName(r.Zone) == zn {
-				mine[normName(r.Name)+" "+normType(r.Type)] = true
 				rows = append(rows, r)
 			}
 		}
-		out := make([]dns.Record, 0, len(recs))
-		at := map[string][]dns.Record{}
-		for _, r := range recs {
-			r.Name, r.Type = normName(r.Name), normType(r.Type)
-			k := r.Name + " " + r.Type
-			if mine[k] {
-				at[k] = append(at[k], r)
-			} else {
-				out = append(out, r)
-			}
+		obs.Foreign[key] = classifyOwned(rows, recs, obs.OwnedMissing, obs.OwnedDrifted)
+	}
+	return obs, errs
+}
+
+// classifyOwned classifies the ownership rows of ONE provider/zone against
+// that pair's listing recs, as both GatherObservedAt and the DNS executor's
+// Finish (clearRecoveredAcks) do, so the breaker counts they use cannot
+// diverge: a row with no listed record at its name+type (any value, any
+// ID) is put in missing; listed records there, none with the stored value,
+// put it in drifted (the plan counts it wanted, not missing); otherwise it
+// is present. It returns the listing minus every record at an owned
+// name+type (the foreign records), names and types normalized. missing or
+// drifted may be nil (not recorded).
+func classifyOwned(rows []store.DNSRecord, recs []dns.Record, missing map[string]bool, drifted map[string][]dns.Record) []dns.Record {
+	mine := map[string]bool{}
+	for _, r := range rows {
+		mine[normName(r.Name)+" "+normType(r.Type)] = true
+	}
+	out := make([]dns.Record, 0, len(recs))
+	at := map[string][]dns.Record{}
+	for _, r := range recs {
+		r.Name, r.Type = normName(r.Name), normType(r.Type)
+		k := r.Name + " " + r.Type
+		if mine[k] {
+			at[k] = append(at[k], r)
+		} else {
+			out = append(out, r)
 		}
-		obs.Foreign[key] = out
-		for _, r := range rows {
-			listed := at[normName(r.Name)+" "+normType(r.Type)]
-			rk := OwnedRowKey(r.Provider, r.Zone, r.Name, r.Type)
-			switch {
-			case len(listed) == 0:
-				obs.OwnedMissing[rk] = true
-			case !anySameValue(listed, r.Value):
-				obs.OwnedDrifted[rk] = listed
+	}
+	for _, r := range rows {
+		listed := at[normName(r.Name)+" "+normType(r.Type)]
+		rk := OwnedRowKey(r.Provider, r.Zone, r.Name, r.Type)
+		switch {
+		case len(listed) == 0:
+			if missing != nil {
+				missing[rk] = true
+			}
+		case !anySameValue(listed, r.Value):
+			if drifted != nil {
+				drifted[rk] = listed
 			}
 		}
 	}
-	return obs, errs
+	return out
 }
 
 // readRepairMassOK reads every parsable mass-repair acknowledgement from st's

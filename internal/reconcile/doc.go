@@ -446,24 +446,28 @@
 // not dated more than 5 minutes ahead, a tripped pair gets the CAPPED
 // repairs (same selection and cap as below; their Reason says "acknowledged
 // at <time>") instead of the Skip. Clearing: MultiExecutor calls
-// DNSExecutor.Finish (the Finisher hook) at the end of EVERY non-dry Apply,
-// whether or not the plan had a DNS action. For every stored
+// DNSExecutor.Finish (the Finisher hook) at the end of a non-dry Apply,
+// whether or not the plan had a DNS action. That is every non-dry cycle
+// only when Runner.Exec is the MultiExecutor holding the DNS executor, and
+// not when Apply returns early on ctx.Err(). For every stored
 // acknowledgement of a managed pair (all spellings of its key grouped) it
-// lists the zone once and deletes every spelling when the breaker
-// condition no longer holds there: at most 3, or at most half, of the
-// pair's ownership rows not scheduled for removal are missing. A row is
-// present only when the listing holds OUR record at its name and type (its
-// provider ID or stored value); a foreign or drifted record there counts as
-// missing, so records that are not ours never clear it. The zone has
-// recovered (or never tripped), and a later mass loss trips the breaker
-// again rather than ride on an old acknowledgement; this holds even when
-// every remaining missing row waits for its backoff and nothing is planned.
-// A failed listing keeps it. The count covers rows the plan does not
-// count (an unavailable source's): present ones among them can clear it
-// while the plan would still trip, which only brings the Skip back. Finish
-// also runs the sweep (first non-dry Apply, then hourly), which deletes
-// acknowledgements that are expired, dated ahead, unreadable, or name a
-// provider/zone it does not manage. A dry run never lists for or clears
+// lists the zone once and classifies the pair's ownership rows not
+// scheduled for removal with classifyOwned, the helper GatherObservedAt
+// uses: missing only when nothing is listed at the row's name and type; a
+// record there with another value is drifted (wanted, not missing, as in
+// the plan). When breakerTrips (the plan's condition) no longer holds, it
+// deletes every spelling: the zone has recovered or never tripped, and a
+// later mass loss trips the breaker again rather than ride on an old
+// acknowledgement, even when every remaining missing row waits for its
+// backoff and nothing is planned. A failed listing keeps it. Finish counts
+// every row of the pair, including rows the plan leaves out (an unavailable
+// source's, owners no longer desired): missing ones among them can make
+// Finish keep an acknowledgement the plan no longer needs, until it expires
+// (RepairMassOKTTL, 24h); present ones can clear it while the plan would
+// still trip, which only brings the Skip back. Finish also runs the sweep
+// (first non-dry Apply, then hourly), which deletes acknowledgements that
+// are expired, dated ahead, unreadable, or name a provider/zone it does not
+// manage. A dry run never lists for or clears
 // one. Otherwise at most RepairCapPerZone (5) repairs are
 // emitted per pair, chosen among the DUE rows only: GatherObservedAt reads
 // the repair backoff (below) into Observed.RepairDue (OwnedRowKey -> due at
