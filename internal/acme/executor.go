@@ -21,8 +21,16 @@ import (
 // recovered per action. The strategy comes from the zone's configuration
 // (reconcile.Action has none); Action.Names give the names.
 type CertExecutor struct {
-	m   *Manager
-	log *slog.Logger
+	m        *Manager
+	log      *slog.Logger
+	onResult func(Result)
+}
+
+// OnResult sets f to receive every issuance result (including deferrals,
+// see Result.Err) and returns e. Set it before the first Apply.
+func (e *CertExecutor) OnResult(f func(Result)) *CertExecutor {
+	e.onResult = f
+	return e
 }
 
 // NewCertExecutor returns the executor for m.
@@ -61,6 +69,9 @@ func (e *CertExecutor) apply(ctx context.Context, a reconcile.Action) (errs []er
 	ictx, cancel := context.WithTimeout(ctx, e.m.issueTimeout)
 	defer cancel()
 	for _, r := range e.m.IssueAll(ictx, IssueRequest{Zone: a.Zone, Names: a.Names}) {
+		if e.onResult != nil {
+			e.onResult(r)
+		}
 		if r.Err != nil {
 			errs = append(errs, fmt.Errorf("certificate %s [%s]: %w", r.CertID, strings.Join(r.Names, ","), r.Err))
 		}

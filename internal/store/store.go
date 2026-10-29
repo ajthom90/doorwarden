@@ -44,6 +44,23 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// OpenReadOnly opens an existing database for reading only (SQLite
+// mode=ro): no migration runs and every write fails. Offline tools use it
+// to inspect the server's database without changing it.
+func OpenReadOnly(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("store: open: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s read-only: %w", path, err)
+	}
+	return &Store{db: db}, nil
+}
+
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 

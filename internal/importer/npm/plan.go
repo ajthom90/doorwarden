@@ -310,20 +310,21 @@ func RenderYAML(w io.Writer, ms []Mapping) error {
 	return err
 }
 
-// CertGuidance describes where NPM wildcard certificates live and the import
-// command the ACME stream will provide. TODO(docs): the command does not
-// exist yet; this is guidance text only.
+// CertGuidance describes where NPM wildcard certificates live and how
+// `doorwarden certs import-npm` imports them (every NPM certificate in
+// live/, wildcards included, so the cutover needs no re-issuance).
 func CertGuidance(snap *Snapshot) string {
 	var b strings.Builder
 	for _, c := range snap.Certificates {
 		if !c.IsWildcard {
 			continue
 		}
-		fmt.Fprintf(&b, "wildcard certificate %q (%s), expires %s\n  files: /etc/letsencrypt/live/npm-%d/ (inside the NPM data volume)\n  planned import (TODO, not yet available): doorwarden certs import-npm <npm-data>/letsencrypt/live/npm-%d/\n",
+		fmt.Fprintf(&b, "wildcard certificate %q (%s), expires %s\n  files: /etc/letsencrypt/live/npm-%d/ inside NPM\n  import: doorwarden certs import-npm -npm-dir <npm-letsencrypt>/live/npm-%d\n",
 			clean(c.NiceName), clean(strings.Join(c.Domains, ", ")), clean(c.ExpiresOn), c.ID, c.ID)
 	}
 	if b.Len() == 0 {
 		return "no wildcard certificates in NPM\n"
 	}
+	b.WriteString("  (<npm-letsencrypt> is the host directory NPM mounts at /etc/letsencrypt; -npm-dir <npm-letsencrypt> imports every NPM certificate; add -dry-run to check first)\n")
 	return b.String()
 }

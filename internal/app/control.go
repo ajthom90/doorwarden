@@ -234,6 +234,7 @@ func (a *App) RenewCert(ctx context.Context, id string) error {
 		return errNoACME
 	}
 	r := a.mgr.RenewNow(ctx, id)
+	a.countRenewal(r)
 	if r.Err == nil && !r.Skipped {
 		a.reRender(ctx)
 	}
@@ -257,6 +258,7 @@ func (a *App) SwitchProduction(ctx context.Context, issuer string) error {
 	}
 	var errs []error
 	for _, r := range rs {
+		a.countRenewal(r)
 		if r.Err != nil && !errors.Is(r.Err, acme.ErrDeferred) {
 			errs = append(errs, fmt.Errorf("%s: %w", r.CertID, r.Err))
 		}

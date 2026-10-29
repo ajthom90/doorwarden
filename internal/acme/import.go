@@ -30,7 +30,32 @@ type ImportResult struct {
 	// Expired is true when the certificate was already expired (it is still
 	// imported; its row's last_error says so).
 	Expired bool
-	Err     error
+	// Skipped is true when nothing was written because a row with the same
+	// id already holds an adopted (managed) or newer certificate; SkipReason
+	// says why. A skip is not an error.
+	Skipped    bool
+	SkipReason string
+	// DryRun is true when the certificate was validated but not stored
+	// (ImportDryRun); Bundle then carries no key.
+	DryRun bool
+	Err    error
+}
+
+// ImportOption changes how ImportPEM and ImportNPMDir behave.
+type ImportOption func(*importOpts)
+
+type importOpts struct{ dryRun bool }
+
+// ImportDryRun validates certificates and reports what would be imported
+// or skipped (using the store read-only) without writing files or rows.
+func ImportDryRun() ImportOption { return func(o *importOpts) { o.dryRun = true } }
+
+func importOptions(opts []ImportOption) importOpts {
+	var o importOpts
+	for _, f := range opts {
+		f(&o)
+	}
+	return o
 }
 
 // maxPEMSize bounds an imported PEM file.
@@ -41,13 +66,15 @@ const maxPEMSize = 1 << 20
 // every certificate name must lie inside the zone. An expired certificate
 // is imported but flagged (Expired, row last_error). Imported certificates
 // are never renewed automatically; see RenewNow. Re-importing the same leaf
-// is idempotent (same id).
-func (m *Manager) ImportPEM(ctx context.Context, zone string, fullchainPEM, keyPEM []byte) (*ImportResult, error) {
-	ir, err := m.importPEM(ctx, zone, fullchainPEM, keyPEM)
+// is idempotent (same id). When a row with the same id is already managed
+// (adopted), no longer imported, or holds a later expiry, nothing is
+// written and the result is Skipped: a newer version is never replaced.
+func (m *Manager) ImportPEM(ctx context.Context, zone string, fullchainPEM, keyPEM []byte, opts ...ImportOption) (*ImportResult, error) {
+	ir, err := m.importPEM(ctx, zone, fullchainPEM, keyPEM, importOptions(opts))
 	return ir, m.red.safeErr(err)
 }
 
-func (m *Manager) importPEM(ctx context.Context, zone string, fullchainPEM, keyPEM []byte) (*ImportResult, error) {
+func (m *Manager) importPEM(ctx context.Context, zone string, fullchainPEM, keyPEM []byte, o importOpts) (*ImportResult, error) {
 	z := normName(zone)
 	if _, ok := m.zone(z); !ok {
 		return nil, fmt.Errorf("acme: zone %q is not configured", zone)
@@ -94,6 +121,30 @@ func (m *Manager) importPEM(ctx context.Context, zone string, fullchainPEM, keyP
 		LastResult: "imported", Managed: false}
 	if expired {
 		row.LastError = "imported certificate is expired"
+	}
+	rows, err := m.st.ListCerts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acme: import: read certificates: %w", err)
+	}
+	for _, prev := range rows {
+		if prev.ID != id {
+			continue
+		}
+		reason := ""
+		switch {
+		case prev.Managed || prev.Status != StatusImported:
+			reason = fmt.Sprintf("already adopted: Doorwarden manages this certificate now (status %s)", prev.Status)
+		case prev.NotAfter.After(leaf.NotAfter):
+			reason = "a newer version is already stored"
+		}
+		if reason != "" {
+			return &ImportResult{Skipped: true, SkipReason: reason, DryRun: o.dryRun, Bundle: &Bundle{ID: id, Zone: z, Names: names,
+				NotAfter: prev.NotAfter, Dir: prev.Path, Managed: prev.Managed, ChainPEM: chainOut}}, nil
+		}
+	}
+	if o.dryRun {
+		return &ImportResult{Expired: expired, DryRun: true, Bundle: &Bundle{ID: id, Zone: z, Names: names, NotAfter: leaf.NotAfter,
+			ChainPEM: chainOut}}, nil
 	}
 	row, err = m.storeVersion(ctx, row, chainOut, keyOut)
 	if err != nil {
@@ -220,15 +271,15 @@ func certNames(c *x509.Certificate) []string {
 // imported. The zone of each certificate is the longest configured zone
 // containing all its names. One ImportResult per directory; a failing
 // directory does not stop the others.
-func (m *Manager) ImportNPMDir(ctx context.Context, dir string) ([]ImportResult, error) {
-	rs, err := m.importNPMDir(ctx, dir)
+func (m *Manager) ImportNPMDir(ctx context.Context, dir string, opts ...ImportOption) ([]ImportResult, error) {
+	rs, err := m.importNPMDir(ctx, dir, importOptions(opts))
 	for i := range rs {
 		rs[i].Err = m.red.safeErr(rs[i].Err)
 	}
 	return rs, m.red.safeErr(err)
 }
 
-func (m *Manager) importNPMDir(ctx context.Context, dir string) ([]ImportResult, error) {
+func (m *Manager) importNPMDir(ctx context.Context, dir string, o importOpts) ([]ImportResult, error) {
 	rd, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return nil, fmt.Errorf("acme: import: %w", err)
@@ -238,7 +289,7 @@ func (m *Manager) importNPMDir(ctx context.Context, dir string) ([]ImportResult,
 	}
 	root := importRoot(rd)
 	if _, err := os.Lstat(filepath.Join(rd, FullchainFile)); err == nil {
-		return []ImportResult{m.importDir(ctx, root, rd, dir)}, nil
+		return []ImportResult{m.importDir(ctx, root, rd, dir, o)}, nil
 	}
 	ents, err := os.ReadDir(rd)
 	if err != nil {
@@ -253,7 +304,7 @@ func (m *Manager) importNPMDir(ctx context.Context, dir string) ([]ImportResult,
 		if st, err := os.Stat(p); err != nil || !st.IsDir() { // a symlinked npm-N dir is followed
 			continue
 		}
-		out = append(out, m.importDir(ctx, root, p, filepath.Join(dir, e.Name())))
+		out = append(out, m.importDir(ctx, root, p, filepath.Join(dir, e.Name()), o))
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("acme: import: no npm-* certificate directories in %s", dir)
@@ -325,7 +376,7 @@ func readConfined(root, p string) ([]byte, error) {
 
 // importDir imports dir's fullchain.pem and privkey.pem (no other file is
 // read). shown is the path used in messages.
-func (m *Manager) importDir(ctx context.Context, root, dir, shown string) ImportResult {
+func (m *Manager) importDir(ctx context.Context, root, dir, shown string, o importOpts) ImportResult {
 	r := ImportResult{Source: shown}
 	chain, err := readConfined(root, filepath.Join(dir, FullchainFile))
 	if err != nil {
@@ -347,7 +398,7 @@ func (m *Manager) importDir(ctx context.Context, root, dir, shown string) Import
 		r.Err = fmt.Errorf("acme: import %s: no configured zone contains all of %s", shown, strings.Join(certNames(leaf), ","))
 		return r
 	}
-	ir, err := m.importPEM(ctx, zone, chain, key)
+	ir, err := m.importPEM(ctx, zone, chain, key, o)
 	if err != nil {
 		r.Err = fmt.Errorf("acme: import %s: %w", shown, err)
 		return r

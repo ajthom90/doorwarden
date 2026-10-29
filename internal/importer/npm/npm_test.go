@@ -198,8 +198,9 @@ func TestPlanClassification(t *testing.T) {
 			t.Errorf("notes missing %q: %s", w, notes)
 		}
 	}
-	if !strings.Contains(CertGuidance(s), "npm-1") {
-		t.Fatal(CertGuidance(s))
+	// The hint names the real command (cmd/doorwarden certs import-npm).
+	if g := CertGuidance(s); !strings.Contains(g, "npm-1") || !strings.Contains(g, "doorwarden certs import-npm -npm-dir <npm-letsencrypt>/live/npm-1") || strings.Contains(g, "TODO") {
+		t.Fatal(g)
 	}
 }
 

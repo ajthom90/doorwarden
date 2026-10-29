@@ -219,9 +219,16 @@ func New(o Options) (*App, error) {
 	if a.stat == nil {
 		a.stat = statFile
 	}
-	if a.providers == nil {
-		a.providers = map[string]dns.Provider{}
+	// Every provider call is counted in doorwarden_dns_operations_total
+	// (listings, record writes and deletes alike).
+	metered := make(map[string]dns.Provider, len(a.providers))
+	for n, p := range a.providers {
+		if p != nil {
+			p = &meteredProvider{Provider: p, met: a.met}
+		}
+		metered[n] = p
 	}
+	a.providers = metered
 	a.gate = approval.NewGate(a.st)
 	a.probe = web.NewCachedProbe(a.st.Ping, o.HealthProbeInterval)
 
@@ -240,7 +247,7 @@ func New(o Options) (*App, error) {
 	}
 	reconcile.RegisterDNSExecutor(multi, de)
 	if a.mgr != nil {
-		multi.Handle(reconcile.CertEnsure, acme.NewCertExecutor(a.mgr))
+		multi.Handle(reconcile.CertEnsure, acme.NewCertExecutor(a.mgr).OnResult(func(r acme.Result) { a.countRenewal(r) }))
 	}
 	a.runner = &reconcile.Runner{Exec: multi, Config: a.cfg, DryRun: a.cycleDry.Load}
 
