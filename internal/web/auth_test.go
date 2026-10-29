@@ -432,3 +432,51 @@ func TestPasswordChangeRace(t *testing.T) {
 		t.Fatalf("session after a concurrent password change = %d", w.Code)
 	}
 }
+
+func withCtx(ctx context.Context) reqOpt {
+	return func(r *http.Request) { *r = *r.WithContext(ctx) }
+}
+
+// Fix round 2: a login whose client disconnects (during the delay or the
+// hashing queue) is a failure for its source, so dropping connections
+// cannot drain the clean budget for free.
+func TestLoginDisconnectCountsAsFailure(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	lim := e.srv.auth.lim
+	c := e.anon()
+	c.remote = "203.0.113.30:1"
+	// Empty bucket: the attempt is delayed, and the client hangs up then.
+	lim.bucket(lim.login, "admin", e.clock()).tokens = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	e.srv.auth.sleep = func(context.Context, time.Duration) { cancel() }
+	c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}, withCtx(ctx))
+	if pe := lim.login.pairs["admin\x00203.0.113.30"]; pe == nil || pe.fails != 1 {
+		t.Fatalf("abandoned login not recorded: %+v", pe)
+	}
+	// Now dirty: it cannot spend the clean reserve; a clean source can.
+	e.srv.auth.sleep = func(context.Context, time.Duration) {}
+	lim.bucket(lim.login, "admin", e.clock()).tokens = cleanReserve
+	if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("dirty source spent the clean reserve: %d", w.Code)
+	}
+	if _, w := e.login("admin", testPassword); w.Code != 200 {
+		t.Fatalf("clean login refused: %d", w.Code)
+	}
+}
+
+// POST /setup after setup is done answers 409 without charging the limiter.
+func TestSetupDoneNoCharge(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	c := e.anon()
+	c.remote = "203.0.113.31:1"
+	for range 50 {
+		if w := c.do("POST", "/api/v1/auth/setup", map[string]string{"username": "admin", "password": testPassword, "token": "x"}); w.Code != http.StatusConflict {
+			t.Fatalf("setup after done = %d", w.Code)
+		}
+	}
+	if n := len(e.srv.auth.lim.setup.buckets) + len(e.srv.auth.lim.setup.pairs); n != 0 {
+		t.Fatalf("finished setup charged the limiter (%d entries)", n)
+	}
+}

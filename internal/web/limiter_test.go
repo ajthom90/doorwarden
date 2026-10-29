@@ -164,7 +164,7 @@ func TestLimiterCleanSurvivesDirtyFlood(t *testing.T) {
 func TestLimiterCleanWaiterCap(t *testing.T) {
 	clk := newFakeNow()
 	l := newLimiter(clk.now)
-	l.delayed = limiterMaxDelayed
+	l.login.delayed = limiterMaxDelayed
 	for i := range totalBurst {
 		at, err := l.begin("admin", ipa(fmt.Sprintf("198.51.100.%d", i)))
 		if err != nil {
@@ -541,5 +541,122 @@ func TestLimiterSetupPerSource(t *testing.T) {
 	}
 	if len(l.login.buckets) != 0 {
 		t.Fatal("setup charged a login bucket")
+	}
+}
+
+// Fix round 2 (PoC): one clean source used to drain the admin's bucket by
+// starting attempts and disconnecting (no failure recorded, stays clean).
+// Now an abandoned attempt is a failure: the attacker turns dirty and is
+// confined to the dirty share, 16 other sources cannot hold every delay
+// slot, and a clean login keeps getting in within limiterMaxDelay.
+// The login is checked every 5s (the total budget of totalRate/min is
+// below one login a second by design), after a ramp: each of the 16 fresh
+// sources spends one clean token before its first failure is recorded,
+// which is indistinguishable from the administrator's own first attempt;
+// once they are dirty they never touch the reserve or a delay slot again.
+func TestLimiterAbandonDrainRegression(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	const attacker = "203.0.113.9"
+	type hold struct {
+		at    *attempt
+		until time.Time
+	}
+	holds := map[int]*hold{}
+	for range 40 { // initial drain
+		at, err := l.begin("admin", ipa(attacker))
+		if err != nil {
+			break
+		}
+		at.abandon()
+	}
+	for s := range 600 {
+		clk.add(time.Second)
+		for range 5 {
+			if at, err := l.begin("admin", ipa(attacker)); err == nil {
+				at.abandon()
+			}
+		}
+		for h := range 16 {
+			ip := ipa(fmt.Sprintf("192.0.2.%d", h+1))
+			if hd := holds[h]; hd != nil {
+				if clk.now().Before(hd.until) {
+					continue
+				}
+				hd.at.abandon()
+				delete(holds, h)
+			}
+			for range limiterMaxDelayedPerSource + 1 {
+				at, err := l.begin("admin", ip)
+				if err != nil {
+					break
+				}
+				if at.delay > 0 {
+					if l.login.pairs["admin\x00"+sourceKey(ip)] != nil {
+						t.Fatalf("second %d: dirty source %v given a delay slot", s, ip)
+					}
+					holds[h] = &hold{at, clk.now().Add(at.delay)}
+					break
+				}
+				at.abandon()
+			}
+		}
+		if s >= 15 && s%5 == 0 {
+			at, err := l.begin("admin", ipa("198.51.100.77"))
+			if err != nil || at.delay > limiterMaxDelay {
+				t.Fatalf("second %d: clean admin login refused: %v (tokens %.2f, delayed %d)", s, err, l.login.buckets["admin"].tokens, l.login.delayed)
+			}
+			at.done(true)
+		}
+	}
+	if e := l.login.pairs["admin\x00"+attacker]; e == nil || !e.locked(clk.now()) {
+		t.Fatalf("abandoning attacker not backed off: %+v", e)
+	}
+}
+
+// Waiting slots are capped per source and per scope; login and setup have
+// separate pools.
+func TestLimiterDelaySlotsPerSourceAndScope(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	b := l.bucket(l.login, "admin", clk.now())
+	b.tokens = 0
+	held := 0
+	for range 5 {
+		if at, err := l.begin("admin", ipa("192.0.2.1")); err == nil && at.delay > 0 {
+			held++
+			b.tokens = 0 // keep every wait short; the cap is under test
+		}
+	}
+	if held != limiterMaxDelayedPerSource {
+		t.Fatalf("one source holds %d delay slots, cap %d", held, limiterMaxDelayedPerSource)
+	}
+	l.login.delayed = limiterMaxDelayed
+	if _, err := l.begin("admin", ipa("192.0.2.2")); err == nil {
+		t.Fatal("login delay pool full but another wait was granted")
+	}
+	sb := l.bucket(l.setup, "192.0.2.3", clk.now())
+	sb.tokens = 0
+	if at, err := l.begin("", ipa("192.0.2.3")); err != nil || at.delay == 0 {
+		t.Fatalf("setup pool shared with login: %v", err)
+	}
+}
+
+// A refusal after the charge: busy queue or client gone counts as a
+// failure, a backoff found by the re-check does not.
+func TestEndRefusedCounts(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	for _, err := range []error{ErrHasherBusy, context.Canceled, context.DeadlineExceeded} {
+		at, _ := l.begin("admin", ipa("192.0.2.9"))
+		endRefused(at, err)
+	}
+	if e := l.login.pairs["admin\x00192.0.2.9"]; e == nil || e.fails != 3 {
+		t.Fatalf("abandoned attempts not recorded: %+v", e)
+	}
+	at, _ := l.begin("admin", ipa("192.0.2.10"))
+	endRefused(at, throttledError{time.Second})
+	if l.login.pairs["admin\x00192.0.2.10"] != nil || len(l.login.inflight) != 0 {
+		t.Fatal("server-side refusal counted as a failure, or inflight leaked")
 	}
 }

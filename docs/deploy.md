@@ -200,7 +200,8 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   used). Addresses with recent failures cannot use the last 5 of it,
   which stay reserved for addresses without failures: at worst such a
   login waits up to 5 seconds or is asked to retry a few seconds later, so
-  failures from elsewhere can never lock the administrator out. Setup is
+  failures from elsewhere can never lock the administrator out. A login
+  the client abandons (disconnect, timeout) counts as a failure. Setup is
   limited per address only (the setup token is 192-bit random).
   Set `web.cookie_insecure: true` only when the UI is served over plain
   HTTP on a trusted LAN.

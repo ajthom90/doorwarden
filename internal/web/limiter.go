@@ -50,7 +50,12 @@ import (
 //     charged against the total bucket). Idle entries are pruned after
 //     limiterForget, lazily at most once per limiterPruneEvery.
 //   - Attempts are reserved before the argon2 check and re-checked for a
-//     new backoff once a hashing slot is held.
+//     new backoff once a hashing slot is held. A charged attempt the
+//     client abandons (disconnect, timeout) or the hashing queue refuses
+//     counts as a failure, so starting and dropping attempts turns a
+//     source dirty instead of draining the clean share for free.
+//   - Waiting (delayed) clean callers are capped per scope
+//     (limiterMaxDelayed) and per source (limiterMaxDelayedPerSource).
 //   - All state is cleared on a new credential generation (password change,
 //     `doorwarden admin unlock`/`reset-password`) and when the
 //     administrator is created.
@@ -68,7 +73,9 @@ const (
 	setupBurst        = 5
 	setupRate         = 12.0 // per minute
 	limiterMaxDelay   = 5 * time.Second
-	limiterMaxDelayed = 16
+	limiterMaxDelayed = 16 // per scope
+	// limiterMaxDelayedPerSource bounds one source's waiting callers.
+	limiterMaxDelayedPerSource = 2
 	// unknownUser is the shared bucket of every name that is not the
 	// administrator's.
 	unknownUser = "\x00unknown"
@@ -109,13 +116,17 @@ type scope struct {
 	// buckets: login per user name (limitUser), setup per source.
 	buckets map[string]*bucket
 	setup   bool
-	reserve float64
-	burst   float64
-	rate    float64
+	// delayed counts callers waiting for a clean token, in this scope and
+	// per source (delayedBy), so a few sources cannot hold every slot.
+	delayed   int
+	delayedBy map[string]int
+	reserve   float64
+	burst     float64
+	rate      float64
 }
 
 func newScope(setup bool) *scope {
-	sc := &scope{pairs: map[string]*limEntry{}, ips: map[string]*limEntry{}, inflight: map[string]int{}, buckets: map[string]*bucket{}, setup: setup}
+	sc := &scope{pairs: map[string]*limEntry{}, ips: map[string]*limEntry{}, inflight: map[string]int{}, buckets: map[string]*bucket{}, delayedBy: map[string]int{}, setup: setup}
 	if setup {
 		sc.burst, sc.rate = setupBurst, setupRate
 	} else {
@@ -133,7 +144,6 @@ type limiter struct {
 	lastPrune time.Time
 	gen       int64
 	genSeen   bool
-	delayed   int
 }
 
 func newLimiter(now func() time.Time) *limiter {
@@ -180,6 +190,7 @@ func sourceKey(ip netip.Addr) string {
 type attempt struct {
 	l     *limiter
 	sc    *scope
+	src   string
 	pairK string
 	ipK   string // "" for setup
 	// trackPair, trackIP: the attempt is counted in sc.inflight under
@@ -254,7 +265,7 @@ func (l *limiter) begin(user string, ip netip.Addr) (*attempt, error) {
 	if user == "" {
 		sc = l.setup
 	}
-	at := &attempt{l: l, sc: sc, pairK: user + "\x00" + src}
+	at := &attempt{l: l, sc: sc, src: src, pairK: user + "\x00" + src}
 	if !sc.setup {
 		at.ipK = src
 	}
@@ -291,11 +302,12 @@ func (l *limiter) begin(user string, ip netip.Addr) (*attempt, error) {
 		return nil, throttledError{b.due(1 + sc.reserve)}
 	case !dirty && b.tokens < 1:
 		wait := b.due(1)
-		if wait > limiterMaxDelay || l.delayed >= limiterMaxDelayed {
-			return nil, throttledError{wait}
+		if wait > limiterMaxDelay || sc.delayed >= limiterMaxDelayed || sc.delayedBy[src] >= limiterMaxDelayedPerSource {
+			return nil, throttledError{max(wait, time.Second)}
 		}
 		at.delay, at.delayed = wait, true
-		l.delayed++
+		sc.delayed++
+		sc.delayedBy[src]++
 	}
 	b.tokens--
 	sc.inflight[at.pairK]++
@@ -312,7 +324,11 @@ func (at *attempt) undelay() {
 	at.l.mu.Lock()
 	defer at.l.mu.Unlock()
 	if at.delayed {
-		at.l.delayed--
+		sc := at.sc
+		sc.delayed--
+		if sc.delayedBy[at.src]--; sc.delayedBy[at.src] <= 0 {
+			delete(sc.delayedBy, at.src)
+		}
 		at.delayed = false
 	}
 }
@@ -336,9 +352,16 @@ func (at *attempt) recheck() error {
 // failure state, a failure is recorded against both.
 func (at *attempt) done(ok bool) { at.finish(true, ok) }
 
-// cancel releases the reservation without counting anything (the password
-// was never checked).
+// cancel releases the reservation without counting anything. Only for an
+// attempt the server itself refused after begin (a backoff found by
+// recheck); the token stays spent.
 func (at *attempt) cancel() { at.finish(false, false) }
+
+// abandon ends an attempt the client gave up (disconnect, timeout) or the
+// hashing queue refused after it was charged: it counts as a failure, so
+// the source turns dirty and can no longer spend the clean share by
+// starting and dropping attempts. The token stays spent.
+func (at *attempt) abandon() { at.finish(true, false) }
 
 // record adds a failure for k in m, evicting the least recently used entry
 // not in backoff when m is full; when every entry is in backoff the

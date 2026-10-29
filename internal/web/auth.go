@@ -566,7 +566,24 @@ func (a *auth) beginAttempt(w http.ResponseWriter, r *http.Request, user string)
 		a.sleep(r.Context(), at.delay)
 	}
 	at.undelay()
+	if r.Context().Err() != nil {
+		at.abandon() // the client gave up: a failure, not a free token
+		hashRefused(w, r.Context().Err())
+		return nil
+	}
 	return at
+}
+
+// endRefused ends an attempt whose password check never ran: a backoff
+// found by the re-check is the server's own refusal (cancel); a busy
+// queue or a client that went away counts as a failure (abandon).
+func endRefused(at *attempt, err error) {
+	var te throttledError
+	if errors.As(err, &te) {
+		at.cancel()
+		return
+	}
+	at.abandon()
 }
 
 // hashRefused answers a password operation that never ran: the throttle
@@ -600,17 +617,17 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := s.auth
-	// Per address only: wrong tokens never block setup globally.
-	at := a.beginAttempt(w, r, "")
-	if at == nil {
-		return
-	}
 	a.tokMu.Lock()
 	tok := a.setupToken
 	a.tokMu.Unlock()
 	if tok == "" {
-		at.cancel()
+		// Before the limiter: a finished setup charges nothing.
 		writeErr(w, http.StatusConflict, "setup is already done")
+		return
+	}
+	// Per address only: wrong tokens never block setup globally.
+	at := a.beginAttempt(w, r, "")
+	if at == nil {
 		return
 	}
 	if req.Token == "" || subtle.ConstantTimeCompare([]byte(req.Token), []byte(tok)) != 1 {
@@ -688,7 +705,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		err = a.hasher.VerifyDummyContext(r.Context(), req.Password, recheck)
 	}
 	if err != nil {
-		at.cancel()
+		endRefused(at, err)
 		hashRefused(w, err)
 		return
 	}
@@ -767,7 +784,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	match, err := a.hasher.VerifyContext(r.Context(), adm.PasswordHash, req.Current, at.recheck)
 	if err != nil {
-		at.cancel()
+		endRefused(at, err)
 		hashRefused(w, err)
 		return
 	}
