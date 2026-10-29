@@ -22,6 +22,9 @@ services:
   doorwarden:
     image: ghcr.io/ajthom90/doorwarden:${DOORWARDEN_TAG:?set DOORWARDEN_TAG to a release version, e.g. 1.0.0}
     restart: unless-stopped
+    # Shutdown waits up to ~10s for HTTP and ~30s for running ACME orders;
+    # Docker's default of 10s would kill it mid-order.
+    stop_grace_period: 45s
     user: "65532:65532"
     read_only: true
     cap_drop: [ALL]
