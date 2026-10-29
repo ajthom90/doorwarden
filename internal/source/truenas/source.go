@@ -81,9 +81,60 @@ func (s *Source) Warnings() []string {
 }
 
 type apiApp struct {
-	Name    string            `json:"name"`
-	State   string            `json:"state"`
-	Portals map[string]string `json:"portals"`
+	Name            string            `json:"name"`
+	State           string            `json:"state"`
+	Portals         map[string]string `json:"portals"`
+	ActiveWorkloads struct {
+		UsedPorts []usedPort `json:"used_ports"`
+	} `json:"active_workloads"`
+}
+
+// usedPort is one entry of app.query's active_workloads.used_ports. TrueNAS
+// versions differ in whether ports are numbers or strings.
+type usedPort struct {
+	Protocol  string `json:"protocol"`
+	HostPorts []struct {
+		HostPort flexPort `json:"host_port"`
+	} `json:"host_ports"`
+}
+
+// flexPort decodes a port given as a JSON number or string; anything else
+// (or out of range) is 0.
+type flexPort int
+
+func (f *flexPort) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > 65535 {
+		*f = 0
+		return nil
+	}
+	*f = flexPort(n)
+	return nil
+}
+
+// hostPorts returns the app's published tcp host ports, or nil when
+// app.query reported none (not validated then).
+func (a apiApp) hostPorts() map[int]bool {
+	var out map[int]bool
+	for _, u := range a.ActiveWorkloads.UsedPorts {
+		if p := strings.ToLower(strings.TrimSpace(u.Protocol)); p != "" && p != "tcp" {
+			continue
+		}
+		for _, h := range u.HostPorts {
+			if h.HostPort > 0 {
+				if out == nil {
+					out = map[int]bool{}
+				}
+				out[int(h.HostPort)] = true
+			}
+		}
+	}
+	// a list with only udp entries is still "reported": no tcp port allowed
+	if out == nil && len(a.ActiveWorkloads.UsedPorts) > 0 {
+		out = map[int]bool{}
+	}
+	return out
 }
 
 func unavailable(err error) error {
@@ -182,8 +233,26 @@ func (s *Source) convert(ctx context.Context, a apiApp) (model.Service, string) 
 		return svc, fmt.Sprintf("app %q: %v", a.Name, err)
 	}
 
+	portals := a.Portals
+	if allowed := a.hostPorts(); allowed != nil && a.State == "RUNNING" && len(portals) > 0 {
+		// Final-review H2: a portal is only trusted when its port is one of
+		// the app's own published host ports; others are dropped.
+		portals = map[string]string{}
+		var bad []string
+		for n, v := range a.Portals {
+			if _, p, usable := parsePortal(v); usable && allowed[p] {
+				portals[n] = v
+			} else {
+				bad = append(bad, fmt.Sprintf("%s (%s)", n, v))
+			}
+		}
+		if len(portals) == 0 {
+			sort.Strings(bad)
+			return fail(fmt.Errorf("no portal port is one of the app's published ports: %s", strings.Join(bad, ", ")))
+		}
+	}
 	port := 0
-	if portal, ok := pickPortal(a.Portals); ok {
+	if portal, ok := pickPortal(portals); ok {
 		if sc, p, usable := parsePortal(portal); usable {
 			if sc != "http" && sc != "https" {
 				if a.State == "RUNNING" {

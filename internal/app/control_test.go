@@ -144,9 +144,10 @@ func TestUnreadableOverrideSkips(t *testing.T) {
 	}
 }
 
-// In approve mode a rename changes the fingerprint: the service goes back
-// to pending until it is approved again.
-func TestRenameNeedsReapproval(t *testing.T) {
+// In approve mode a stale fingerprint is refused; a rename made by an
+// administrator through a UI override carries the approval over in the same
+// action (final-review H2 ruling: the admin is the authority; audited).
+func TestRenameOverrideReapproves(t *testing.T) {
 	e := newEnv(t, testYAML)
 	e.src.set(nil, svc("docker", "app"))
 	a := e.app(func(o *Options) { o.Sources = []SourceSpec{{Source: e.src, Mode: approval.ModeApprove}} })
@@ -170,8 +171,24 @@ func TestRenameNeedsReapproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.RunOnce(ctx)
+	if s := info(t, a, "docker/app"); s.State != model.StatePublished || s.Hostname != "web.example.test" {
+		t.Fatalf("renamed service not re-approved: %+v", s)
+	}
+	acts, _ := e.st.ListActivity(ctx, 100)
+	found := false
+	for _, x := range acts {
+		found = found || (x.Kind == "approval" && strings.Contains(x.Message, "docker/app") && strings.Contains(x.Message, "carried over"))
+	}
+	if !found {
+		t.Fatalf("re-approval not audited: %+v", acts)
+	}
+	// the source changing the backend still needs re-approval
+	moved := svc("docker", "app")
+	moved.Backend.Port = 8081
+	e.src.set(nil, moved)
+	a.RunOnce(ctx)
 	if s := info(t, a, "docker/app"); s.State != model.StatePending {
-		t.Fatalf("renamed service still approved: %+v", s)
+		t.Fatalf("source backend change kept the approval: %+v", s)
 	}
 }
 

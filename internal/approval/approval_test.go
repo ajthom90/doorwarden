@@ -198,16 +198,56 @@ func TestFingerprintChangesFlipToPending(t *testing.T) {
 	}
 }
 
-func TestFingerprintIgnoresPortHostAndMiddlewareOrder(t *testing.T) {
+// Final-review H2/H3: the fingerprint covers the ORDERED middleware list
+// (the renderer applies them in order) and the backend scheme, host and port
+// of every source: each such change needs re-approval (fail safe).
+func TestFingerprintCoversBackendAndMiddlewareOrder(t *testing.T) {
+	for name, mut := range map[string]func(*model.Service){
+		"middleware reorder": func(c *model.Service) { c.Options.Middlewares = []string{"rl", "auth"} },
+		"port":               func(c *model.Service) { c.Backend.Port = 32768 },
+		"host":               func(c *model.Service) { c.Backend.Host = "198.51.100.9" },
+		"scheme":             func(c *model.Service) { c.Backend.Scheme = "https" },
+	} {
+		g := NewGate(newFake())
+		s := svc("a", model.StateDiscovered)
+		resolveState(t, g, ModeApprove, s)
+		approveCur(t, g, "a")
+		c := s
+		c.Options.Middlewares = append([]string(nil), s.Options.Middlewares...)
+		mut(&c)
+		if resolveState(t, g, ModeApprove, c) != model.StatePending {
+			t.Errorf("%s: change kept the approval", name)
+		}
+		if resolveState(t, g, ModeApprove, s) != model.StatePublished {
+			t.Errorf("%s: unchanged content lost its approval", name)
+		}
+	}
+}
+
+// Reapprove carries an existing approval over to new content (an admin's
+// UI override) only when the stored approval is for the old content.
+func TestReapprove(t *testing.T) {
 	g := NewGate(newFake())
 	s := svc("a", model.StateDiscovered)
 	resolveState(t, g, ModeApprove, s)
-	approveCur(t, g, "a")
 	c := s
-	c.Backend.Port, c.Backend.Host = 32768, "198.51.100.9"
-	c.Options.Middlewares = []string{"rl", "auth"}
+	c.Backend.Port = 9000
+	ctx := context.Background()
+	if ok, err := g.Reapprove(ctx, "a", Fingerprint(s), Fingerprint(c)); err != nil || ok {
+		t.Fatalf("unapproved service reapproved: %v %v", ok, err)
+	}
+	approveCur(t, g, "a")
+	if ok, err := g.Reapprove(ctx, "a", "other", Fingerprint(c)); err != nil || ok {
+		t.Fatalf("approval of other content carried over: %v %v", ok, err)
+	}
+	if ok, err := g.Reapprove(ctx, "a", Fingerprint(s), Fingerprint(c)); err != nil || !ok {
+		t.Fatalf("reapprove: %v %v", ok, err)
+	}
 	if resolveState(t, g, ModeApprove, c) != model.StatePublished {
-		t.Fatal("port/host/order change must keep approval")
+		t.Fatal("new content not approved")
+	}
+	if resolveState(t, g, ModeApprove, s) != model.StatePending {
+		t.Fatal("old content still approved")
 	}
 }
 

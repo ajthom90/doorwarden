@@ -11,12 +11,17 @@
 // from Resolve's output.
 //
 // An approval is bound to a fingerprint of the approved content (key, name,
-// rename, zone, backend scheme, skip-verify, websockets, sorted middlewares).
-// Backend host and port are deliberately excluded because Docker host ports
-// change on every restart. If the content changes (e.g. an auth middleware is
-// dropped) the stored approval no longer applies and the service is Pending
-// again until re-approved. A service that disappears and returns unchanged
-// stays approved.
+// rename, zone, backend scheme, host and port, skip-verify, websockets, and
+// the middlewares IN ORDER, since the renderer applies them in order). The
+// backend is included for every source (final-review H2/H3, fail safe): a
+// source reporting another host or port, or reordered middlewares, makes the
+// service Pending again until re-approved. Consequence: a Docker container
+// in approve mode whose published host port changes on restart needs
+// re-approval (pin the host port, or use auto mode for docker). If the
+// content changes (e.g. an auth middleware is dropped) the stored approval no
+// longer applies. A service that disappears and returns unchanged stays
+// approved. Reapprove carries an approval over to content an administrator
+// changed through a UI override (the admin is the authority).
 //
 // Approve takes the fingerprint of the service the caller displayed and only
 // stores the approval if it still equals the Gate's snapshot (ErrStale
@@ -40,7 +45,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 
 	"github.com/ajthom90/doorwarden/internal/model"
@@ -81,10 +85,9 @@ func NewGate(st Store) *Gate { return &Gate{st: st, snap: map[string]string{}} }
 // Fingerprint returns the content fingerprint an approval is bound to. It is
 // the value a UI must echo back to Approve for the service it displayed.
 func Fingerprint(s model.Service) string {
-	mw := append([]string{}, s.Options.Middlewares...)
-	sort.Strings(mw)
-	b, _ := json.Marshal([]any{s.Key, s.Name, s.Options.Rename, s.Zone,
-		s.Backend.Scheme, s.Backend.SkipVerify, s.Options.Websockets, mw})
+	mw := append([]string{}, s.Options.Middlewares...) // order matters
+	b, _ := json.Marshal([]any{"v2", s.Key, s.Name, s.Options.Rename, s.Zone,
+		s.Backend.Scheme, s.Backend.Host, s.Backend.Port, s.Backend.SkipVerify, s.Options.Websockets, mw})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
@@ -164,6 +167,34 @@ func (g *Gate) Approve(ctx context.Context, key, fingerprint string) error {
 		return fmt.Errorf("%w: %q changed since it was displayed", ErrStale, key)
 	}
 	return g.st.SetApproval(ctx, key, fp)
+}
+
+// Reapprove moves the approval of key from the content fingerprinted oldFP to
+// newFP, for a change an administrator made (a UI override). It does so only
+// when the stored approval is exactly oldFP, i.e. the content before the
+// change was approved; otherwise nothing is stored and ok is false (an
+// override never approves content nobody approved). The snapshot entry is
+// updated so the UI can show and approve the new content at once.
+func (g *Gate) Reapprove(ctx context.Context, key, oldFP, newFP string) (ok bool, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cur, err := g.st.ListApprovals(ctx)
+	if err != nil {
+		return false, err
+	}
+	if stored, has := cur[key]; !has || stored != oldFP || oldFP == "" || newFP == "" {
+		return false, nil
+	}
+	if oldFP == newFP {
+		return true, nil
+	}
+	if err := g.st.SetApproval(ctx, key, newFP); err != nil {
+		return false, err
+	}
+	if _, seen := g.snap[key]; seen {
+		g.snap[key] = newFP
+	}
+	return true, nil
 }
 
 // Revoke removes any approval for key; it is a no-op if there is none.

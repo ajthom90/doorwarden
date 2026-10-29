@@ -12,6 +12,18 @@ package app
 // every source is treated as unavailable this cycle (nothing published,
 // nothing removed); one row unparsable -> that service is skipped.
 //
+// An override is applied by an administrator, who is the authority: when
+// the service's content before the change was approved, SetServiceOverride
+// moves the approval to the overridden content in the same action
+// (approval.Gate.Reapprove) and records it in the activity log. Content
+// nobody approved stays Pending.
+//
+// A TrueNAS app without a usable portal is an Error service with no backend
+// host. A UI Port override on it promotes it to Discovered with the host the
+// TrueNAS source uses (the default zone's target_ip) and the overridden port
+// (scheme http unless the app reported one); the approval gate still
+// applies (final-review H2 ruling).
+//
 // Unpublish sets skip: the service is absent from the plan, so its route
 // and records are scheduled for removal after settings.grace_period (24h
 // by default), the same as a service that disappeared. Publish clears it.
@@ -65,6 +77,28 @@ func (a *App) loadOverrides(ctx context.Context) (map[string]model.UIOverrides, 
 	return out, bad, nil
 }
 
+// promote returns s ready for the UI overrides o: a TrueNAS app in Error
+// with no backend host and a Port override gets the TrueNAS backend host
+// (tip) and becomes Discovered, so the override yields a routable backend.
+// Everything else is returned unchanged.
+func promote(s model.Service, o model.UIOverrides, tip string) model.Service {
+	if o.Port == nil || tip == "" || !strings.HasPrefix(s.Key, "truenas:") ||
+		s.State != model.StateError || s.Backend.Host != "" {
+		return s
+	}
+	s.State = model.StateDiscovered
+	s.Backend.Host = tip
+	if s.Backend.Scheme == "" {
+		s.Backend.Scheme = "http"
+	}
+	return s
+}
+
+// overridden is raw with the UI overrides o applied (after promote).
+func (a *App) overridden(raw model.Service, o model.UIOverrides) model.Service {
+	return model.ApplyUI(promote(raw, o, sourceTargetIP(a.cfg)), o)
+}
+
 // applyOverrides applies the UI overrides to one source's services and
 // records them for the listing.
 func (a *App) applyOverrides(ctx context.Context, spec string, svcs []model.Service, ovs map[string]model.UIOverrides, bad map[string]bool) ([]model.Service, []listed) {
@@ -72,7 +106,7 @@ func (a *App) applyOverrides(ctx context.Context, spec string, svcs []model.Serv
 	ls := make([]listed, 0, len(svcs))
 	for _, s := range svcs {
 		o := ovs[s.Key]
-		got := model.ApplyUI(s, o)
+		got := a.overridden(s, o)
 		msg := ""
 		if bad[s.Key] {
 			got.Options.Skip = true
@@ -170,16 +204,19 @@ func (a *App) SetServiceOverride(ctx context.Context, key string, edit func(*mod
 		return err
 	}
 	o, err := model.ParseUIOverrides(strings.TrimSpace(cur.OverridesJSON))
+	readable := err == nil
 	if err != nil {
 		o = model.UIOverrides{} // unreadable: replaced by the edit
 	}
+	before := a.overridden(raw, o)
 	if err := edit(&o); err != nil {
 		return err
 	}
 	zs, dz := a.zoneNames()
-	if err := o.Validate(raw, zs, dz); err != nil {
+	if err := o.Validate(promote(raw, o, sourceTargetIP(a.cfg)), zs, dz); err != nil {
 		return err
 	}
+	after := a.overridden(raw, o)
 	js, err := o.JSON()
 	if err != nil {
 		return err
@@ -187,11 +224,21 @@ func (a *App) SetServiceOverride(ctx context.Context, key string, edit func(*mod
 	if err := a.st.SetServiceOverrides(ctx, key, raw.Source, js, a.now()); err != nil {
 		return err
 	}
+	if readable {
+		oldFP, newFP := approval.Fingerprint(before), approval.Fingerprint(after)
+		ok, err := a.gate.Reapprove(ctx, key, oldFP, newFP)
+		switch {
+		case err != nil:
+			a.appendActivity(ctx, "warn", "approval", fmt.Sprintf("service %s: UI override saved, but its approval could not be carried over (it may be pending until approved again): %v", key, err))
+		case ok && oldFP != newFP:
+			a.appendActivity(ctx, "info", "approval", fmt.Sprintf("service %s: approval carried over to the content changed by a UI override (%s)", key, js))
+		}
+	}
 	a.hmu.Lock()
 	for i := range a.listing {
 		if a.listing[i].raw.Key == key {
 			a.listing[i].ov = o
-			a.listing[i].svc = model.ApplyUI(a.listing[i].raw, o)
+			a.listing[i].svc = a.overridden(a.listing[i].raw, o)
 		}
 	}
 	a.hmu.Unlock()
