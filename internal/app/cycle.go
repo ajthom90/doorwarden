@@ -373,7 +373,8 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 		}
 		switch {
 		case x.Alert == reconcile.AlertQuarantined:
-			// Planned once, with the route's withdrawal.
+			// Planned every quarantined cycle; the key (per backend)
+			// suppresses repeats and lets a dropped one be retried.
 			a.notify(ctx, notify.Event{Kind: "service.quarantined", Severity: notify.Warning,
 				Subject: "doorwarden: " + x.Key + " changed; re-approve to resume", Message: x.Reason,
 				Fields:    map[string]string{"key": x.Key, "zone": x.Zone, "host": x.Host},

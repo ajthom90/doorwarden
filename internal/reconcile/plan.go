@@ -376,21 +376,19 @@ func (p *planner) quarantined(e entry) bool {
 }
 
 // planQuarantine stops serving a quarantined service: its route is
-// withdrawn (RouteRemove, CauseQuarantine: the row stays, marked; the
-// alerted Invalid accompanies that one removal, so the caller notifies
-// once) and an Invalid tells the operator to re-approve on
-// every cycle. Nothing else is planned for it: it is present, so its DNS
+// withdrawn once (RouteRemove, CauseQuarantine: the row stays, marked) and
+// an Invalid carrying AlertQuarantined tells the operator to re-approve on
+// every cycle (the caller's notification dedupe key suppresses repeats, so
+// one that could not be queued is retried). Nothing else is planned for it: it is present, so its DNS
 // records and certificates are kept, and it keeps its hostname claim. If a
 // higher source rank won the name, it is a Conflict as well.
 func (p *planner) planQuarantine(e entry, losers map[string]loss) {
 	x := Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc),
 		Reason: "backend changed; re-approve to resume: the service's backend or middlewares differ from what was approved, so " +
-			e.host + " is not served (its DNS record, certificate and hostname are kept)"}
+			e.host + " is not served (its DNS record, certificate and hostname are kept)",
+		Alert: AlertQuarantined} // every cycle: the notifier's dedupe key suppresses repeats, a dropped one is retried
 	k, isKnown := p.obs.Known[e.svc.Key]
 	withdraw := isKnown && !k.Quarantined
-	if withdraw {
-		x.Alert = AlertQuarantined
-	}
 	p.emit(x)
 	if withdraw {
 		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,

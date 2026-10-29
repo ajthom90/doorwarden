@@ -9,6 +9,7 @@ import (
 
 	"github.com/ajthom90/doorwarden/internal/approval"
 	"github.com/ajthom90/doorwarden/internal/model"
+	"github.com/ajthom90/doorwarden/internal/notify"
 	"github.com/ajthom90/doorwarden/internal/reconcile"
 	"github.com/ajthom90/doorwarden/internal/traefik"
 )
@@ -67,14 +68,14 @@ func TestApprovedBackendChangeQuarantines(t *testing.T) {
 	if w := writes(e.fk); len(w) != dnsWrites {
 		t.Fatalf("DNS changed while quarantined: %+v", w[dnsWrites:])
 	}
-	n := 0
+	keys := map[string]int{}
 	for _, ev := range e.notif.events() {
 		if ev.Kind == "service.quarantined" {
-			n++
+			keys[ev.DedupeKey]++
 		}
 	}
-	if n != 1 {
-		t.Fatalf("quarantine notifications = %d, want 1: %+v", n, e.notif.events())
+	if len(keys) != 1 || keys["quarantined/docker/app/http://198.51.100.5:8099"] != 3 {
+		t.Fatalf("want the alert every cycle under one dedupe key (the dispatcher sends it once): %v", keys)
 	}
 
 	if err := a.Approve(ctx, "docker/app", info(t, a, "docker/app").Fingerprint); err != nil {
@@ -268,5 +269,56 @@ func TestAutoModeNeverQuarantines(t *testing.T) {
 	}
 	if r, ok, _ := e.st.GetRoute(ctx, app.Key); !ok || r.Quarantined || r.Port != 8099 {
 		t.Fatalf("route %+v %v", r, ok)
+	}
+}
+
+// dedupeNotifier mimics the dispatcher: a DedupeKey is recorded only once
+// queued, so a queue-full drop is retried at the next notify; the first
+// failFirst calls fail.
+type dedupeNotifier struct {
+	failFirst int
+	seen      map[string]bool
+	sent      []notify.Event
+}
+
+func (d *dedupeNotifier) Notify(_ context.Context, e notify.Event) error {
+	if d.seen[e.DedupeKey] {
+		return nil
+	}
+	if d.failFirst > 0 {
+		d.failFirst--
+		return notify.ErrQueueFull
+	}
+	d.seen[e.DedupeKey] = true
+	d.sent = append(d.sent, e)
+	return nil
+}
+
+// A quarantine notification that could not be queued is retried at the
+// next cycle; once queued, later cycles are suppressed by its dedupe key.
+func TestQuarantineNotificationRetriedAfterQueueFull(t *testing.T) {
+	e := newEnv(t, testYAML)
+	ctx := context.Background()
+	app := svc("docker", "app")
+	served(t, e, app)
+	dn := &dedupeNotifier{failFirst: 1, seen: map[string]bool{}}
+	moved := app
+	moved.Backend.Port = 8099
+	e.src.set(nil, moved)
+	a := e.app(func(o *Options) {
+		o.Sources = []SourceSpec{{Source: e.src, Mode: approval.ModeApprove}}
+		o.Notifier = dn
+	})
+	for range 4 {
+		a.RunOnce(ctx)
+	}
+	n := 0
+	for _, ev := range dn.sent {
+		if ev.Kind == "service.quarantined" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("quarantine notifications delivered = %d, want 1 (retried after the drop): %+v", n, dn.sent)
 	}
 }
