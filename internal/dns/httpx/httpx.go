@@ -281,7 +281,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		return resp.StatusCode, fmt.Errorf("%s %s: %w (%d bytes)", method, path, ErrTooLarge, max)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return resp.StatusCode, fmt.Errorf("%s %s: %w", method, path, &StatusError{Status: resp.StatusCode, Msg: c.Scrub(summarize(data))})
+		return resp.StatusCode, fmt.Errorf("%s %s: %w", method, path, &StatusError{Status: resp.StatusCode, Msg: trunc(c.Scrub(summarize(data)))})
 	}
 	if out != nil && len(bytes.TrimSpace(data)) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -299,25 +299,26 @@ func unwrapURLErr(err error) error {
 	return err
 }
 
-// summarize extracts a short message from an error body (JSON message/error
-// fields, else a truncated text prefix).
+// summarize extracts the message of an error body (JSON message/error
+// fields), complete: the caller redacts it and only then normalizes and
+// truncates it (trunc), so no fragment of a secret survives the cut.
 func summarize(b []byte) string {
 	var m map[string]any
 	if json.Unmarshal(b, &m) == nil {
 		if arr, ok := m["errors"].([]any); ok && len(arr) > 0 {
 			if first, ok := arr[0].(map[string]any); ok {
 				if s, ok := first["message"].(string); ok && s != "" {
-					return trunc(s)
+					return s
 				}
 			}
 		}
 		for _, k := range []string{"message", "errorMessage", "error", "detail", "msg"} {
 			if s, ok := m[k].(string); ok && s != "" {
-				return trunc(s)
+				return s
 			}
 			if em, ok := m[k].(map[string]any); ok {
 				if s, ok := em["message"].(string); ok && s != "" {
-					return trunc(s)
+					return s
 				}
 			}
 		}
@@ -325,6 +326,8 @@ func summarize(b []byte) string {
 	return ""
 }
 
+// trunc normalizes whitespace and cuts s to 200 bytes; apply it only to
+// redacted text.
 func trunc(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > 200 {

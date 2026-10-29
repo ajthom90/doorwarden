@@ -2,6 +2,7 @@ package httpx_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/dns/httpx"
+	"github.com/ajthom90/doorwarden/internal/secrets"
 )
 
 func TestSizeLimit(t *testing.T) {
@@ -284,5 +286,40 @@ func TestWriteOutcomeClassification(t *testing.T) {
 	}
 	if httpx.NotApplied(nil) {
 		t.Error("nil is not a failure")
+	}
+}
+
+// The whole message is redacted before it is whitespace-normalized and
+// truncated: a secret straddling the 200-byte cut, or one containing
+// whitespace runs, leaves no fragment behind.
+func TestStatusErrorRedactedBeforeTruncation(t *testing.T) {
+	secret := "S3CRETTOKENabcdefghijklmnopqrstuvwxyz0123456789"
+	ws := "pass  word\twith\nspace"
+	for name, msg := range map[string]string{
+		"straddle":   strings.Repeat("x", 180) + secret + " tail",
+		"whitespace": "bad credentials: " + ws,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]string{"message": msg})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(401)
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			c, _ := httpx.New(srv.URL, false, 0)
+			c.AddSecret(secrets.Secret(secret), secrets.Secret(ws))
+			_, err := c.Do(context.Background(), "GET", "/", nil, nil, nil, nil)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			for _, frag := range []string{secret[:12], "S3CRET", "pass word", "pass"} {
+				if strings.Contains(err.Error(), frag) {
+					t.Fatalf("fragment %q leaked: %v", frag, err)
+				}
+			}
+			if !strings.Contains(err.Error(), "[redacted]") {
+				t.Fatalf("not redacted: %v", err)
+			}
+		})
 	}
 }
