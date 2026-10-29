@@ -180,6 +180,9 @@ func parse(raw []byte, path string, env func(string) (string, bool)) (*Config, e
 	if err := RejectMergeKeys(&root); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
+	if err := checkMappingSizes(&root); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
+	}
 	var missing []string
 	substituteNode(&root, env, &missing)
 	if len(missing) > 0 {

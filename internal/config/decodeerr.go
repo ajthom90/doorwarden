@@ -6,13 +6,25 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
 
+// A decode error describes at most maxDecodeProblems problems and is cut
+// at maxDecodeMsg bytes, so a large invalid document costs little.
+const (
+	maxDecodeProblems = 20
+	maxDecodeMsg      = 8 << 10
+	// maxMappingKeys bounds every mapping: yaml.v3's duplicate-key check
+	// is quadratic in a mapping's size, so a huge one is refused before
+	// decoding. Real configs have a few dozen keys per mapping.
+	maxMappingKeys = 4096
+)
+
 var (
-	decodeLineRe = regexp.MustCompile(`^line (\d+): (.*)$`)
-	unmarshalRe  = regexp.MustCompile(`^cannot unmarshal !!(\w+) (?:.* )?into (\S+)$`)
+	decodeLineRe = regexp.MustCompile(`(?s)^line (\d+): (.*)$`)
+	unmarshalRe  = regexp.MustCompile(`(?s)^cannot unmarshal !!(\w+) (?:.* )?into (\S+)$`)
 )
 
 // describeDecodeError rewrites a decode error so it never quotes a scalar
@@ -27,8 +39,10 @@ func describeDecodeError(err error, out []byte, root *yaml.Node) error {
 	}
 	var outRoot yaml.Node
 	_ = yaml.Unmarshal(out, &outRoot)
-	msgs := make([]string, 0, len(te.Errors))
-	for _, e := range te.Errors {
+	idx := lineIndex(&outRoot) // once: a path lookup per problem is linear
+	shown := min(len(te.Errors), maxDecodeProblems)
+	msgs := make([]string, 0, shown+1)
+	for _, e := range te.Errors[:shown] {
 		m := decodeLineRe.FindStringSubmatch(e)
 		if m == nil {
 			msgs = append(msgs, elideQuoted(e))
@@ -37,7 +51,7 @@ func describeDecodeError(err error, out []byte, root *yaml.Node) error {
 		reason := decodeReason(m[2])
 		n, _ := strconv.Atoi(m[1])
 		where := "a value"
-		if p := pathAtLine(&outRoot, n, nil); p != nil {
+		if p := idx[n]; p != nil {
 			where = formatPath(p)
 			if ln := lineAtPath(root, p); ln > 0 {
 				where += fmt.Sprintf(" (line %d)", ln)
@@ -45,7 +59,18 @@ func describeDecodeError(err error, out []byte, root *yaml.Node) error {
 		}
 		msgs = append(msgs, where+": "+reason)
 	}
-	return errors.New(strings.Join(msgs, "; "))
+	if rest := len(te.Errors) - shown; rest > 0 {
+		msgs = append(msgs, fmt.Sprintf("and %d more problems", rest))
+	}
+	msg := strings.Join(msgs, "; ")
+	if len(msg) > maxDecodeMsg {
+		cut := maxDecodeMsg
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut] + " ... (truncated)"
+	}
+	return errors.New(msg)
 }
 
 // decodeReason turns a yaml.v3 problem into a reason without the value.
@@ -77,39 +102,44 @@ type pathElem struct {
 	idx int // -1 for a mapping key
 }
 
-// pathAtLine returns the path to the first node (in document order) whose
-// key or scalar value is on line n, or nil.
-func pathAtLine(n *yaml.Node, line int, path []pathElem) []pathElem {
-	switch n.Kind {
-	case yaml.DocumentNode:
-		for _, c := range n.Content {
-			if p := pathAtLine(c, line, path); p != nil {
-				return p
-			}
+// lineIndex maps each line to the path of the first node (in document
+// order) whose key or scalar value is on it, in one walk of the tree.
+func lineIndex(root *yaml.Node) map[int][]pathElem {
+	idx := map[int][]pathElem{}
+	var walk func(n *yaml.Node, path []pathElem)
+	mark := func(line int, p []pathElem) {
+		if _, ok := idx[line]; !ok {
+			idx[line] = append([]pathElem{}, p...)
 		}
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			k, v := n.Content[i], n.Content[i+1]
-			p := append(append([]pathElem{}, path...), pathElem{key: k.Value, idx: -1})
-			if k.Line == line || (v.Kind == yaml.ScalarNode && v.Line == line) {
-				return p
+	}
+	walk = func(n *yaml.Node, path []pathElem) {
+		switch n.Kind {
+		case yaml.DocumentNode:
+			for _, c := range n.Content {
+				walk(c, path)
 			}
-			if r := pathAtLine(v, line, p); r != nil {
-				return r
+		case yaml.MappingNode:
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				k, v := n.Content[i], n.Content[i+1]
+				p := append(path, pathElem{key: k.Value, idx: -1})
+				mark(k.Line, p)
+				if v.Kind == yaml.ScalarNode {
+					mark(v.Line, p)
+				}
+				walk(v, p[:len(p):len(p)])
 			}
-		}
-	case yaml.SequenceNode:
-		for i, c := range n.Content {
-			p := append(append([]pathElem{}, path...), pathElem{idx: i})
-			if c.Kind == yaml.ScalarNode && c.Line == line {
-				return p
-			}
-			if r := pathAtLine(c, line, p); r != nil {
-				return r
+		case yaml.SequenceNode:
+			for i, c := range n.Content {
+				p := append(path, pathElem{idx: i})
+				if c.Kind == yaml.ScalarNode {
+					mark(c.Line, p)
+				}
+				walk(c, p[:len(p):len(p)])
 			}
 		}
 	}
-	return nil
+	walk(root, nil)
+	return idx
 }
 
 // lineAtPath returns the line of path's last key or element in n, or 0.
@@ -154,4 +184,42 @@ func formatPath(p []pathElem) string {
 		b.WriteString(e.key)
 	}
 	return b.String()
+}
+
+// checkMappingSizes refuses a mapping with more than maxMappingKeys keys,
+// naming it by key path and line.
+func checkMappingSizes(root *yaml.Node) error {
+	var walk func(n *yaml.Node, path []pathElem) error
+	walk = func(n *yaml.Node, path []pathElem) error {
+		switch n.Kind {
+		case yaml.MappingNode:
+			if k := len(n.Content) / 2; k > maxMappingKeys {
+				where := "the document"
+				if len(path) > 0 {
+					where = formatPath(path)
+				}
+				return fmt.Errorf("%s (line %d): a mapping with %d keys (at most %d)", where, n.Line, k, maxMappingKeys)
+			}
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				p := append(path[:len(path):len(path)], pathElem{key: n.Content[i].Value, idx: -1})
+				if err := walk(n.Content[i+1], p); err != nil {
+					return err
+				}
+			}
+		case yaml.SequenceNode:
+			for i, c := range n.Content {
+				if err := walk(c, append(path[:len(path):len(path)], pathElem{idx: i})); err != nil {
+					return err
+				}
+			}
+		case yaml.DocumentNode:
+			for _, c := range n.Content {
+				if err := walk(c, path); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(root, nil)
 }
