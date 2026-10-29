@@ -14,11 +14,19 @@ import (
 
 // render writes Traefik's dynamic files from the persisted routes and cert
 // rows (traefikwire's composition, plus an on-disk check of the default
-// certificate) and records the certificate expiry metrics.
-func (a *App) render(ctx context.Context, now time.Time) error {
+// certificate) and records the certificate expiry metrics. The routes of
+// the keys in quarantined (this cycle's gate verdict) are rendered as
+// quarantined even if storing the flag failed, so a failed write cannot
+// leave a quarantined service served.
+func (a *App) render(ctx context.Context, now time.Time, quarantined map[string]bool) error {
 	routes, err := a.st.ListRoutes(ctx)
 	if err != nil {
 		return fmt.Errorf("traefik render: reading routes: %w", err)
+	}
+	for i := range routes {
+		if quarantined[routes[i].Key] {
+			routes[i].Quarantined = true
+		}
 	}
 	rows, err := a.st.ListCerts(ctx)
 	if err != nil {

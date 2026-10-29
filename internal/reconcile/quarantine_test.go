@@ -35,12 +35,15 @@ func TestQuarantineRemovesRouteKeepsHostname(t *testing.T) {
 		if len(inv) != 1 || !strings.Contains(inv[0].Reason, "backend changed; re-approve to resume") {
 			t.Fatalf("cycle %d: want the quarantine Invalid, got %v", i, sums(acts))
 		}
+		if inv[0].Alert != AlertQuarantined {
+			t.Fatalf("cycle %d: every quarantined cycle carries the alert (the notifier dedupes), got %q", i, inv[0].Alert)
+		}
 		if i == 0 {
-			if len(rr) != 1 || rr[0].Cause != CauseQuarantine || inv[0].Alert != AlertQuarantined {
-				t.Fatalf("cycle 0: want RouteRemove(quarantine) and an alert, got %v", sums(acts))
+			if len(rr) != 1 || rr[0].Cause != CauseQuarantine {
+				t.Fatalf("cycle 0: want RouteRemove(quarantine), got %v", sums(acts))
 			}
-		} else if len(rr) != 0 || inv[0].Alert != "" {
-			t.Fatalf("cycle %d: route already removed; got %v (alert %q)", i, sums(acts), inv[0].Alert)
+		} else if len(rr) != 0 {
+			t.Fatalf("cycle %d: route already removed; got %v", i, sums(acts))
 		}
 		if r, ok := e.route("docker:app"); !ok || !r.Quarantined || r.Port != 8080 {
 			t.Fatalf("cycle %d: want the route kept and quarantined: %+v %v", i, r, ok)

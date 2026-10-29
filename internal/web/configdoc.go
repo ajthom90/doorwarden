@@ -159,7 +159,7 @@ func parseDoc(raw []byte) (*yaml.Node, error) {
 	if root.Kind == 0 {
 		root = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}}
 	}
-	if err := config.RejectMergeKeys(&root); err != nil {
+	if err := config.CheckDocument(&root); err != nil {
 		return nil, errors.New("config: " + err.Error())
 	}
 	return &root, nil

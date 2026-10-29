@@ -41,7 +41,8 @@
 // is withdrawn with RouteRemove{Cause: CauseQuarantine}, which keeps the row
 // but marks it quarantined (the renderer skips it), together with an
 // Invalid ("backend changed; re-approve to resume") carrying
-// AlertQuarantined; later cycles repeat the Invalid without the alert. It
+// AlertQuarantined; later cycles repeat the alerted Invalid (the notifier's
+// dedupe key keeps it to one notification and retries a dropped one). It
 // claims, as an incumbent, only the hostname of its persisted route (the one
 // it was approved and served under), so a same-rank squatter there gets only
 // a Conflict; a hostname its unapproved labels declare is never claimed, and

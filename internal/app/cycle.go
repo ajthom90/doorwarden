@@ -71,7 +71,7 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 		}
 	}
 
-	desired, up, quarantined := a.gather(ctx, res.Unavailable)
+	desired, up, quarantined := a.gather(ctx, res.Unavailable, dry)
 	if err := ctx.Err(); err != nil {
 		res.Err = err
 		return res
@@ -108,7 +108,7 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 	if !dry {
 		a.persistServices(ctx, desired, now)
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTimeout)
-		if err := a.render(rctx, now); err != nil {
+		if err := a.render(rctx, now, quarantined); err != nil {
 			errs = append(errs, err)
 		} else {
 			res.Rendered = true
@@ -148,7 +148,7 @@ func (a *App) finishCycle(start time.Time, dry bool, up map[string]bool, desired
 
 // gather lists every source and applies the approval gate. unavailable is
 // filled with every unknown source name.
-func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.Service, map[string]bool, map[string]bool) {
+func (a *App) gather(ctx context.Context, unavailable map[string]bool, dry bool) ([]model.Service, map[string]bool, map[string]bool) {
 	up := map[string]bool{}
 	quarantined := map[string]bool{}
 	var desired []model.Service
@@ -175,6 +175,17 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		return desired, up, quarantined
 	}
 	a.logChange(ctx, "overrides", "error", "")
+	opt, err := a.approvalOptions(ctx, dry)
+	if err != nil {
+		// Without the persisted routes the gate cannot tell a served,
+		// unchanged service from a changed one: every source is unknown.
+		a.logChange(ctx, "approval-routes", "error", fmt.Sprintf("routes could not be read for the approval check; every source is treated as unknown: %v", err))
+		for _, sp := range a.sources {
+			mark(sp.name())
+		}
+		return desired, up, quarantined
+	}
+	a.logChange(ctx, "approval-routes", "error", "")
 	for _, sp := range a.sources {
 		name := sp.name()
 		if sp.Source == nil {
@@ -208,7 +219,7 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		if mode == "" {
 			mode = approval.ModeAuto
 		}
-		rd, err := a.gate.ResolveDetail(ctx, mode, svcs)
+		rd, err := a.gate.ResolveDetail(ctx, mode, svcs, opt)
 		res := rd.Services
 		if err != nil {
 			// Its approvals could not be loaded: its services would look
@@ -223,8 +234,13 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		for _, s := range svcs {
 			a.alias(name, s.Source)
 		}
-		for _, k := range rd.Migrated {
-			a.appendActivity(ctx, "info", "approval", "service "+k+": migrated approval v1->v2 (the approved content is unchanged; the approval now also covers the backend and the middleware order)")
+		if !dry { // dry run writes no approval; its plan shows them served
+			for _, k := range rd.Migrated {
+				a.appendActivity(ctx, "info", "approval", "service "+k+": migrated approval v1->v2 (the approved content is unchanged and is what its route serves; the approval now also covers the backend and the middleware order)")
+			}
+			for _, k := range rd.Grandfathered {
+				a.appendActivity(ctx, "info", "approval", "service "+k+": grandfathered on mode switch (approved as it was already served: no approval was stored and its content equals its route)")
+			}
 		}
 		for k := range rd.Quarantined {
 			quarantined[k] = true
@@ -239,6 +255,32 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		desired = append(desired, res...)
 	}
 	return desired, up, quarantined
+}
+
+// approvalOptions gives the gate what each persisted route serves, so a
+// legacy approval migrates and a served unapproved service is
+// grandfathered only for unchanged content.
+func (a *App) approvalOptions(ctx context.Context, dry bool) (approval.Options, error) {
+	sctx, cancel := context.WithTimeout(ctx, storeTimeout)
+	defer cancel()
+	routes, err := a.st.ListRoutes(sctx)
+	if err != nil {
+		return approval.Options{}, err
+	}
+	o := approval.Options{DryRun: dry, Served: make(map[string]approval.Served, len(routes))}
+	for _, r := range routes {
+		o.Served[r.Key] = approval.Served{Hostname: r.Hostname, Websockets: r.Websockets, Middlewares: r.Middlewares,
+			Quarantined: r.Quarantined, Backend: model.Backend{Scheme: r.Scheme, Host: r.Host, Port: r.Port, SkipVerify: r.SkipVerify}}
+	}
+	zs, dz := a.zoneNames()
+	o.Hostname = func(s model.Service) string {
+		h, err := model.Hostname(s, zs, dz)
+		if err != nil {
+			return ""
+		}
+		return h
+	}
+	return o, nil
 }
 
 func (a *App) alias(name, src string) {
@@ -331,7 +373,8 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 		}
 		switch {
 		case x.Alert == reconcile.AlertQuarantined:
-			// Planned once, with the route's withdrawal.
+			// Planned every quarantined cycle; the key (per backend)
+			// suppresses repeats and lets a dropped one be retried.
 			a.notify(ctx, notify.Event{Kind: "service.quarantined", Severity: notify.Warning,
 				Subject: "doorwarden: " + x.Key + " changed; re-approve to resume", Message: x.Reason,
 				Fields:    map[string]string{"key": x.Key, "zone": x.Zone, "host": x.Host},

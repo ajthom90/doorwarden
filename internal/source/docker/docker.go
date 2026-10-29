@@ -51,6 +51,9 @@ type Config struct {
 	// zone's host with its published port; others (and unknown zones) use
 	// TargetIP.
 	ZoneTargets map[string]string
+	// DefaultZone is the normalized name of the zone TargetIP belongs to
+	// ("" without settings.default_zone), for error messages.
+	DefaultZone string
 	Network     string // optional shared network; use the container IP on it
 	Name        string // source name, default "docker"
 }
@@ -296,10 +299,17 @@ func (s *Source) convert(cname string, c apiContainer) (model.Service, string) {
 	if z != "" && s.cfg.ZoneTargets[z] != "" {
 		tip = s.cfg.ZoneTargets[z]
 	}
-	if z == "" && tip == "" {
+	if z == "" && tip == "" && s.cfg.DefaultZone == "" {
 		// Several zones and no settings.default_zone: an unlabelled
 		// service has no zone (nor a host for its published port).
 		return fail(errors.New("no zone: set doorwarden.zone or settings.default_zone"))
+	}
+	if pub := published[port]; pub > 0 && tip == "" {
+		// It has a zone, but no host to reach the published port on.
+		if z == "" {
+			return fail(fmt.Errorf("zone %s (the default zone) has no target_ip: set its target_ip for published port %d", s.cfg.DefaultZone, pub))
+		}
+		return fail(fmt.Errorf("zone %s has no target_ip (nor does the default zone): set its target_ip for published port %d", z, pub))
 	}
 	if pub := published[port]; pub > 0 && tip != "" {
 		svc.Backend.Host = tip

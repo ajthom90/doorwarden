@@ -461,7 +461,7 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 	out := []SourceSpec{{Source: static.New(static.Config{Services: cfg.Static}), Mode: approval.ModeAuto}}
 	tip := sourceTargetIP(cfg)
 	if d := cfg.Sources.Docker; d != nil {
-		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip, ZoneTargets: zoneTargets(cfg)})
+		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip, ZoneTargets: zoneTargets(cfg), DefaultZone: cfg.DefaultCertZone()})
 		sp := SourceSpec{Name: "docker", Mode: approvalMode(d.Approval, approval.ModeAuto), Err: err}
 		if err == nil {
 			sp.Source = s
@@ -473,7 +473,7 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 		key, err := sec.Value(t.APIKey)
 		if err == nil {
 			var s *truenas.Source
-			if s, err = truenas.New(truenas.Config{URL: t.URL, APIKey: key, TargetIP: tip}, nil); err == nil {
+			if s, err = truenas.New(truenas.Config{URL: t.URL, APIKey: key, TargetIP: tip, DefaultZone: cfg.DefaultCertZone()}, nil); err == nil {
 				sp.Source = s
 			}
 		}
