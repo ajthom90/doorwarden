@@ -197,9 +197,6 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(Config{TargetIP: "1.2.3.4"}, nil); err == nil {
 		t.Fatal("URL required")
 	}
-	if _, err := New(Config{URL: "https://h"}, nil); err == nil {
-		t.Fatal("TargetIP required")
-	}
 	s, err := New(Config{URL: "https://h", TargetIP: "1.2.3.4"}, nil)
 	if err != nil || s.Name() != "truenas" {
 		t.Fatal(err)
@@ -271,5 +268,24 @@ func TestListPreservesContextError(t *testing.T) {
 	_, err := s.List(ctx)
 	if !errors.Is(err, source.ErrSourceUnavailable) || !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+}
+
+// Without a default zone (several zones, no settings.default_zone) the
+// source still builds; each running app is an Error naming the fix.
+func TestNoTargetIPAppsAreNoZoneErrors(t *testing.T) {
+	f := newFake(t, appsJSON(appJSON("a", "RUNNING", `{"Web UI":"http://0.0.0.0:30088/"}`)))
+	s, err := New(Config{URL: f.url(), APIKey: secrets.Secret(testKey)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	out, err := s.List(context.Background())
+	if err != nil || len(out) != 1 {
+		t.Fatalf("out=%v err=%v", out, err)
+	}
+	if out[0].State != model.StateError || out[0].Backend.Host != "" || len(s.Warnings()) != 1 ||
+		!strings.Contains(s.Warnings()[0], "no zone: set settings.default_zone") {
+		t.Fatalf("%+v %v", out[0], s.Warnings())
 	}
 }

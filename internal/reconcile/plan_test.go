@@ -41,9 +41,9 @@ func TestPlanDefaultZone(t *testing.T) {
 		wantHost string // "" => Invalid
 		msg      string
 	}{
-		{"no zones", nil, "", "", "no default_zone is set while 0 zones"},
+		{"no zones", nil, "", "", "no zone: set doorwarden.zone or settings.default_zone (0 zones"},
 		{"one zone implicit", one, "", "app.example.test", ""},
-		{"two zones no default", two, "", "", "no default_zone is set while 2 zones"},
+		{"two zones no default", two, "", "", "no zone: set doorwarden.zone or settings.default_zone (2 zones"},
 		{"two zones default second", two, "Other.Test.", "app.other.test", ""},
 		{"one zone explicit default", one, "example.test", "app.example.test", ""},
 		{"default not configured", two, "nope.test", "", "unknown zone"},
@@ -709,7 +709,10 @@ func TestPlanDoesNotMutateInputs(t *testing.T) {
 
 // --- fix round 1 ------------------------------------------------------------
 
-func TestPlanPublishedTierBeatsExistingRoute(t *testing.T) {
+// Final-review H1: within one source rank the incumbent (a stopped v1 that
+// still holds the route) keeps the hostname; the published newcomer v2 is a
+// Conflict and the incumbent's route is not removed.
+func TestPlanIncumbentBeatsPublishedNewcomer(t *testing.T) {
 	cfg := cfgOf(zone("example.test", "off", "wildcard"))
 	lk := map[string]model.Backend{"docker:app_v1": {Scheme: "http", Host: "198.51.100.5", Port: 1111}}
 	v1 := svc("docker:app_v1", "app", "example.test", model.StateStopped, "", 0)
@@ -717,10 +720,9 @@ func TestPlanPublishedTierBeatsExistingRoute(t *testing.T) {
 	obs := Observed{LastKnown: lk, Known: knownMap(known("docker:app_v1", "example.test", "app.example.test", nil))}
 	got := Plan([]model.Service{v1, v2}, obs, cfg, t0)
 	assertSums(t, got,
-		"Conflict example.test app.example.test docker:app_v1",
+		"Conflict example.test app.example.test docker:app_v2",
 		"CertEnsure example.test *.example.test *.example.test,example.test",
-		"RouteWrite example.test app.example.test docker:app_v2 ->198.51.100.5:2222",
-		"RouteRemove example.test app.example.test docker:app_v1",
+		"RouteWrite example.test app.example.test docker:app_v1 ->198.51.100.5:1111",
 	)
 }
 
@@ -976,16 +978,17 @@ func TestPlanLoserRouteRemovedOnlyWhenWinnerRouted(t *testing.T) {
 func TestPlanSameSourceTiers(t *testing.T) {
 	cfg := cfgOf(zone("example.test", "off", "wildcard"))
 	rn := func(s model.Service) model.Service { s.Options.Rename = "app"; return s }
-	t.Run("stopped v1 never beats published v2", func(t *testing.T) {
+	t.Run("stopped incumbent v1 keeps the name against published v2", func(t *testing.T) {
 		v1 := rn(svc("docker:a_v1", "x", "example.test", model.StateStopped, "", 0))
 		v2 := rn(pub("docker:b_v2", "y", "example.test", 2))
 		obs := Observed{Known: knownMap(known("docker:a_v1", "example.test", "app.example.test", nil)),
 			LastKnown: map[string]model.Backend{"docker:a_v1": {Scheme: "http", Host: "198.51.100.5", Port: 1}}}
 		got := Plan([]model.Service{v1, v2}, obs, cfg, t0)
-		if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:b_v2" {
+		if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:a_v1" {
 			t.Fatalf("got %v", sums(got))
 		}
-		assertSums(t, forKey(got, "docker:a_v1"), "Conflict example.test app.example.test docker:a_v1", "RouteRemove example.test app.example.test docker:a_v1")
+		assertSums(t, forKey(got, "docker:b_v2"), "Conflict example.test app.example.test docker:b_v2")
+		assertNone(t, got, RouteRemove)
 	})
 	t.Run("published without backend is not serving", func(t *testing.T) {
 		a := rn(svc("docker:a", "x", "example.test", model.StatePublished, "", 0))
@@ -995,15 +998,21 @@ func TestPlanSameSourceTiers(t *testing.T) {
 			t.Fatalf("got %v", sums(got))
 		}
 	})
-	t.Run("equal tier stable by key whichever is known", func(t *testing.T) {
+	t.Run("equal tier: the incumbent wins whatever the key order (H1)", func(t *testing.T) {
 		a := rn(pub("docker:a", "x", "example.test", 1))
 		b := rn(pub("docker:b", "y", "example.test", 2))
 		for _, k := range []string{"docker:a", "docker:b"} {
 			obs := Observed{Known: knownMap(known(k, "example.test", "app.example.test", nil))}
 			got := Plan([]model.Service{b, a}, obs, cfg, t0)
-			if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:a" {
+			if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != k {
 				t.Fatalf("known=%s: %v", k, sums(got))
 			}
+			assertNone(t, got, RouteRemove)
+		}
+		// first-time tie: no incumbent, the smaller key
+		got := Plan([]model.Service{b, a}, Observed{}, cfg, t0)
+		if r := ofKind(got, RouteWrite); len(r) != 1 || r[0].Key != "docker:a" {
+			t.Fatalf("no incumbent: %v", sums(got))
 		}
 	})
 	t.Run("phantom with route beats non-serving newcomer of same source", func(t *testing.T) {

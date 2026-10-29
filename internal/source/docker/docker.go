@@ -28,6 +28,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -44,9 +45,14 @@ import (
 // Config configures a Docker source.
 type Config struct {
 	Endpoint string // unix:///var/run/docker.sock or tcp://host:2375
-	TargetIP string // host used with published ports
-	Network  string // optional shared network; use the container IP on it
-	Name     string // source name, default "docker"
+	TargetIP string // host used with published ports (the default zone's target_ip)
+	// ZoneTargets maps a normalized zone name (lowercase, no trailing dot)
+	// to its target_ip: a container labelled doorwarden.zone uses that
+	// zone's host with its published port; others (and unknown zones) use
+	// TargetIP.
+	ZoneTargets map[string]string
+	Network     string // optional shared network; use the container IP on it
+	Name        string // source name, default "docker"
 }
 
 // Source is the Docker discovery source.
@@ -285,8 +291,18 @@ func (s *Source) convert(cname string, c apiContainer) (model.Service, string) {
 		svc.Backend.Host = n.IPAddress
 		return svc, ""
 	}
-	if pub := published[port]; pub > 0 && s.cfg.TargetIP != "" {
-		svc.Backend.Host = s.cfg.TargetIP
+	tip := s.cfg.TargetIP
+	z := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(svc.Zone)), ".")
+	if z != "" && s.cfg.ZoneTargets[z] != "" {
+		tip = s.cfg.ZoneTargets[z]
+	}
+	if z == "" && tip == "" {
+		// Several zones and no settings.default_zone: an unlabelled
+		// service has no zone (nor a host for its published port).
+		return fail(errors.New("no zone: set doorwarden.zone or settings.default_zone"))
+	}
+	if pub := published[port]; pub > 0 && tip != "" {
+		svc.Backend.Host = tip
 		svc.Backend.Port = pub
 		return svc, ""
 	}

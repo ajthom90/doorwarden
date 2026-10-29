@@ -34,7 +34,10 @@ type Route struct {
 	// RemovedAfter is the scheduled removal time. UpsertRoute ignores it;
 	// only SetRouteRemoval changes it.
 	RemovedAfter *time.Time
-	UpdatedAt    time.Time
+	// Quarantined: kept but not rendered (see QuarantineRoute). UpsertRoute
+	// ignores it and always clears it.
+	Quarantined bool
+	UpdatedAt   time.Time
 }
 
 func normRouteName(n string) string {
@@ -108,15 +111,16 @@ func (s *Store) UpsertRoute(ctx context.Context, r Route) error {
 		upd = time.Now()
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO routes
-		(key, source, zone, hostname, scheme, host, port, skip_verify, websockets, middlewares_json, removed_after, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+		(key, source, zone, hostname, scheme, host, port, skip_verify, websockets, middlewares_json, removed_after, quarantined, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)
 		ON CONFLICT(key) DO UPDATE SET source=excluded.source, zone=excluded.zone, hostname=excluded.hostname,
 			scheme=excluded.scheme, host=excluded.host, port=excluded.port, skip_verify=excluded.skip_verify,
-			websockets=excluded.websockets, middlewares_json=excluded.middlewares_json, updated_at=excluded.updated_at
+			websockets=excluded.websockets, middlewares_json=excluded.middlewares_json, quarantined=0,
+			updated_at=excluded.updated_at
 		WHERE source IS NOT excluded.source OR zone IS NOT excluded.zone OR hostname IS NOT excluded.hostname
 			OR scheme IS NOT excluded.scheme OR host IS NOT excluded.host OR port IS NOT excluded.port
 			OR skip_verify IS NOT excluded.skip_verify OR websockets IS NOT excluded.websockets
-			OR middlewares_json IS NOT excluded.middlewares_json`,
+			OR middlewares_json IS NOT excluded.middlewares_json OR quarantined != 0`,
 		r.Key, r.Source, r.Zone, r.Hostname, r.Scheme, r.Host, r.Port, boolInt(r.SkipVerify), boolInt(r.Websockets),
 		string(mwJSON), toUnix(upd))
 	return err
@@ -142,6 +146,24 @@ func (s *Store) DeleteRouteIfDue(ctx context.Context, key string, notAfter time.
 	return n > 0, err
 }
 
+// QuarantineRoute marks key's route quarantined: it stays in the set (so
+// the plan still sees its key as the hostname's incumbent) but is not
+// rendered. It returns ErrRouteNotFound when there is no route for key.
+func (s *Store) QuarantineRoute(ctx context.Context, key string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE routes SET quarantined = 1 WHERE key = ?`, key)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %q", ErrRouteNotFound, key)
+	}
+	return nil
+}
+
 // SetRouteRemoval sets (at non-nil) or clears (at nil) the scheduled removal
 // of key's route. It returns ErrRouteNotFound, writing nothing, when there is
 // no route for key.
@@ -160,23 +182,23 @@ func (s *Store) SetRouteRemoval(ctx context.Context, key string, at *time.Time) 
 	return nil
 }
 
-const routeCols = `key, source, zone, hostname, scheme, host, port, skip_verify, websockets, middlewares_json, removed_after, updated_at`
+const routeCols = `key, source, zone, hostname, scheme, host, port, skip_verify, websockets, middlewares_json, removed_after, quarantined, updated_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanRoute(sc rowScanner) (Route, error) {
 	var (
 		r          Route
-		sv, ws     int
+		sv, ws, qu int
 		mwJSON     string
 		removed    sql.NullInt64
 		updatedSec int64
 	)
 	if err := sc.Scan(&r.Key, &r.Source, &r.Zone, &r.Hostname, &r.Scheme, &r.Host, &r.Port, &sv, &ws, &mwJSON,
-		&removed, &updatedSec); err != nil {
+		&removed, &qu, &updatedSec); err != nil {
 		return Route{}, err
 	}
-	r.SkipVerify, r.Websockets = sv != 0, ws != 0
+	r.SkipVerify, r.Websockets, r.Quarantined = sv != 0, ws != 0, qu != 0
 	if err := json.Unmarshal([]byte(mwJSON), &r.Middlewares); err != nil {
 		return Route{}, fmt.Errorf("store: route %q middlewares: %w", r.Key, err)
 	}

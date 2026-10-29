@@ -11,13 +11,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/dns"
 	_ "github.com/ajthom90/doorwarden/internal/dns/providers"
 	"github.com/ajthom90/doorwarden/internal/secrets"
 )
 
+// The production registry (this package's blank imports, which the server
+// binary uses) has only the real providers: the in-memory "fake" provider
+// is registered only by tests and the UI demo that import it directly, so
+// an operator's `type: fake` is rejected as an unknown type.
 func TestAllTypesRegistered(t *testing.T) {
-	want := []string{"adguard", "cloudflare", "fake", "pihole", "rfc2136", "route53", "technitium", "unifi"}
+	want := []string{"adguard", "cloudflare", "pihole", "rfc2136", "route53", "technitium", "unifi"}
 	if got := dns.Types(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("types = %v", got)
 	}
@@ -78,7 +83,6 @@ const sentinel = "LEAKCHECKs3cretvalue" // 20 characters of valid base64, so it 
 // schema field.
 func leakConfigs() map[string]map[string]any {
 	return map[string]map[string]any{
-		"fake":        {},
 		"cloudflare":  {"api_token": sentinel},
 		"route53":     {"access_key_id": "AKIALEAKCHECKKEY01", "secret_access_key": sentinel},
 		"rfc2136":     {"server": "127.0.0.1", "key_name": "k", "key_secret": sentinel},
@@ -276,5 +280,28 @@ func (w *walker) walk(v reflect.Value, path string) {
 	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
 		// closures are opaque to reflection and print as addresses: this is where
 		// credentials are kept
+	}
+}
+
+// An operator config selecting `type: fake` is rejected by validation with
+// the production registry.
+func TestFakeProviderTypeRejected(t *testing.T) {
+	yml := `zones:
+  - name: example.test
+    target_ip: 192.0.2.10
+    records: {provider: fk, mode: per-host}
+providers:
+  fk: {type: fake}
+`
+	c, err := config.Parse([]byte(yml), func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := c.Validate(dns.ConfigCaps())
+	if !strings.Contains(fmt.Sprint(errs), "fake") {
+		t.Fatalf("type fake accepted: %v", errs)
+	}
+	if _, err := dns.New("fake", map[string]any{}, nil); err == nil {
+		t.Fatal("dns.New(fake) succeeded")
 	}
 }

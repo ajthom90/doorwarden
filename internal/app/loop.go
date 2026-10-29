@@ -136,15 +136,32 @@ func (a *App) renewOnce(ctx context.Context) {
 	rctx, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()
 	for _, r := range a.mgr.Renew(rctx) {
-		switch {
-		case r.Err == nil:
-			a.met.CertRenewal("ok")
-		case errors.Is(r.Err, acme.ErrDeferred), errors.Is(r.Err, acme.ErrUnwanted),
-			errors.Is(r.Err, acme.ErrImported), errors.Is(r.Err, acme.ErrNeedsSwitch):
-			// No attempt was made.
-		default:
-			a.met.CertRenewal("error")
+		if a.countRenewal(r) == "error" {
 			a.log.WarnContext(ctx, "certificate renewal failed", "cert", r.CertID, "zone", r.Zone, "error", r.Err)
 		}
 	}
+}
+
+// countRenewal counts one certificate result in
+// doorwarden_cert_renewal_total when an attempt was made (issuance,
+// renewal, re-issue: from the hourly round, the cycle's CertEnsure, the
+// API's renew and issuer switch alike) and returns its result ("ok",
+// "error", or "" when no attempt was made: deferred, skipped, unwanted,
+// imported, needs a switch, already in flight, refused downgrade, unknown
+// certificate, no issuer).
+func (a *App) countRenewal(r acme.Result) string {
+	res := ""
+	switch {
+	case r.Skipped, errors.Is(r.Err, acme.ErrDeferred), errors.Is(r.Err, acme.ErrUnwanted),
+		errors.Is(r.Err, acme.ErrImported), errors.Is(r.Err, acme.ErrNeedsSwitch), errors.Is(r.Err, acme.ErrInFlight),
+		errors.Is(r.Err, acme.ErrDowngrade), errors.Is(r.Err, acme.ErrNotFound), errors.Is(r.Err, acme.ErrNoIssuer):
+	case r.Err == nil:
+		res = "ok"
+	default:
+		res = "error"
+	}
+	if res != "" {
+		a.met.CertRenewal(res)
+	}
+	return res
 }

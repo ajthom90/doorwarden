@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -27,6 +28,9 @@ func (c *Config) validateTraefik() []error {
 		case p.v != "/" && path.Clean(p.v) != strings.TrimRight(p.v, "/"):
 			add("%s %q must be a clean path (no . or .. elements)", p.name, p.v)
 		}
+	}
+	if _, err := t.Mode(); err != nil {
+		add("%v", err)
 	}
 	if ep := t.EntryPoint; ep != "" && !validEntryPoint(ep) {
 		add("traefik.entry_point %q must be [A-Za-z0-9_-]+", ep)
@@ -63,6 +67,18 @@ func (c *Config) validateTraefik() []error {
 		}
 	}
 	return errs
+}
+
+// Mode is traefik.file_mode as a permission: 0600 when unset, else 0600 or
+// 0640 (anything else is an error).
+func (t Traefik) Mode() (os.FileMode, error) {
+	switch strings.TrimSpace(t.FileMode) {
+	case "", "0600", "600":
+		return 0o600, nil
+	case "0640", "640":
+		return 0o640, nil
+	}
+	return 0o600, fmt.Errorf("traefik.file_mode %q must be \"0600\" or \"0640\"", t.FileMode)
 }
 
 func validEntryPoint(s string) bool {

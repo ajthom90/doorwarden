@@ -11,9 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -74,7 +72,9 @@ func ParseFlags(args []string, env func(string) (string, bool)) (Flags, error) {
 // ACME, notifications and metrics, serve /healthz, and run the loop. On
 // cancellation it shuts down gracefully: the running cycle is aborted
 // through ctx, the HTTP server drains, sources and the notifier are closed,
-// then the store.
+// then the store. Shutdown deletes nothing: no route, DNS record,
+// certificate or Traefik file is removed (the next start resumes from the
+// persisted state; see docs/rollback.md).
 func Run(ctx context.Context, args []string) error {
 	f, err := ParseFlags(args, nil)
 	if err != nil {
@@ -187,6 +187,7 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 	appRef.Store(a)
 
 	var srv *http.Server
+	var api *web.Server
 	srvErr := make(chan error, 1)
 	if f.Listen != "" {
 		ln, err := net.Listen("tcp", f.Listen)
@@ -194,7 +195,7 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 			_ = a.Close(context.Background())
 			return fmt.Errorf("listen %s: %w", f.Listen, err)
 		}
-		api, err := web.NewServer(ctx, web.Options{
+		api, err = web.NewServer(ctx, web.Options{
 			Store: st, Control: a, Config: cfg, ConfigPath: f.Config,
 			ValidateConfig: func(raw []byte) error { return validateConfigBytes(raw, env, box != nil) },
 			Health:         a.HealthHandler(), Metrics: a.MetricsHandler(), Log: log,
@@ -213,7 +214,21 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn)}
 		go func() { srvErr <- srv.Serve(ln) }()
 	}
-	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers))
+	dry, dryErr := a.DryRun(ctx)
+	if w := defaultZoneWarning(cfg); w != "" {
+		log.WarnContext(ctx, w)
+	}
+	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers), "dry_run", dry)
+	if dry {
+		why := "the dry-run toggle (UI/API) is on"
+		switch {
+		case cfg.Settings.DryRun:
+			why = "settings.dry_run is true in the config"
+		case dryErr != nil:
+			why = "the dry-run toggle could not be read: " + dryErr.Error()
+		}
+		log.WarnContext(ctx, "DRY RUN: no DNS record, certificate, Traefik file or route is changed; the plan is only recorded as activity", "reason", why)
+	}
 
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	loopDone := make(chan error, 1)
@@ -231,10 +246,19 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 		runErr = err
 	}
 	log.Info("doorwarden shutting down")
-	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Shutdown order: the loop is stopped; end the UI event streams and stop
+	// HTTP (connections still open after 10s are force-closed), then cancel
+	// the API's async jobs and wait for them (api.Shutdown does all three),
+	// then Close drains background ACME orders (bounded) and closes the
+	// sources and the notifier; the deferred st.Close runs last.
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second+DefaultDrainTimeout)
 	defer cancel()
 	if srv != nil {
-		_ = srv.Shutdown(sctx)
+		hctx, hcancel := context.WithTimeout(sctx, 10*time.Second)
+		if err := api.Shutdown(hctx, srv); err != nil {
+			log.Warn("http shutdown: open connections were force-closed", "error", err)
+		}
+		hcancel()
 	}
 	if err := a.Close(sctx); err != nil {
 		log.Warn("shutdown", "error", err)
@@ -245,12 +269,21 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 // LoadConfig loads the config and runs config.Validate with the DNS
 // registry's capabilities; any problem fails.
 func LoadConfig(path string, env func(string) (string, bool)) (*config.Config, error) {
+	if env == nil {
+		env = os.LookupEnv
+	}
 	cfg, err := config.Load(path, env)
 	if err != nil {
 		return nil, err
 	}
 	if errs := cfg.Validate(dns.ConfigCaps()); len(errs) > 0 {
-		return nil, fmt.Errorf("invalid config %s: %w", path, errors.Join(errs...))
+		// Validation messages quote field values, which may be substituted
+		// env values: scrub them like config.Load does its decode errors.
+		err := errors.Join(errs...)
+		if raw, rerr := os.ReadFile(path); rerr == nil {
+			err = config.ScrubEnvValues(err, raw, env)
+		}
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
 	return cfg, nil
 }
@@ -269,10 +302,10 @@ func LoadConfig(path string, env func(string) (string, bool)) (*config.Config, e
 func validateConfigBytes(raw []byte, env func(string) (string, bool), haveMasterKey bool) error {
 	cfg, err := config.Parse(raw, placeholderEnv(env))
 	if err != nil {
-		return scrubEnvValues(err, raw, env)
+		return config.ScrubEnvValues(err, raw, env)
 	}
 	if errs := cfg.Validate(dns.ConfigCaps()); len(errs) > 0 {
-		return scrubEnvValues(errors.Join(errs...), raw, env)
+		return config.ScrubEnvValues(errors.Join(errs...), raw, env)
 	}
 	if !haveMasterKey && needsMasterKey(cfg) {
 		return errors.New("the config uses secret: references or ACME issuers, which need DOORWARDEN_MASTER_KEY (not set)")
@@ -283,8 +316,6 @@ func validateConfigBytes(raw []byte, env func(string) (string, bool), haveMaster
 // envPlaceholder is what every set variable expands to when a client's
 // config document is validated.
 const envPlaceholder = "doorwarden-env-placeholder"
-
-var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
 
 // placeholderEnv reports env's variables as set (or empty) without their
 // values.
@@ -299,18 +330,6 @@ func placeholderEnv(env func(string) (string, bool)) func(string) (string, bool)
 		}
 		return envPlaceholder, true
 	}
-}
-
-// scrubEnvValues replaces the values of the variables raw references in
-// err's text.
-func scrubEnvValues(err error, raw []byte, env func(string) (string, bool)) error {
-	msg := err.Error()
-	for _, m := range envRefRe.FindAllSubmatch(raw, -1) {
-		if v, ok := env(string(m[1])); ok && len(v) >= 3 {
-			msg = strings.ReplaceAll(msg, v, "[redacted]")
-		}
-	}
-	return errors.New(msg)
 }
 
 func hasIssuer(cfg *config.Config) bool {
@@ -410,6 +429,31 @@ func sourceTargetIP(cfg *config.Config) string {
 	return ""
 }
 
+// defaultZoneWarning is the start-up warning for several zones without
+// settings.default_zone while a discovery source is enabled ("" when not
+// needed): zone-less discovered services (docker without doorwarden.zone,
+// every TrueNAS app) are then per-service errors.
+func defaultZoneWarning(cfg *config.Config) string {
+	discovery := (cfg.Sources.Docker != nil && cfg.Sources.Docker.Approval != "off") ||
+		(cfg.Sources.TrueNAS != nil && cfg.Sources.TrueNAS.Approval != "off")
+	if !discovery || len(cfg.Zones) < 2 || normZone(cfg.Settings.DefaultZone) != "" {
+		return ""
+	}
+	return fmt.Sprintf("%d zones and no settings.default_zone: discovered services without a doorwarden.zone label, and every TrueNAS app, are errors (\"no zone\") until settings.default_zone is set", len(cfg.Zones))
+}
+
+// zoneTargets maps each zone (normalized) to its target_ip, for sources
+// whose services can name their zone (docker's doorwarden.zone label).
+func zoneTargets(cfg *config.Config) map[string]string {
+	m := map[string]string{}
+	for _, z := range cfg.Zones {
+		if n := normZone(z.Name); n != "" && z.TargetIP != "" {
+			m[n] = z.TargetIP
+		}
+	}
+	return m
+}
+
 // BuildSources builds the static source (always) and the configured docker
 // and truenas sources. A source that fails to construct is returned with
 // its error and is Unavailable every cycle (its services stay as they are).
@@ -417,7 +461,7 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 	out := []SourceSpec{{Source: static.New(static.Config{Services: cfg.Static}), Mode: approval.ModeAuto}}
 	tip := sourceTargetIP(cfg)
 	if d := cfg.Sources.Docker; d != nil {
-		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip})
+		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip, ZoneTargets: zoneTargets(cfg)})
 		sp := SourceSpec{Name: "docker", Mode: approvalMode(d.Approval, approval.ModeAuto), Err: err}
 		if err == nil {
 			sp.Source = s
@@ -432,9 +476,6 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 			if s, err = truenas.New(truenas.Config{URL: t.URL, APIKey: key, TargetIP: tip}, nil); err == nil {
 				sp.Source = s
 			}
-		}
-		if err != nil && tip == "" {
-			err = fmt.Errorf("%w (the backend host is the default zone's target_ip: set settings.default_zone)", err)
 		}
 		sp.Err = err
 		out = append(out, sp)

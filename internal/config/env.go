@@ -1,8 +1,13 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -34,20 +39,21 @@ func substituteEnv(in string, env func(string) (string, bool)) (string, error) {
 	return out, nil
 }
 
-// substituteNode expands variables only inside string scalar values of the
-// node tree (never keys, comments or non-string scalars). Missing variables
-// are collected in missing. Under the top-level "providers" and
-// "middlewares" subtrees (stringOnlyTopKeys) results are always plain
-// strings. Elsewhere, an unquoted scalar that is exactly one
-// placeholder takes the type (bool/int/float only) its substituted text
-// resolves to; quoted or mixed text always stays a string. Substituted text
-// is never re-parsed as YAML structure.
 // stringOnlyTopKeys are the top-level subtrees whose substituted scalars are
-// always plain strings: provider settings (secrets) and middleware
-// definitions (header values, secrets), which must reach their consumer
-// exactly as written (0123, 1e3, 0x1F, true stay those strings).
+// always plain strings: provider settings (secrets), middleware definitions
+// (header values, secrets) and notification settings (passwords, tokens),
+// which must reach their consumer exactly as written (0123, 1e3, 0x1F, true
+// stay those strings).
 var stringOnlyTopKeys = map[string]bool{"providers": true, "middlewares": true, "notifications": true}
 
+// substituteNode expands variables only inside string scalar values of the
+// node tree (never keys, comments or non-string scalars). Missing variables
+// are collected in missing. Under the stringOnlyTopKeys subtrees
+// (providers, middlewares, notifications) results are always plain
+// strings. Elsewhere, an unquoted scalar that is exactly one placeholder
+// takes the type (bool/int/float only) its substituted text resolves to;
+// quoted or mixed text always stays a string. Substituted text is never
+// re-parsed as YAML structure.
 func substituteNode(n *yaml.Node, env func(string) (string, bool), missing *[]string) {
 	walkNode(n, env, missing, true, false)
 }
@@ -90,6 +96,100 @@ func walkNode(n *yaml.Node, env func(string) (string, bool), missing *[]string, 
 			n.Style = yaml.DoubleQuotedStyle
 		}
 	}
+}
+
+var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
+
+// backtickRe matches the backtick-quoted scalars YAML decode errors quote
+// (yaml.v3 cuts values longer than 10 bytes to 7 bytes plus "...");
+// dquoteRe a Go- or JSON-quoted string (%q).
+var (
+	backtickRe = regexp.MustCompile("`[^`]*`")
+	dquoteRe   = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+)
+
+// envValueForms returns v and its escaped spellings (the inside of %q,
+// %+q and JSON strings, with and without HTML escaping).
+func envValueForms(v string) []string {
+	forms := []string{v, inner(strconv.Quote(v)), inner(strconv.QuoteToASCII(v))}
+	if b, err := json.Marshal(v); err == nil {
+		forms = append(forms, inner(string(b)))
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(v) == nil {
+		forms = append(forms, inner(strings.TrimSpace(buf.String())))
+	}
+	return forms
+}
+
+func inner(q string) string { return q[1 : len(q)-1] }
+
+// sharesFragment reports whether s contains any 3-byte piece of v.
+func sharesFragment(s, v string) bool {
+	for i := 0; i+3 <= len(v); i++ {
+		if strings.Contains(s, v[i:i+3]) {
+			return true
+		}
+	}
+	return false
+}
+
+// ScrubEnvValues returns err with the values of every environment variable
+// raw references (${VAR}) removed from its text, as defence in depth behind
+// errors that never quote a value (parse elides decoded scalars): each
+// value of at least 3 bytes is replaced wherever it appears, raw or escaped
+// as by %q, %+q or JSON, and every quoted token (`...`, possibly truncated
+// by YAML, or "..." in Go or JSON quoting) carrying any 3-byte fragment of
+// such a value is replaced whole. Load/Parse errors and the startup and web
+// config validation use it, so no error (or the log line printing it)
+// carries a fragment of a substituted value. nil stays nil.
+func ScrubEnvValues(err error, raw []byte, env func(string) (string, bool)) error {
+	if err == nil {
+		return nil
+	}
+	var vals []string
+	for _, m := range envRefRe.FindAllSubmatch(raw, -1) {
+		if v, ok := env(string(m[1])); ok && len(v) >= 3 {
+			vals = append(vals, envValueForms(v)...)
+		}
+	}
+	if len(vals) == 0 {
+		return err
+	}
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+	msg := err.Error()
+	for _, v := range vals {
+		if len(v) >= 3 {
+			msg = strings.ReplaceAll(msg, v, "[redacted]")
+		}
+	}
+	leaks := func(content string) bool {
+		for _, v := range vals {
+			if sharesFragment(content, v) {
+				return true
+			}
+		}
+		return false
+	}
+	msg = backtickRe.ReplaceAllStringFunc(msg, func(q string) string {
+		if leaks(strings.TrimSuffix(inner(q), "...")) {
+			return "`[redacted]`"
+		}
+		return q
+	})
+	msg = dquoteRe.ReplaceAllStringFunc(msg, func(q string) string {
+		content := inner(q)
+		if u, err := strconv.Unquote(q); err == nil {
+			content += "\x00" + u
+		}
+		if leaks(content) {
+			return `"[redacted]"`
+		}
+		return q
+	})
+	return errors.New(msg)
 }
 
 // resolveScalar returns !!bool, !!int or !!float if s on its own is exactly

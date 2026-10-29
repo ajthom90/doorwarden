@@ -40,6 +40,10 @@ var (
 	copyFileFn  = copyFile
 	sleepFn     = time.Sleep
 	maxAttempts = 3
+	// maxFileBytes bounds each copied file and maxSnapshotBytes the three
+	// together (NPM databases are a few MB; this only stops a runaway copy).
+	maxFileBytes     int64 = 1 << 30
+	maxSnapshotBytes int64 = 2 << 30
 )
 
 // TempPrefix is the name prefix of the temporary snapshot directory. The copy
@@ -147,11 +151,12 @@ func openSnapshot(ctx context.Context, path string) (*Reader, error) {
 		dst := filepath.Join(dir, "database.sqlite")
 		beforeDB, beforeWAL := sigOf(path), sigOf(path+"-wal")
 		var cerr error
+		budget := maxSnapshotBytes
 		for _, suf := range []string{"", "-wal", "-shm"} {
 			if cerr = ctx.Err(); cerr != nil {
 				break
 			}
-			if cerr = copyFileFn(path+suf, dst+suf, suf != ""); cerr != nil {
+			if cerr = copyFileFn(ctx, path+suf, dst+suf, suf != "", &budget); cerr != nil {
 				break
 			}
 		}
@@ -195,24 +200,69 @@ func checkInPlace(path string) error {
 	return nil
 }
 
-func copyFile(src, dst string, optional bool) error {
-	in, err := os.Open(src)
+// copyFile copies src to a new dst (0600). src must be a regular file (a
+// symlink, FIFO, device or directory is refused, checked with Lstat and
+// again on the opened descriptor, which is opened non-blocking and without
+// following a symlink); it may not exceed maxFileBytes nor the remaining
+// *budget (decremented by what was copied). The copy stops when ctx is
+// cancelled. A missing optional file is not an error.
+func copyFile(ctx context.Context, src, dst string, optional bool, budget *int64) error {
+	li, err := os.Lstat(src)
 	if err != nil {
 		if optional && errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return err
 	}
+	if !li.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (%s); refusing to copy it", filepath.Base(src), li.Mode().Type())
+	}
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
 	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() || !os.SameFile(li, fi) {
+		return fmt.Errorf("%s changed to a non-regular file while opening it; refusing to copy it", filepath.Base(src))
+	}
+	limit := maxFileBytes
+	if *budget < limit {
+		limit = *budget
+	}
+	if fi.Size() > limit {
+		return fmt.Errorf("%s is %d bytes; the snapshot limit is %d", filepath.Base(src), fi.Size(), limit)
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	n, err := io.Copy(out, io.LimitReader(ctxReader{ctx, in}, limit+1))
+	*budget -= n
+	if err == nil && n > limit {
+		err = fmt.Errorf("%s grew past the snapshot limit of %d bytes while copying", filepath.Base(src), limit)
+	}
+	if err != nil {
 		out.Close()
 		return err
 	}
 	return out.Close()
+}
+
+// ctxReader stops reading once ctx is done.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // Close releases the database and removes any temp copy.
