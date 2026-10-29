@@ -515,12 +515,14 @@ func validUsername(u string) bool {
 	return true
 }
 
-// limitUser is the limiter's name for a submitted user name.
-func limitUser(name string) string {
-	if name == "" {
-		name = "\x00empty" // "" is the setup scope
+// limitUser is the limiter's bucket for a submitted user name: the
+// administrator's own name, or the one shared unknownUser bucket for any
+// other (so spraying names cannot grow the limiter's tables).
+func limitUser(name string, adm store.Admin, exists bool) string {
+	if exists && validUsername(name) && strings.EqualFold(name, adm.Username) {
+		return strings.ToLower(adm.Username)
 	}
-	return strings.ToLower(truncate(name, maxUsernameLen))
+	return unknownUser
 }
 
 func passwordProblem(pw string) string {
@@ -548,7 +550,7 @@ func writeThrottled(w http.ResponseWriter, retry time.Duration) {
 // address and waits out any delay; on refusal it answers 429 and returns
 // nil.
 func (a *auth) beginAttempt(w http.ResponseWriter, r *http.Request, user string) *attempt {
-	at, err := a.lim.begin(user, a.clientIP(r).String())
+	at, err := a.lim.begin(user, a.clientIP(r))
 	if err != nil {
 		writeThrottled(w, err.(throttledError).retry)
 		return nil
@@ -665,7 +667,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if exists {
 		a.lim.observeGeneration(adm.Generation) // unlock/reset clears limits
 	}
-	at := a.beginAttempt(w, r, limitUser(req.Username))
+	at := a.beginAttempt(w, r, limitUser(req.Username, adm, exists))
 	if at == nil {
 		return
 	}
@@ -751,7 +753,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.lim.observeGeneration(adm.Generation)
-	at := a.beginAttempt(w, r, limitUser(p.User))
+	at := a.beginAttempt(w, r, limitUser(p.User, adm, true))
 	if at == nil {
 		return
 	}

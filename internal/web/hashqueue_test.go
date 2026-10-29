@@ -128,27 +128,27 @@ func TestLoginBurstBounded(t *testing.T) {
 			mu.Lock()
 			codes[w.Code]++
 			mu.Unlock()
-			if w.Code == http.StatusServiceUnavailable && w.Header().Get("Retry-After") == "" {
-				t.Error("503 without Retry-After")
+			if (w.Code == http.StatusServiceUnavailable || w.Code == http.StatusTooManyRequests) && w.Header().Get("Retry-After") == "" {
+				t.Error("refusal without Retry-After")
 			}
 		}()
 	}
+	// Two run, maxHashWaiters queue; the rest are refused at once: 503
+	// (queue full) or 429 (the user's bucket ran dry; no attempt ever runs
+	// uncharged).
 	h := e.srv.auth.hasher
 	deadline := time.Now().Add(10 * time.Second)
-	for {
+	refused := func() int {
 		mu.Lock()
-		n := codes[http.StatusServiceUnavailable]
-		mu.Unlock()
-		if n >= 200-2-maxHashWaiters || time.Now().After(deadline) {
-			break
-		}
+		defer mu.Unlock()
+		return codes[http.StatusServiceUnavailable] + codes[http.StatusTooManyRequests]
+	}
+	for refused() < 200-2-maxHashWaiters && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	mu.Lock()
-	n503 := codes[http.StatusServiceUnavailable]
-	mu.Unlock()
-	if n503 != 200-2-maxHashWaiters {
-		t.Fatalf("503s = %d, want %d (codes %v)", n503, 200-2-maxHashWaiters, codes)
+	if n := refused(); n != 200-2-maxHashWaiters {
+		mu.Lock()
+		t.Fatalf("refused = %d, want %d (codes %v)", n, 200-2-maxHashWaiters, codes)
 	}
 	if running.Load() != 2 || h.waiting.Load() != maxHashWaiters {
 		t.Fatalf("running=%d waiting=%d", running.Load(), h.waiting.Load())
