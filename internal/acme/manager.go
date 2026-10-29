@@ -671,7 +671,14 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 			}
 		}
 		defer release()
-		defer m.clearInFlight(id)
+		cleared := false
+		clearFlight := func() {
+			if !cleared {
+				cleared = true
+				m.clearInFlight(id)
+			}
+		}
+		defer clearFlight()
 		var r Result
 		var ev *Event
 		func() {
@@ -711,6 +718,9 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 		}()
 		// Notifications go out only after the process-wide slot is free.
 		release()
+		// Free the certificate before the caller can see the result, or a
+		// prompt follow-up Issue would find its own finished order in flight.
+		clearFlight()
 		m.notify(bg, ev)
 		done <- r
 	}()
