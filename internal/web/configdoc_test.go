@@ -309,3 +309,37 @@ func TestEnvRefCannotReachPlainFields(t *testing.T) {
 		}
 	}
 }
+
+// Fix round 3: a ${VAR} in a secret field is bound to its entry's
+// destination like a masked secret. A new or changed reference needs an
+// existing entry with an unchanged destination; DOORWARDEN_* variables are
+// never accepted from the editor; unchanged stored references keep
+// working.
+func TestMergeEnvRefDestinationBinding(t *testing.T) {
+	old := "notifications:\n  webhooks:\n    - name: ops\n      url: https://hook.example.test/a\n      secret: \"${HOOK_SECRET}\"\n" +
+		"providers:\n  cf:\n    type: cloudflare\n    api_token: \"${CF_TOKEN}\"\n  pd:\n    type: powerdns\n    url: https://dns.example.test\n    api_key: x\n"
+	cases := []struct {
+		name, doc, wantErr string
+	}{
+		{"master key", strings.Replace(old, "api_token: \"${CF_TOKEN}\"", "api_token: \"${DOORWARDEN_MASTER_KEY}\"", 1), "DOORWARDEN_"},
+		{"other reserved", strings.Replace(old, "api_key: x", "api_key: \"${DOORWARDEN_SETUP_TOKEN}\"", 1), "DOORWARDEN_"},
+		{"new ref, changed url", strings.Replace(strings.Replace(old, "api_key: x", "api_key: \"${CLOUDFLARE_TOKEN}\"", 1), "https://dns.example.test", "https://evil.example.test", 1), "destination"},
+		{"stored ref, changed url", strings.Replace(old, "https://hook.example.test/a", "https://evil.example.test/a", 1), "destination"},
+		{"new entry with ref", old + "  pd2:\n    type: powerdns\n    url: https://dns2.example.test\n    api_key: \"${CLOUDFLARE_TOKEN}\"\n", "destination"},
+		{"new list entry with ref", strings.Replace(old, "providers:", "    - name: new\n      url: https://hook2.example.test\n      secret: \"${HOOK_SECRET}\"\nproviders:", 1), "destination"},
+		{"new ref, same destination", strings.Replace(old, "api_key: x", "api_key: \"${CLOUDFLARE_TOKEN}\"", 1), ""},
+		{"unchanged refs", old, ""},
+		{"unchanged refs, other edit", old + "settings:\n  default_zone: example.test\n", ""},
+	}
+	for _, c := range cases {
+		_, err := MergeMasked([]byte(c.doc), []byte(old))
+		switch {
+		case c.wantErr == "" && err != nil:
+			t.Errorf("%s: %v", c.name, err)
+		case c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)):
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.wantErr)
+		case err != nil && (strings.Contains(err.Error(), "evil") || strings.Contains(err.Error(), "MASTER")):
+			t.Errorf("%s: error echoes a value: %v", c.name, err)
+		}
+	}
+}
