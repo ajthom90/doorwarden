@@ -1,11 +1,16 @@
 package config
 
 import (
+	"net/url"
+	"strconv"
+
 	"fmt"
 	"net"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ajthom90/doorwarden/internal/model"
 )
 
 // ACME tunes the certificate manager (internal/acme). Zero values mean the
@@ -18,6 +23,11 @@ type ACME struct {
 	// Unset disables HTTP-01. Traefik must forward
 	// /.well-known/acme-challenge/ on port 80 to this address.
 	HTTP01Listen string `yaml:"http01_listen"`
+	// HTTP01Backend is the URL Traefik uses to reach the HTTP-01 challenge
+	// server on HTTP01Listen (scheme://host[:port], default
+	// http://doorwarden:<port of http01_listen>). Doorwarden renders a
+	// challenge router to it (internal/traefik, ChallengeFile).
+	HTTP01Backend string `yaml:"http01_backend"`
 	// DNSPropagationTimeout bounds the wait for a DNS-01 TXT record to
 	// propagate (default: the challenge provider's own timeout).
 	DNSPropagationTimeout time.Duration `yaml:"dns_propagation_timeout"`
@@ -48,6 +58,14 @@ func (c *Config) validateACME() []error {
 	if a.HTTP01Listen != "" {
 		if _, port, err := net.SplitHostPort(a.HTTP01Listen); err != nil || port == "" {
 			add("acme.http01_listen %q must be host:port", a.HTTP01Listen)
+		}
+	}
+	if b := a.HTTP01Backend; b != "" {
+		if a.HTTP01Listen == "" {
+			add("acme.http01_backend requires acme.http01_listen")
+		}
+		if msg := backendURLProblem(b); msg != "" {
+			add("acme.http01_backend %q %s", b, msg)
 		}
 	}
 	for _, r := range a.Resolvers {
@@ -83,4 +101,28 @@ func (c *Config) validateACME() []error {
 		}
 	}
 	return errs
+}
+
+// backendURLProblem checks a scheme://host[:port] URL (http or https, no
+// userinfo, path, query or fragment). It returns "" when it is usable.
+func backendURLProblem(raw string) string {
+	u, err := url.Parse(raw)
+	switch {
+	case err != nil || strings.ContainsAny(raw, " \t\r\n"):
+		return "is not a valid URL"
+	case u.Scheme != "http" && u.Scheme != "https":
+		return "must be http:// or https://"
+	case u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(raw, "#"):
+		return "must be scheme://host[:port] without userinfo, path, query or fragment"
+	case u.Hostname() == "":
+		return "has no host"
+	case !model.ValidHost(u.Hostname()) && !model.ValidHost("["+u.Hostname()+"]"):
+		return "has an invalid host"
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return "port " + p + " out of range 1..65535"
+		}
+	}
+	return ""
 }

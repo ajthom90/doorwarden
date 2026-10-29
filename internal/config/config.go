@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -58,6 +59,10 @@ type Traefik struct {
 	DynamicDir string `yaml:"dynamic_dir"`
 	// EntryPoint every router listens on (default websecure).
 	EntryPoint string `yaml:"entry_point"`
+	// HTTPEntryPoint is the plain-HTTP entry point (port 80) the HTTP-01
+	// challenge router listens on (default web). Only used when an http-01
+	// certificate is wanted (see acme.http01_backend).
+	HTTPEntryPoint string `yaml:"http_entry_point"`
 	// CertPathPrefix is where Traefik sees doorwarden's certificate
 	// directory (default /certs).
 	CertPathPrefix string `yaml:"cert_path_prefix"`
@@ -219,6 +224,14 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Traefik.EntryPoint == "" {
 		c.Traefik.EntryPoint = "websecure"
+	}
+	if c.Traefik.HTTPEntryPoint == "" {
+		c.Traefik.HTTPEntryPoint = "web"
+	}
+	if c.ACME.HTTP01Backend == "" && c.ACME.HTTP01Listen != "" {
+		if _, port, err := net.SplitHostPort(c.ACME.HTTP01Listen); err == nil && port != "" {
+			c.ACME.HTTP01Backend = "http://doorwarden:" + port
+		}
 	}
 	if c.Traefik.CertPathPrefix == "" {
 		c.Traefik.CertPathPrefix = "/certs"
