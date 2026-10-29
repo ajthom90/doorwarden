@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -73,5 +74,58 @@ func TestHTTPEntryPointValidation(t *testing.T) {
 	errs = mustLoad(t, http01Base+"acme: {http01_listen: ':8089'}\ntraefik: {http_entry_point: websecure}\n").Validate(caps(true))
 	if !hasErr(errs, "traefik.http_entry_point must differ from traefik.entry_point") {
 		t.Fatalf("errs = %v", errs)
+	}
+}
+
+// Regression: entry_point web without http-01 must keep loading; the
+// entry-point check applies only when the challenge route is rendered.
+func TestHTTPEntryPointCheckOnlyWithHTTP01(t *testing.T) {
+	for _, y := range []string{
+		base + "traefik: {entry_point: web}\n",
+		base + "traefik: {entry_point: web}\nacme: {http01_listen: ':8089'}\n",
+	} {
+		if errs := mustLoad(t, y).Validate(caps(true)); len(errs) != 0 {
+			t.Fatalf("%s: errs = %v", y, errs)
+		}
+	}
+	errs := mustLoad(t, http01Base+"acme: {http01_listen: ':8089'}\ntraefik: {entry_point: web}\n").Validate(caps(true))
+	if !hasErr(errs, "traefik.http_entry_point must differ from traefik.entry_point (\"web\")") || !hasErr(errs, "http-01") {
+		t.Fatalf("errs = %v", errs)
+	}
+	c := mustLoad(t, http01Base+"acme: {http01_listen: ':8089'}\n")
+	if !c.UsesHTTP01() || mustLoad(t, base+"acme: {http01_listen: ':8089'}\n").UsesHTTP01() {
+		t.Fatal("UsesHTTP01")
+	}
+}
+
+func TestHTTP01Warnings(t *testing.T) {
+	has := func(ws []string, s string) bool {
+		for _, w := range ws {
+			if strings.Contains(w, s) {
+				return true
+			}
+		}
+		return false
+	}
+	// No http-01: nothing.
+	if ws := mustLoad(t, base+"acme: {http01_listen: '127.0.0.1:8089'}\n").HTTP01Warnings(); len(ws) != 0 {
+		t.Fatalf("%v", ws)
+	}
+	// Default backend: the route is now rendered; the redirect priority.
+	ws := mustLoad(t, http01Base+"acme: {http01_listen: ':8089'}\n").HTTP01Warnings()
+	if len(ws) != 2 || !has(ws, "acme.http01_backend") || !has(ws, "priority: 1") || has(ws, "loopback") {
+		t.Fatalf("%v", ws)
+	}
+	// Loopback listen with the default backend: unreachable.
+	for _, l := range []string{"127.0.0.1:8089", "[::1]:8089", "localhost:8089"} {
+		ws = mustLoad(t, http01Base+"acme: {http01_listen: '"+l+"'}\n").HTTP01Warnings()
+		if !has(ws, "loopback") {
+			t.Fatalf("%s: %v", l, ws)
+		}
+	}
+	// Explicit backend: only the priority reminder (even if loopback).
+	ws = mustLoad(t, http01Base+"acme: {http01_listen: '127.0.0.1:8089', http01_backend: 'http://127.0.0.1:8089'}\n").HTTP01Warnings()
+	if len(ws) != 1 || !has(ws, "priority: 1") {
+		t.Fatalf("%v", ws)
 	}
 }

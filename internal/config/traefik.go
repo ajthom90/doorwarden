@@ -37,8 +37,10 @@ func (c *Config) validateTraefik() []error {
 	}
 	if ep := t.HTTPEntryPoint; ep != "" && !validEntryPoint(ep) {
 		add("traefik.http_entry_point %q must be [A-Za-z0-9_-]+", ep)
-	} else if ep != "" && ep == t.EntryPoint {
-		add("traefik.http_entry_point must differ from traefik.entry_point (%q): the challenge router serves plain HTTP on port 80", ep)
+	} else if ep != "" && ep == t.EntryPoint && c.UsesHTTP01() {
+		// Only when the challenge route is rendered: a config with
+		// entry_point web and no http-01 zone stays valid.
+		add("traefik.http_entry_point must differ from traefik.entry_point (%q): a zone uses certificate.challenge http-01, whose challenge router needs Traefik's plain-HTTP entry point (port 80); set traefik.http_entry_point to it", ep)
 	}
 	for _, e := range t.ExternalMiddlewares {
 		if err := model.ValidateExternalMiddleware(e); err != nil {
