@@ -42,8 +42,11 @@
 // but marks it quarantined (the renderer skips it), together with an
 // Invalid ("backend changed; re-approve to resume") carrying
 // AlertQuarantined; later cycles repeat the Invalid without the alert. It
-// claims its hostname as an incumbent, so a same-rank squatter gets only a
-// Conflict, and being present its DNS records and certificates are kept.
+// claims, as an incumbent, only the hostname of its persisted route (the one
+// it was approved and served under), so a same-rank squatter there gets only
+// a Conflict; a hostname its unapproved labels declare is never claimed, and
+// a quarantined service without a route claims nothing. Being present, its
+// DNS records and certificates are kept.
 // Re-approval makes it Published: its RouteWrite clears the mark.
 //
 // Middlewares fail closed: a service with an undefined middleware is Invalid

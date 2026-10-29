@@ -138,10 +138,14 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 		if e.heldInvalid {
 			// not routable, so never serving and never able to evict anyone
 			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true, incumbent: inc})
-		} else if p.quarantined(e) && e.err == nil {
-			// not served, but its hostname stays reserved: an incumbent
-			// whether or not its route still exists
-			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, incumbent: true})
+		} else if p.quarantined(e) {
+			// Not served. It reserves, as an incumbent, only the hostname it
+			// was approved and served under (its persisted route; claimKnown
+			// set e.host to it), never one its unapproved labels declare: a
+			// never-served or renamed quarantined service claims nothing new.
+			if e.err == nil && inc {
+				claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, incumbent: true})
+			}
 		} else if e.err == nil {
 			pubd := e.svc.State == model.StatePublished
 			_, routable := p.routeBackend(e.svc)

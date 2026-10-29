@@ -101,3 +101,73 @@ func TestPendingWithoutQuarantineKeepsRoute(t *testing.T) {
 	assertNone(t, acts, RouteRemove)
 	assertNone(t, acts, Invalid)
 }
+
+// A quarantined service reserves only the hostname it was approved and
+// served under (its persisted route), never the one its unapproved labels
+// now declare: approved A at a.example.test changes its label to
+// b.example.test, which C holds; C keeps b, A keeps a reserved but is not
+// served, and a fresh D later claims b without A blocking it.
+func TestQuarantineReservesOnlyApprovedHostname(t *testing.T) {
+	e := newE2E(t)
+	a := pub("docker:a", "a", "example.test", 8080)
+	c := pub("docker:c", "b", "example.test", 8081)
+	e.cycle([]model.Service{a, c})
+	e.mustRoute("docker:a")
+	e.mustRoute("docker:c")
+
+	renamed := a
+	renamed.State = model.StatePending
+	renamed.Name = "b" // doorwarden.name=b, not approved
+	e.quarantined = map[string]bool{"docker:a": true}
+	e.now = t0.Add(time.Hour)
+	acts := e.cycle([]model.Service{renamed, c})
+	if len(ofKind(forKey(acts, "docker:c"), Conflict)) != 0 || len(ofKind(forKey(acts, "docker:c"), RouteRemove)) != 0 {
+		t.Fatalf("C lost b.example.test to an unapproved rename: %v", sums(acts))
+	}
+	if r := e.mustRoute("docker:c"); r.Hostname != "b.example.test" || r.Quarantined {
+		t.Fatalf("C route %+v", r)
+	}
+	if r, ok := e.route("docker:a"); !ok || !r.Quarantined || r.Hostname != "a.example.test" {
+		t.Fatalf("A route not kept quarantined at a.example.test: %+v %v", r, ok)
+	}
+	if len(ofKind(forKey(acts, "docker:a"), RouteWrite)) != 0 {
+		t.Fatalf("A served: %v", sums(acts))
+	}
+
+	// a squatter at A's approved name is still blocked
+	sq := pub("docker:0sq", "a", "example.test", 9000)
+	e.now = t0.Add(2 * time.Hour)
+	acts = e.cycle([]model.Service{renamed, c, sq})
+	if cf := ofKind(forKey(acts, "docker:0sq"), Conflict); len(cf) != 1 || !strings.Contains(cf[0].Reason, "docker:a") {
+		t.Fatalf("squatter at a.example.test not blocked by A: %v", sums(acts))
+	}
+
+	// C leaves; once its route is gone, fresh D claims b without A blocking it
+	d := pub("docker:d", "b", "example.test", 8082)
+	e.now = t0.Add(3 * time.Hour)
+	e.cycle([]model.Service{renamed})
+	e.now = t0.Add(30 * 24 * time.Hour)
+	e.cycle([]model.Service{renamed})
+	if _, ok := e.route("docker:c"); ok {
+		t.Fatal("C route not removed after grace")
+	}
+	e.now = e.now.Add(time.Hour)
+	acts = e.cycle([]model.Service{renamed, d})
+	if rw := ofKind(forKey(acts, "docker:d"), RouteWrite); len(rw) != 1 {
+		t.Fatalf("D not routed at b.example.test: %v", sums(acts))
+	}
+}
+
+// A quarantined service that was never served (no persisted route) makes
+// no hostname claim at all.
+func TestQuarantineWithoutRouteClaimsNothing(t *testing.T) {
+	cfg := cfgOf(zone("example.test", "off", "wildcard"))
+	q := svc("docker:a", "d", "example.test", model.StatePending, "198.51.100.5", 8099)
+	d := svc("docker:d", "d", "example.test", model.StatePublished, "198.51.100.6", 8080)
+	obs := Observed{Quarantined: map[string]bool{"docker:a": true}}
+	acts := Plan([]model.Service{q, d}, obs, cfg, t0)
+	if len(ofKind(forKey(acts, "docker:d"), RouteWrite)) != 1 {
+		t.Fatalf("D blocked by an unserved quarantined service: %v", sums(acts))
+	}
+	assertNone(t, forKey(acts, "docker:a"), Conflict, RouteRemove, RouteWrite)
+}
