@@ -88,6 +88,7 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 
 	acts, applyErr := a.runner.Reconcile(ctx, desired, obs, now)
 	res.Actions = acts
+	a.setPlan(acts, dry, now)
 	if applyErr != nil {
 		errs = append(errs, applyErr)
 		a.logChange(ctx, "apply", "warn", fmt.Sprintf("reconcile apply had errors: %v", applyErr))
@@ -115,6 +116,7 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 		result = "dry_run"
 	}
 	a.finishCycle(start, dry, up, desired, result, res.Err)
+	a.emit("cycle", map[string]any{"result": result, "dry_run": dry, "actions": len(acts)})
 	return res
 }
 
@@ -141,14 +143,29 @@ func (a *App) finishCycle(start time.Time, dry bool, up map[string]bool, desired
 func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.Service, map[string]bool) {
 	up := map[string]bool{}
 	var desired []model.Service
+	var listing []listed
+	down := map[string]bool{}
 	mark := func(name string) {
 		unavailable[name] = true
 		for alias := range a.aliases[name] {
 			unavailable[alias] = true
 		}
 		up[name] = false
+		down[name] = true
 		a.met.SourceUp(name, false)
 	}
+	defer func() { a.publishListing(listing, down) }()
+	ovs, bad, err := a.loadOverrides(ctx)
+	if err != nil {
+		// Without the UI overrides a service could be published that the
+		// operator unpublished: every source is unknown this cycle.
+		a.logChange(ctx, "overrides", "error", fmt.Sprintf("UI overrides could not be read; every source is treated as unknown: %v", err))
+		for _, sp := range a.sources {
+			mark(sp.name())
+		}
+		return desired, up
+	}
+	a.logChange(ctx, "overrides", "error", "")
 	for _, sp := range a.sources {
 		name := sp.name()
 		if sp.Source == nil {
@@ -177,6 +194,7 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 			a.logChange(ctx, "warnings/"+name, "warn", msg)
 		}
 		svcs = a.dedupe(ctx, name, svcs)
+		svcs, ls := a.applyOverrides(ctx, name, svcs, ovs, bad)
 		mode := sp.Mode
 		if mode == "" {
 			mode = approval.ModeAuto
@@ -195,6 +213,10 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		for _, s := range svcs {
 			a.alias(name, s.Source)
 		}
+		for i := range ls {
+			ls[i].state = stateOf(res, ls[i].svc, mode)
+		}
+		listing = append(listing, ls...)
 		up[name] = true
 		a.met.SourceUp(name, true)
 		a.logChange(ctx, "source/"+name, "info", "")
@@ -283,8 +305,17 @@ func (a *App) observe(ctx context.Context, now time.Time, unavailable map[string
 // of every Alert (and of hostname/DNS conflicts), deduplicated by key.
 func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 	n := map[reconcile.ActionKind]int{}
+	var skipped map[string]bool
 	for _, x := range acts {
 		n[x.Kind]++
+		if id := web.ConflictID(x); id != "" && x.Alert == "" {
+			if skipped == nil {
+				skipped = a.skippedConflicts(ctx)
+			}
+			if skipped[id] {
+				continue // the operator chose to ignore this DNS conflict
+			}
+		}
 		switch {
 		case x.Alert != "":
 			a.notify(ctx, notify.Event{Kind: "dns.alert", Severity: notify.Critical,
