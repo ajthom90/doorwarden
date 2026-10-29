@@ -243,19 +243,19 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 		runErr = err
 	}
 	log.Info("doorwarden shutting down")
-	// Shutdown order: the loop is stopped; stop HTTP, then cancel the API's
-	// async jobs (api.Close waits for them), then Close drains background
-	// ACME orders (bounded) and closes the sources and the notifier; the
-	// deferred st.Close runs last.
+	// Shutdown order: the loop is stopped; end the UI event streams and stop
+	// HTTP (connections still open after 10s are force-closed), then cancel
+	// the API's async jobs and wait for them (api.Shutdown does all three),
+	// then Close drains background ACME orders (bounded) and closes the
+	// sources and the notifier; the deferred st.Close runs last.
 	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second+DefaultDrainTimeout)
 	defer cancel()
 	if srv != nil {
 		hctx, hcancel := context.WithTimeout(sctx, 10*time.Second)
-		_ = srv.Shutdown(hctx)
+		if err := api.Shutdown(hctx, srv); err != nil {
+			log.Warn("http shutdown: open connections were force-closed", "error", err)
+		}
 		hcancel()
-	}
-	if api != nil {
-		api.Close()
 	}
 	if err := a.Close(sctx); err != nil {
 		log.Warn("shutdown", "error", err)

@@ -193,6 +193,7 @@ type Server struct {
 	mu       sync.Mutex
 	lastTest map[string]time.Time
 	inflight map[string]bool
+	closing  bool // set under mu by Close; runAsync refuses new jobs
 	configMu sync.Mutex
 }
 
@@ -277,10 +278,29 @@ func (s *Server) Events() *Broker { return s.events }
 // Close stops background work (renewals) and waits for it.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		// The flag is set under the mutex runAsync holds for wg.Add, so no
+		// Add can follow the Wait below.
+		s.mu.Lock()
+		s.closing = true
+		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
 		s.events.Close()
 	})
+}
+
+// Shutdown stops hs and then the API. The event streams end first, so
+// open UI tabs do not hold the graceful stop for its whole timeout; when
+// ctx ends with connections still open they are force-closed. Close then
+// cancels and waits for the async jobs.
+func (s *Server) Shutdown(ctx context.Context, hs *http.Server) error {
+	s.events.Close()
+	err := hs.Shutdown(ctx)
+	if err != nil {
+		_ = hs.Close()
+	}
+	s.Close()
+	return err
 }
 
 // ---- middleware and helpers
@@ -942,17 +962,27 @@ func (s *Server) handleCerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"certs": out})
 }
 
+var (
+	errAlreadyRunning = errors.New("already running")
+	errClosing        = errors.New("shutting down")
+)
+
 // runAsync runs f in the background under key (one at a time per key),
-// recording the outcome in the activity log.
-func (s *Server) runAsync(key, actor, what string, f func(context.Context) error) bool {
+// recording the outcome in the activity log. It returns errAlreadyRunning
+// when a job under key runs, and errClosing once Close has begun.
+func (s *Server) runAsync(key, actor, what string, f func(context.Context) error) error {
 	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return errClosing
+	}
 	if s.inflight[key] {
 		s.mu.Unlock()
-		return false
+		return errAlreadyRunning
 	}
 	s.inflight[key] = true
-	s.mu.Unlock()
 	s.wg.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer s.wg.Done()
 		defer func() {
@@ -971,7 +1001,16 @@ func (s *Server) runAsync(key, actor, what string, f func(context.Context) error
 		s.auditAs(context.Background(), actor, msg)
 		s.ctl.Trigger()
 	}()
-	return true
+	return nil
+}
+
+// asyncRefused writes the refusal for a runAsync error.
+func asyncRefused(w http.ResponseWriter, err error, running string) {
+	if errors.Is(err, errClosing) {
+		writeErr(w, http.StatusServiceUnavailable, "doorwarden is shutting down")
+		return
+	}
+	writeErr(w, http.StatusConflict, running)
 }
 
 func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
@@ -1000,8 +1039,8 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := principalFrom(r.Context()).Actor()
-	if !s.runAsync("cert/"+id, actor, "renewal of certificate "+id, func(ctx context.Context) error { return s.ctl.RenewCert(ctx, id) }) {
-		writeErr(w, http.StatusConflict, "a renewal of this certificate is already running")
+	if err := s.runAsync("cert/"+id, actor, "renewal of certificate "+id, func(ctx context.Context) error { return s.ctl.RenewCert(ctx, id) }); err != nil {
+		asyncRefused(w, err, "a renewal of this certificate is already running")
 		return
 	}
 	s.audit(r, "requested renewal of certificate "+id)
@@ -1032,10 +1071,10 @@ func (s *Server) handleSwitchProduction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	actor := principalFrom(r.Context()).Actor()
-	if !s.runAsync("issuer/"+req.Issuer, actor, "switch of issuer "+req.Issuer+" to production", func(ctx context.Context) error {
+	if err := s.runAsync("issuer/"+req.Issuer, actor, "switch of issuer "+req.Issuer+" to production", func(ctx context.Context) error {
 		return s.ctl.SwitchProduction(ctx, req.Issuer)
-	}) {
-		writeErr(w, http.StatusConflict, "a switch of this issuer is already running")
+	}); err != nil {
+		asyncRefused(w, err, "a switch of this issuer is already running")
 		return
 	}
 	s.audit(r, "requested the switch of issuer "+req.Issuer+" to production")
