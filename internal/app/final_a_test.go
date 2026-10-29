@@ -282,3 +282,43 @@ func TestZoneTargetsForSources(t *testing.T) {
 		t.Fatalf("zoneTargets = %v", got)
 	}
 }
+
+// When the approval gate cannot resolve a source's services (approvals
+// unreadable; here an invalid mode makes Resolve fail), the source is
+// treated as unavailable: its published services are never scheduled for
+// removal and their routes stay.
+func TestGateResolveErrorMarksSourceUnavailable(t *testing.T) {
+	e := newEnv(t, testYAML)
+	s := svc("docker", "app")
+	e.src.set(nil, s)
+	a := e.app()
+	ctx := context.Background()
+	a.RunOnce(ctx)
+	if got := info(t, a, s.Key); got.State != model.StatePublished {
+		t.Fatalf("not published: %+v", got)
+	}
+	for i := range a.sources {
+		if a.sources[i].Source == e.src {
+			a.sources[i].Mode = "bogus"
+		}
+	}
+	for i := 0; i < 2; i++ {
+		res := a.RunOnce(ctx)
+		for _, x := range res.Actions {
+			if x.Kind == reconcile.ScheduleRemoval || x.Kind == reconcile.RouteRemove {
+				t.Fatalf("cycle %d: %s for %s after a gate error", i, x.Kind, x.Key)
+			}
+		}
+	}
+	if routes, _ := e.st.ListRoutes(ctx); len(routes) != 1 || routes[0].Key != s.Key || routes[0].RemovedAfter != nil {
+		t.Fatalf("routes = %+v", routes)
+	}
+	act, _ := e.st.ListActivity(ctx, 100)
+	found := false
+	for _, x := range act {
+		found = found || strings.Contains(x.Message, "approvals could not be loaded")
+	}
+	if !found {
+		t.Fatalf("no activity about the gate error: %+v", act)
+	}
+}

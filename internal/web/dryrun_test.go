@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -79,4 +80,42 @@ func TestServerCloseWaitsForAsyncJobs(t *testing.T) {
 		t.Fatal("Close did not return")
 	}
 	e.srv.Close()
+}
+
+// A session stream is re-validated at every heartbeat (stillValid's session
+// branch): it stays open while the session is valid and ends once the
+// session has been idle longer than the idle timeout, without a logout.
+func TestEventsSessionStreamEndsWhenSessionExpires(t *testing.T) {
+	old := sseHeartbeat
+	sseHeartbeat = 20 * time.Millisecond
+	t.Cleanup(func() { sseHeartbeat = old })
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	r := httptest.NewRequest("GET", "http://dw.example.test/api/v1/events", nil)
+	r.AddCookie(c.cookie)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.h.ServeHTTP(rec, r)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for e.srv.events.clientCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if e.srv.events.clientCount() == 0 {
+		t.Fatal("stream not opened")
+	}
+	time.Sleep(100 * time.Millisecond) // several heartbeats with a valid session
+	select {
+	case <-done:
+		t.Fatal("session stream ended early")
+	default:
+	}
+	e.advance(e.srv.auth.cfg.SessionIdle + time.Minute)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session stream outlived its idle timeout")
+	}
 }
