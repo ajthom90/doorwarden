@@ -194,7 +194,8 @@
 // (routes and certs proceed). An owned row for the same (provider, zone, name,
 // type) with an equal value means nothing to do (unless the listing shows it
 // missing or changed: see Drift repair); with another value, DNSEnsure
-// carries the row's provider record ID (update). Otherwise a listed record
+// carries the row's provider record ID (update; capped like a repair when
+// the listing shows it missing: see Drift repair). Otherwise a listed record
 // with the same name and the same type, or a CNAME, that is not owned yields
 // Conflict ("foreign record exists") and no DNSEnsure, even if its value is
 // already right: the user must adopt it. A DNS conflict does not block the
@@ -396,8 +397,9 @@
 //     provider already lists the desired value (our own unconfirmed update);
 //     any other out-of-band value is a Skip.
 //   - missing: DNSEnsure{Repair: true} carrying the stored row's identity
-//     (Record.ID = its provider ID, its value, Owner = its owner), emitted
-//     every cycle while it stays missing. Wanted means: the owner is a
+//     (Record.ID = its provider ID, its value, Owner = its owner), planned
+//     every cycle while it stays missing, subject to the breaker and the cap
+//     below. Wanted means: the owner is a
 //     present, cleanly Published service from an available source and the
 //     row is its per-host record in a per-host zone (a hostname winner via
 //     ensureRecord, a loser via planOrphans), or the row is the "*.zone" row
@@ -410,6 +412,95 @@
 //     zones without a listing. A scheduled wanted row is cancelled
 //     (DNSCancelRemoval runs first) and repaired in the same plan.
 //
+// Mass-repair breaker and cap, per provider/zone and cycle (planRepairs).
+// Counted are the wanted rows ELIGIBLE for repair: wanted as above, with
+// the zone listed and the owner's source available (the wildcard row counts
+// as one; orphans, protected owners and unavailable sources do not count).
+// Of them, M are wanted and N missing (a missing row a foreign record blocks
+// counts as missing; a drifted row counts as wanted, not missing). When
+// N > 3 AND 2N > M, a listing that succeeded but is (nearly) empty is far
+// more likely wrong (a wiped Pi-hole, a Route 53 zone pinned to the wrong
+// hosted zone, a misconfigured provider) than the records gone: ONE Skip
+// "most owned records missing at <provider>/<zone> (N of M); refusing mass
+// repair: check the provider and zone configuration. ..." with
+// Action.Alert = AlertDNSMassMissing (the caller notifies an operator) and
+// Key = RepairBreakerKey(provider, zone) ("repair-breaker:<provider>/<zone>",
+// never a service key) is emitted, and NO repair for that pair. The reason
+// also names the way out (below). It holds every cycle while the
+// condition holds and clears by itself: once most records are listed again
+// (restored by hand, or the configuration fixed) the remaining rows are
+// repaired as usual.
+//
+// Operator override: when the records really are gone (a reinstalled
+// Pi-hole, records deleted by hand) there is no configuration to fix. The
+// operator acknowledges it once per provider/zone: kv key
+// dns/repair-mass-ok/<provider>/<zone> (store.RepairMassOKKey, zone
+// normalized) holding the acknowledgement time in RFC3339
+// (store.AcknowledgeMassRepair; the API action POST /api/v1/dns/repair/ack
+// {provider, zone} that calls it lands in T20 and does not exist before
+// it; until then, and without the API, the kv row can be written with
+// sqlite3, as the Skip says). GatherObserved reads every acknowledgement
+// into Observed.RepairMassOK (keyed provider+"/"+zone, the zone normalized;
+// of several spellings of one pair's key a valid one wins, then the latest).
+// While the pair's acknowledgement is younger than RepairMassOKTTL (24h) and
+// not dated more than 5 minutes ahead, a tripped pair gets the CAPPED
+// repairs (same selection and cap as below; their Reason says "acknowledged
+// at <time>") instead of the Skip. Clearing: MultiExecutor calls
+// DNSExecutor.Finish (the Finisher hook) at the end of a non-dry Apply,
+// whether or not the plan had a DNS action. That is every non-dry cycle
+// only when Runner.Exec is the MultiExecutor holding the DNS executor, and
+// not when Apply returns early on ctx.Err(). For every stored
+// acknowledgement of a managed pair (all spellings of its key grouped) it
+// lists the zone once and classifies the pair's ownership rows not
+// scheduled for removal with classifyOwned, the helper GatherObservedAt
+// uses: missing only when nothing is listed at the row's name and type; a
+// record there with another value is drifted (wanted, not missing, as in
+// the plan). When breakerTrips (the plan's condition) no longer holds, it
+// deletes every spelling: the zone has recovered or never tripped, and a
+// later mass loss trips the breaker again rather than ride on an old
+// acknowledgement, even when every remaining missing row waits for its
+// backoff and nothing is planned. A failed listing keeps it. Finish counts
+// every row of the pair, including rows the plan leaves out (an unavailable
+// source's, owners no longer desired): missing ones among them can make
+// Finish keep an acknowledgement the plan no longer needs, until it expires
+// (RepairMassOKTTL, 24h); present ones can clear it while the plan would
+// still trip, which only brings the Skip back. Finish also runs the sweep
+// (first non-dry Apply, then hourly), which deletes acknowledgements that
+// are expired, dated ahead, unreadable, or name a provider/zone it does not
+// manage. A dry run never lists for or clears
+// one. Otherwise at most RepairCapPerZone (5) repairs are
+// emitted per pair, chosen among the DUE rows only: GatherObservedAt reads
+// the repair backoff (below) into Observed.RepairDue (OwnedRowKey -> due at
+// the plan's time; an absent row is due; a state the clock left more than
+// 1h ahead is due so the executor can clamp it). A row waiting for its
+// backoff is skipped silently, takes no slot, and still counts as wanted and
+// missing for the breaker. The due rows are sorted by (name, type, owner
+// key) and the 5 sent are a window starting at RepairRotation(pair, now, n)
+// (wrapping; 0 when all fit): a hash of the pair and the plan's minute, so
+// rows that keep failing without a backoff (repair-class re-creates have
+// none) cannot hold the cap, and no cycle interval locks the window onto
+// the same rows. The rest follow in later cycles. A wildcard zone has at
+// most one eligible row, so its breaker never trips.
+//
+// Repair-class updates (ownedUpdate): a wanted owned row (same owner) whose
+// desired value changed (a target_ip change) is updated, DNSEnsure with the
+// row's provider ID and no Repair flag. When the listing shows it PRESENT,
+// or the pair was not listed, that is an in-place change of a record we own
+// and the update is emitted uncapped (a legitimate migration touches every
+// record of the zone); the row counts as wanted, not missing. When a
+// successful listing shows it MISSING, the update would re-create the record
+// (UpdateRecord answers not-found, then the guarded create), so it is
+// repair-class: it counts as wanted and missing for the breaker, shares the
+// per-pair cap and selection with the same-value repairs, is held (no
+// update at all) while the breaker trips unless acknowledged, is a Conflict
+// when a foreign record holds the name, and is never planned while the
+// owner's source is unavailable. A drifted row is the drift Skip, as above.
+// Unlike a same-value repair, a repair-class update has NO per-row executor
+// backoff (no dns/repair/ state: it is a plain update whose not-found falls
+// back to the guarded create): a row whose re-create keeps failing is tried
+// again every cycle it is selected, bounded only by the per-pair cap of 5
+// and the rotation, which moves the window to other rows.
+//
 // The executor (DNSEnsure with Repair) does not stop at an up-to-date row:
 //  1. stale-plan check: the stored row must still exist with the action's
 //     owner, value and provider ID and no removal scheduled; otherwise
@@ -420,8 +511,12 @@
 //     of 1m << (n-1), capped at 1h. A state whose last attempt is more than
 //     2h old is ignored (a new incident starts at 1m). Without a state store
 //     the repair is refused (ErrDNSRefused): attempts are never unbounded;
-//  3. the zone is RE-LISTED (the batch cache is dropped): a failed listing
-//     counts an attempt and returns ErrListingUnavailable; our record present
+//  3. the zone is RE-LISTED once per batch and provider/zone, by the first
+//     repair of that pair (the batch cache is dropped then); later repairs
+//     of the pair use that listing, which the batch keeps current with its
+//     own creates and deletes, so N repairs cost one listing. A failed
+//     listing is cached for the batch too: it counts an attempt for every
+//     repair of the pair and returns ErrListingUnavailable; our record present
 //     (same name and type and our stored ID, or our value when the row has
 //     no ID) is a no-op that deletes the backoff state; any other record
 //     blocking the name (same type, even with an identical value, or a
@@ -430,17 +525,43 @@
 //     nothing) and the guarded create runs; the SAME row is refreshed
 //     (CreatedAt kept, new provider ID), with the usual rollback.
 //
-// Every attempt that reaches the listing counts, successful or not; only the
-// executor seeing our record present resets the state (plus the 2h
-// staleness). After a successful repair the plan no longer emits the repair,
-// so its state stays in kv until it goes stale (harmless: ignored after 2h;
-// a recurrence within 2h continues the backoff where it was).
+// Every attempt that reaches the listing counts. The state is deleted when
+// the executor sees our record present, after a CONFIRMED create (an
+// unconfirmed one keeps it, so a lagging listing stays bounded by the
+// backoff), when the row is deleted, and by a sweep at the first non-dry
+// Apply and then hourly that deletes dns/repair/ and dns/pending-update/
+// keys whose ownership row no longer exists (store.ListSettingsWithPrefix,
+// found by type assertion on the RepairStateStore). A state whose next_at
+// is more than 1h ahead (the clock went back) is clamped to now+1h and
+// persisted, so no repair is held longer than the cap. Trade-off: a record
+// that is created with confirmation and then vanishes again every cycle is
+// re-created once per cycle, without backoff (the cap and the breaker still
+// bound how many per zone).
 //
 // The unconfirmed-write contract feeds this: a create that answered
 // dns.ErrUnconfirmed with a usable record wrote its ownership row; if it
 // never landed the next listing shows the row missing and it is repaired;
 // if it landed but a lagging listing hides it, the repair's own listing (or
 // the provider's idempotent create) finds it and nothing is duplicated.
+//
+// Pending updates: an UpdateRecord answering dns.ErrUnconfirmed with a
+// usable record (same name, type and the target value or none; a record
+// with another value is ambiguous and nothing is recorded) keeps the row's
+// OLD value and takes the returned provider ID, and stores kv
+// dns/pending-update/<provider>/<zone>/<name>/<type> = {value (attempted),
+// old_id (the ID the update was sent to), new_id, at}. If the next update
+// by the row's (returned) ID answers dns.ErrNotFound, the update is retried
+// once under old_id (still ours by ID) before the guarded create, so an ID
+// the provider rotated for an update that never landed does not leave our
+// own old record refused as foreign every cycle. The key is dropped by the
+// next confirmed update or re-create of the row, by the row's deletion, by
+// the sweep, and ignored after 2h. Plan does not read it: a listed value
+// equal to the attempted value is already treated as ours when it is also
+// the current desired value (the update is repeated, idempotently); if the
+// desired value changes AGAIN before the attempted one is confirmed, the
+// listed attempted value is reported as changed out of band (the drift
+// Skip, never overwritten) until an operator resolves it. No provider in
+// this repository updates by ID and answers dns.ErrUnconfirmed today.
 //
 // # Execution
 //
@@ -453,10 +574,13 @@
 // its RouteRemove was applied (removal past grace, or a conflict loser);
 // pass Observed.Owned (with RemovedAfter) as EVERY ownership row in the
 // store, not only the configured provider/zone pairs, plus Foreign,
-// OwnedMissing and OwnedDrifted (GatherObserved does all of it:
-// DNSObservation.Fill); give the DNS executor a RepairStateStore (a
+// OwnedMissing, OwnedDrifted, RepairMassOK and RepairDue (GatherObservedAt
+// at the plan's time does all of it: DNSObservation.Fill; GatherObserved is
+// it at time.Now()); notify an operator for a Skip with
+// Action.Alert set; give the DNS executor a RepairStateStore (a
 // *store.Store as its Store is enough) or every repair is refused; register the DNS executor for every kind in DNSActionKinds
-// (RegisterDNSExecutor; it persists, reassigns and forgets ownership rows
+// (RegisterDNSExecutor, through a MultiExecutor so its Finish runs every
+// cycle; it persists, reassigns and forgets ownership rows
 // itself) and the route executor for RouteWrite, RouteRemove,
 // ScheduleRemoval and CancelRemoval (its store must implement
 // DeleteRouteIfDue); mark a source

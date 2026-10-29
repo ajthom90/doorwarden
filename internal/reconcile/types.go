@@ -99,6 +99,9 @@ type Action struct {
 	// and its own listing, never writes over a record it does not own, and
 	// bounds attempts with a backoff (see doc.go).
 	Repair bool
+	// Alert, on an informational action, names a condition an operator must
+	// act on (the caller notifies): AlertDNSMassMissing. Empty otherwise.
+	Alert string
 	// Names are the certificate names for CertEnsure; Issuer its issuer key.
 	Names  []string
 	Issuer string
@@ -162,6 +165,17 @@ type Observed struct {
 	// what is listed there (normalized). Informational: Plan reports it and
 	// never overwrites it.
 	OwnedDrifted map[string][]dns.Record
+	// RepairMassOK maps provider+"/"+zone (normalized) to the time an
+	// operator acknowledged that the pair's owned records really are gone
+	// (store.AcknowledgeMassRepair). While it is younger than RepairMassOKTTL
+	// a tripped mass-repair breaker lets the capped repairs through.
+	RepairMassOK map[string]time.Time
+	// RepairDue maps OwnedRowKey of an Owned row with a live repair backoff
+	// (kv dns/repair/...) to whether its next attempt is due at the time
+	// given to GatherObservedAt. A row absent from it is due. Plan spends
+	// the per-zone repair cap only on due rows; a row that is not due is
+	// skipped silently but still counts toward the mass-repair breaker.
+	RepairDue map[string]bool
 }
 
 // OwnedRowKey identifies an ownership row in Observed.OwnedMissing and

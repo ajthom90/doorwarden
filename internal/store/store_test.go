@@ -204,6 +204,31 @@ func TestDeleteSetting(t *testing.T) {
 	}
 }
 
+func TestListSettingsWithPrefix(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	for k, v := range map[string]string{"dns/repair/a": "1", "dns/repair/b": "2", "dns/repairx": "3", "dns_repair/c": "4",
+		"dns%repair/d": "5", "other": "6"} {
+		if err := s.SetSetting(ctx, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListSettingsWithPrefix(ctx, "dns/repair/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["dns/repair/a"] != "1" || got["dns/repair/b"] != "2" {
+		t.Fatalf("got %v", got)
+	}
+	// no wildcard semantics in the prefix
+	if got, err := s.ListSettingsWithPrefix(ctx, "dns_"); err != nil || len(got) != 1 || got["dns_repair/c"] != "4" {
+		t.Fatalf("got %v %v", got, err)
+	}
+	if got, err := s.ListSettingsWithPrefix(ctx, "none/"); err != nil || len(got) != 0 {
+		t.Fatalf("got %v %v", got, err)
+	}
+}
+
 func TestStoreSurvivesReopen(t *testing.T) {
 	s, p := openTemp(t)
 	ctx := context.Background()

@@ -25,6 +25,7 @@ type world struct {
 	fk     *fake.Fake
 	prov   dns.Provider // fk, or a test wrapper around it
 	runner *Runner
+	de     *DNSExecutor
 	// clock is the executors' now: each cycle sets it to the plan's time.
 	clock time.Time
 }
@@ -52,6 +53,7 @@ func newWorldWith(t *testing.T, mode string, wrap func(*fake.Fake) dns.Provider)
 		m.Handle(k, re)
 	}
 	w.runner = &Runner{Exec: m, Config: w.cfg}
+	w.de = de
 	return w
 }
 
@@ -62,7 +64,11 @@ func (w *world) observe(ctx context.Context) Observed {
 		w.t.Fatal(err)
 	}
 	known, lk := ObservedFromRoutes(routes)
-	dobs, _ := GatherObserved(ctx, map[string]dns.Provider{dzp: w.prov}, w.st, DNSZoneRefs(w.cfg), 0)
+	at := w.clock // the cycle's time (cycle sets it first)
+	if at.IsZero() {
+		at = time.Now()
+	}
+	dobs, _ := GatherObservedAt(ctx, map[string]dns.Provider{dzp: w.prov}, w.st, DNSZoneRefs(w.cfg), 0, at)
 	o := Observed{Known: known, LastKnown: lk}
 	dobs.Fill(&o)
 	return o
@@ -71,6 +77,7 @@ func (w *world) observe(ctx context.Context) Observed {
 func (w *world) cycle(now time.Time, desired ...model.Service) ([]Action, error) {
 	w.t.Helper()
 	ctx := context.Background()
+	w.clock = now
 	return w.reconcileAt(now, desired, w.observe(ctx))
 }
 

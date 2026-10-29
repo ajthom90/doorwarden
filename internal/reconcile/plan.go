@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net/netip"
 	"sort"
 	"strings"
@@ -50,6 +51,51 @@ type planner struct {
 	out        []Action
 	// presenceChecked: OwnedRowKey of rows ownedPresence already handled.
 	presenceChecked map[string]bool
+	// repairPairs: per provider+"/"+zone, the wanted rows eligible for
+	// repair and the missing ones (planRepairs decides what is emitted).
+	repairPairs map[string]*repairPair
+}
+
+// repairPair counts, for one provider/zone, the wanted owned rows eligible
+// for repair (wanted) and those of them a listing showed missing (missing,
+// including rows a foreign record blocks), with the repairs that could be
+// emitted (cands, unblocked missing rows: DNSEnsure{Repair} for a row with
+// the desired value, the update for a row whose desired value changed).
+type repairPair struct {
+	provider, zone  string
+	wanted, missing int
+	cands           []Action
+}
+
+// Mass-repair limits per provider/zone and cycle (see planRepairs).
+const (
+	// RepairCapPerZone bounds the repairs emitted per provider/zone and cycle.
+	RepairCapPerZone = 5
+	// repairBreakerMinMissing: the breaker needs MORE than this many missing
+	// rows (and more than half of the wanted ones).
+	repairBreakerMinMissing = 3
+	// RepairMassOKTTL: a mass-repair acknowledgement older than this is
+	// ignored (and cleared by the DNS executor).
+	RepairMassOKTTL = 24 * time.Hour
+	// repairMassOKSkew: an acknowledgement dated further than this in the
+	// future (a clock stepped back) is ignored too.
+	repairMassOKSkew = 5 * time.Minute
+)
+
+// AlertDNSMassMissing marks the Skip planRepairs emits when most owned
+// records of a provider/zone are missing (Action.Alert).
+const AlertDNSMassMissing = "dns-mass-missing"
+
+// RepairBreakerKey is the Key of the breaker Skip of provider/zone (zone
+// normalized): stable, and never a service key.
+func RepairBreakerKey(provider, zone string) string {
+	return "repair-breaker:" + provider + "/" + normName(zone)
+}
+
+// massOKValid reports whether a mass-repair acknowledgement made at at still
+// counts at now.
+func massOKValid(at, now time.Time) bool {
+	return now.Sub(at) < RepairMassOKTTL && !at.After(now.Add(repairMassOKSkew))
 }
 
 // Plan computes the actions that bring the world in line with desired. It is
@@ -128,6 +174,7 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 	}
 	p.planRemovals(present, losers)
 	p.planOrphans(entries, winners)
+	p.planRepairs()
 
 	sortActions(p.out)
 	return p.out, winners
@@ -135,7 +182,7 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 
 func newPlanner(obs Observed, cfg *config.Config, now time.Time) *planner {
 	p := &planner{obs: obs, now: now, grace: cfg.Settings.GracePeriod, zones: map[string]*zoneInfo{},
-		foreign: map[string][]dns.Record{}}
+		foreign: map[string][]dns.Record{}, presenceChecked: map[string]bool{}, repairPairs: map[string]*repairPair{}}
 	if p.grace <= 0 {
 		p.grace = defaultGrace
 	}
@@ -405,7 +452,8 @@ func (p *planner) planZone(z *zoneInfo, hosts []string) {
 // the desired value, or Conflict if a foreign record holds the name. key is
 // the service key ("" for the wildcard record). An owned record with the
 // desired value that a listing showed missing is repaired (see
-// ownedPresence).
+// ownedPresence). An owned record with another value is updated (see
+// ownedUpdate).
 func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) {
 	owner := key
 	if owner == "" {
@@ -432,16 +480,8 @@ func (p *planner) ensureRecord(z *zoneInfo, name, key string, s *model.Service) 
 					name, z.recType, o.OwnerKey, o.OwnerKey)})
 			return
 		}
-		if d, ok := p.obs.OwnedDrifted[OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)]; ok && !anySameValue(d, z.value) {
-			// Changed out of band to neither the stored nor the desired
-			// value: someone else's edit is never overwritten. (Listed with
-			// the desired value is our own unconfirmed update: the update is
-			// repeated, idempotently.)
-			p.emit(p.driftSkip(z, o, key, s, d))
-			return
-		}
 		want.ID = o.ProviderRecordID
-		p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+		p.ownedUpdate(z, o, key, s, Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 			Record: &want, Owner: owner, Reason: "owned record has a different value"})
 		return
 	}
@@ -474,34 +514,44 @@ func (p *planner) foreignBlocker(z *zoneInfo, name string) *dns.Record {
 	return nil
 }
 
-// ownedPresence checks a wanted owned row o (owner o.OwnerKey, value equal to
-// the zone's desired value) against the provider listing: changed out of
-// band is reported with a Skip and never overwritten; missing is repaired
-// with DNSEnsure{Repair: true} carrying the stored row's identity, unless
-// the owner's source is unavailable or a foreign record now holds the name
-// (Conflict). s is the owner's service (nil for the wildcard row).
-func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service) {
+// ownedUpdate plans upd, the update of the wanted owned row o (same owner)
+// to the zone's desired value, against the provider listing:
+//   - changed out of band to neither the stored nor the desired value: a
+//     drift Skip, never overwritten (listed with the desired value is our
+//     own unconfirmed update: the update is repeated, idempotently);
+//   - present (or the pair not listed): the update is emitted, uncapped: an
+//     in-place change of a record we own and the provider lists (a target_ip
+//     migration touches every record of the zone);
+//   - missing at a successful listing: the update would re-create the record
+//     (UpdateRecord answers not-found, then the guarded create), so it is
+//     REPAIR-CLASS: it counts toward the pair's breaker like a missing
+//     same-value row and is a candidate of planRepairs (breaker, cap, due
+//     rows only), or a Conflict when a foreign record holds the name; never
+//     planned while the owner's source is unavailable.
+//
+// An eligible row (see ownedPresence) counts as wanted in every case.
+func (p *planner) ownedUpdate(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service, upd Action) {
 	rk := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
 	if p.presenceChecked[rk] {
-		return // once per row (a winner's row is not re-checked for its owner as a loser)
-	}
-	if p.presenceChecked == nil {
-		p.presenceChecked = map[string]bool{}
+		return // once per row
 	}
 	p.presenceChecked[rk] = true
-	if d, ok := p.obs.OwnedDrifted[rk]; ok {
+	pair := p.eligiblePair(z, s)
+	if pair != nil {
+		pair.wanted++
+	}
+	if d, ok := p.obs.OwnedDrifted[rk]; ok && !anySameValue(d, z.value) {
 		p.emit(p.driftSkip(z, o, key, s, d))
 		return
 	}
 	if !p.obs.OwnedMissing[rk] {
+		p.emit(upd)
 		return
 	}
-	if s != nil && (s.Source == "" || p.obs.Unavailable[s.Source]) {
-		return // the owner's state is unknown this cycle
+	if pair == nil {
+		return // the owner's state is unknown this cycle: never re-create blind
 	}
-	if _, listed := p.foreign[z.provider+"/"+z.name]; !listed {
-		return // unknown: never repair blind
-	}
+	pair.missing++
 	name := normName(o.Name)
 	if fr := p.foreignBlocker(z, name); fr != nil {
 		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
@@ -510,9 +560,160 @@ func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *
 				name, z.recType, fr.Name, fr.Type, fr.Value)})
 		return
 	}
-	p.emit(Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+	upd.Reason = "owned record has a different value and is missing at the provider; re-creating it with the new value"
+	pair.cands = append(pair.cands, upd)
+}
+
+// eligiblePair returns the breaker counters of z's provider/zone when a row
+// of owner service s (nil for the wildcard row) is eligible for repair: the
+// pair was listed and the owner's source is available. nil otherwise.
+func (p *planner) eligiblePair(z *zoneInfo, s *model.Service) *repairPair {
+	pk := z.provider + "/" + z.name
+	if _, listed := p.foreign[pk]; !listed || (s != nil && (s.Source == "" || p.obs.Unavailable[s.Source])) {
+		return nil
+	}
+	pair := p.repairPairs[pk]
+	if pair == nil {
+		pair = &repairPair{provider: z.provider, zone: z.name}
+		p.repairPairs[pk] = pair
+	}
+	return pair
+}
+
+// ownedPresence checks a wanted owned row o (owner o.OwnerKey, value equal to
+// the zone's desired value) against the provider listing: changed out of
+// band is reported with a Skip and never overwritten; missing is a repair
+// candidate (DNSEnsure{Repair: true} carrying the stored row's identity,
+// emitted by planRepairs subject to the mass-repair breaker and cap), unless
+// the owner's source is unavailable or a foreign record now holds the name
+// (Conflict). s is the owner's service (nil for the wildcard row).
+func (p *planner) ownedPresence(z *zoneInfo, o *store.DNSRecord, key string, s *model.Service) {
+	rk := OwnedRowKey(o.Provider, o.Zone, o.Name, o.Type)
+	if p.presenceChecked[rk] {
+		return // once per row (a winner's row is not re-checked for its owner as a loser)
+	}
+	p.presenceChecked[rk] = true
+	// eligible: the owner's state is known and the pair was listed; only
+	// such rows count for the breaker
+	pair := p.eligiblePair(z, s)
+	if pair != nil {
+		pair.wanted++
+	}
+	if d, ok := p.obs.OwnedDrifted[rk]; ok {
+		p.emit(p.driftSkip(z, o, key, s, d))
+		return
+	}
+	if pair == nil || !p.obs.OwnedMissing[rk] {
+		return // present, or unknown this cycle: never repair blind
+	}
+	pair.missing++
+	name := normName(o.Name)
+	if fr := p.foreignBlocker(z, name); fr != nil {
+		p.emit(Action{Kind: Conflict, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
+			Record: fr, Owner: o.OwnerKey,
+			Reason: fmt.Sprintf("owned record %s %s is missing and a foreign record exists: %s %s %s; not re-creating it (adopt or remove it)",
+				name, z.recType, fr.Name, fr.Type, fr.Value)})
+		return
+	}
+	pair.cands = append(pair.cands, Action{Kind: DNSEnsure, Zone: z.name, Host: name, Key: key, Svc: copySvcPtr(s), Provider: z.provider,
 		Record: &dns.Record{ID: o.ProviderRecordID, Name: name, Type: z.recType, Value: z.value}, Owner: o.OwnerKey,
 		Repair: true, Reason: "owned record is missing at the provider; re-creating it"})
+}
+
+// planRepairs emits the repair candidates ownedPresence and ownedUpdate
+// collected, per
+// provider/zone. Breaker: when more than repairBreakerMinMissing wanted rows
+// are missing AND they are more than half of the pair's wanted rows, the
+// listing is more likely wrong (a wiped server, a zone pinned to the wrong
+// hosted zone, a misconfigured provider) than the records gone: ONE Skip
+// (Alert AlertDNSMassMissing) is emitted and no repair at all for that pair.
+// It holds every cycle while the condition does, and clears by itself once
+// it no longer holds. An operator acknowledgement of the pair
+// (Observed.RepairMassOK, valid for RepairMassOKTTL) lets the capped repairs
+// through instead. Otherwise at most RepairCapPerZone repairs are emitted,
+// the first by (name, type, owner key); the rest wait for later cycles.
+func (p *planner) planRepairs() {
+	keys := make([]string, 0, len(p.repairPairs))
+	for k := range p.repairPairs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		rp := p.repairPairs[k]
+		ackAt, acked := p.obs.RepairMassOK[k]
+		acked = acked && massOKValid(ackAt, p.now)
+		tripped := breakerTrips(rp.missing, rp.wanted)
+		if tripped && !acked {
+			p.emit(Action{Kind: Skip, Zone: rp.zone, Host: rp.zone, Key: RepairBreakerKey(rp.provider, rp.zone),
+				Provider: rp.provider, Alert: AlertDNSMassMissing, Reason: breakerReason(rp)})
+			continue
+		}
+		// only due rows take a slot; the rest wait for their backoff (still
+		// counted in wanted/missing above)
+		var c []Action
+		for _, a := range rp.cands {
+			if due, ok := p.obs.RepairDue[OwnedRowKey(a.Provider, a.Zone, a.Record.Name, a.Record.Type)]; !ok || due {
+				c = append(c, a)
+			}
+		}
+		if tripped {
+			for i := range c {
+				c[i].Reason += fmt.Sprintf(" (mass repair of %s/%s acknowledged at %s: %d of %d missing)",
+					rp.provider, rp.zone, ackAt.UTC().Format(time.RFC3339), rp.missing, rp.wanted)
+			}
+		}
+		sort.SliceStable(c, func(i, j int) bool {
+			a, b := c[i], c[j]
+			if a.Record.Name != b.Record.Name {
+				return a.Record.Name < b.Record.Name
+			}
+			if a.Record.Type != b.Record.Type {
+				return a.Record.Type < b.Record.Type
+			}
+			return a.Owner < b.Owner
+		})
+		off := RepairRotation(k, p.now, len(c))
+		for i := 0; i < len(c) && i < RepairCapPerZone; i++ {
+			p.emit(c[(off+i)%len(c)])
+		}
+	}
+}
+
+// RepairRotation is where, in the sorted due repairs of the pair pk
+// (provider+"/"+zone), the RepairCapPerZone repairs sent at now start
+// (wrapping around): 0 when all fit, else a hash of pk and now's minute
+// modulo n. It moves every minute, so rows that fail without a backoff
+// cannot hold the cap forever, and being hashed it never locks onto the
+// same few offsets whatever the cycle interval is.
+func RepairRotation(pk string, now time.Time, n int) int {
+	if n <= RepairCapPerZone {
+		return 0
+	}
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s|%d", pk, now.Unix()/60)
+	return int(h.Sum64() % uint64(n))
+}
+
+// breakerTrips is the mass-repair breaker condition: more than
+// repairBreakerMinMissing of wanted rows missing, and more than half. The
+// DNS executor's Finish uses it too, to clear acknowledgements.
+func breakerTrips(missing, wanted int) bool {
+	return missing > repairBreakerMinMissing && 2*missing > wanted
+}
+
+// breakerReason is the self-describing text of a breaker Skip: what is
+// refused, why, and the two ways out (fix the configuration, or acknowledge
+// that the records really are gone). The API action lands in T20; the kv
+// fallback works before it.
+func breakerReason(rp *repairPair) string {
+	key := store.RepairMassOKKey(rp.provider, rp.zone)
+	return fmt.Sprintf("most owned records missing at %[1]s/%[2]s (%[3]d of %[4]d); refusing mass repair: check the provider and zone configuration. "+
+		"Repairs resume by themselves once most records are listed again. "+
+		"If the records really are gone, acknowledge it once to re-create them (%[5]d per cycle): "+
+		`POST /api/v1/dns/repair/ack {"provider":%[1]q,"zone":%[2]q} (API from T20), or without the API set the kv key %[6]s to the current UTC time in RFC3339 `+
+		`(sqlite3 <database> "INSERT OR REPLACE INTO kv(key,value) VALUES('%[6]s',strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now'))"); `+
+		"the acknowledgement lasts %[7]s and is cleared once the zone has recovered",
+		rp.provider, rp.zone, rp.missing, rp.wanted, RepairCapPerZone, key, "24h")
 }
 
 // driftSkip reports an owned record whose value was changed out of band.

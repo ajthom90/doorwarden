@@ -258,8 +258,9 @@ func TestDNSExecRepairRecreatesMissingRecord(t *testing.T) {
 	if !strings.Contains(r.act.messages(), "missing") {
 		t.Fatalf("activity %q", r.act.messages())
 	}
-	if s, ok := r.repairState(t, "app.example.test"); !ok || s.Attempts != 1 {
-		t.Fatalf("attempt not recorded: %+v %v", s, ok)
+	// a confirmed create ends the incident: the backoff state is reset
+	if s, ok := r.repairState(t, "app.example.test"); ok {
+		t.Fatalf("backoff not reset after a confirmed create: %+v", s)
 	}
 }
 
@@ -402,8 +403,9 @@ func TestDNSExecRepairBackoff(t *testing.T) {
 	// a state older than the stale window is forgotten: the next missing
 	// incident starts again at 1m
 	r.set(now.Add(3 * time.Hour))
-	if err := r.apply(t, false, a); err != nil {
-		t.Fatal(err)
+	r.fk.FailNext("CreateRecord", errors.New("rate limited"))
+	if err := r.apply(t, false, a); err == nil {
+		t.Fatal("want the create error")
 	}
 	if s, _ := r.repairState(t, "app.example.test"); s.Attempts != 1 {
 		t.Fatalf("stale state not restarted: %+v", s)
@@ -613,8 +615,10 @@ func TestDNSE2EUnconfirmedLandedNoopAndReset(t *testing.T) {
 		t.Fatalf("rows %+v records %+v", rows, w.records())
 	}
 	// cycle 2: gather lags (missing), executor listing too: the guarded
-	// create is idempotent; one attempt is counted
+	// create is idempotent (and unconfirmed again); one attempt is counted
+	// and kept, since only a confirmed create or a listing ends the incident
 	l.setHide("app.example.test", 2)
+	u.push("CreateRecord", unconfStep{apply: true, record: true})
 	n := len(w.fk.Calls())
 	acts := w.mustCycle(t0.Add(time.Minute), app)
 	if len(repairs(acts)) != 1 || len(w.records()) != 1 {
@@ -627,11 +631,12 @@ func TestDNSE2EUnconfirmedLandedNoopAndReset(t *testing.T) {
 	if v, ok, _ := w.st.GetSetting(context.Background(), key); !ok || !strings.Contains(v, `"attempts":1`) {
 		t.Fatalf("state %q %v", v, ok)
 	}
-	// cycle 3, within the backoff: the gather lags again; no provider call
+	// cycle 3, within the backoff: the gather lags again; the repair is
+	// not due, so it is not planned (and no provider call)
 	l.setHide("app.example.test", 1)
 	n = len(w.fk.Calls())
 	acts = w.mustCycle(t0.Add(time.Minute+30*time.Second), app)
-	if len(repairs(acts)) != 1 || len(w.writes(n)) != 0 {
+	if len(repairs(acts)) != 0 || len(w.writes(n)) != 0 {
 		t.Fatalf("plan %v writes %v", sums(acts), w.writes(n))
 	}
 	// cycle 4, due: the gather lags, the executor's listing sees it: no-op,

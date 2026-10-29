@@ -17,6 +17,8 @@ type unconfStep struct {
 	apply  bool   // the write really happens (it "landed")
 	record bool   // the provider returns the Record that was written
 	name   string // overrides the returned Record's Name (a provider bug)
+	id     string // overrides the returned Record's ID (a rotated ID)
+	value  string // overrides the returned Record's Value (a provider bug)
 }
 
 // unconf wraps the fake and makes queued Create/Update/Delete calls return an
@@ -75,6 +77,12 @@ func (u *unconf) write(op string, r dns.Record, f func() (dns.Record, error)) (d
 	}
 	if s.name != "" {
 		got.Name = s.name
+	}
+	if s.id != "" {
+		got.ID = s.id
+	}
+	if s.value != "" {
+		got.Value = s.value
 	}
 	return got, errUnconf
 }

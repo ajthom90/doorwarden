@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -106,7 +108,41 @@ func (m *MultiExecutor) Apply(ctx context.Context, actions []Action, dryRun bool
 		}
 		m.record(ctx, batch, false, err)
 	}
+	m.finish(ctx)
 	return errors.Join(errs...)
+}
+
+// Finisher is an optional hook of a registered Executor: MultiExecutor
+// calls Finish at the end of a non-dry Apply that was not cut short by
+// ctx.Err() (each distinct executor once, ordered by the smallest action
+// kind name it is registered for), whether or not the plan had an action
+// for it. Never in dry run. The DNS executor
+// uses it to clear mass-repair acknowledgements of recovered zones.
+type Finisher interface {
+	Finish(ctx context.Context)
+}
+
+func (m *MultiExecutor) finish(ctx context.Context) {
+	kinds := make([]string, 0, len(m.handlers))
+	for k := range m.handlers {
+		kinds = append(kinds, string(k))
+	}
+	sort.Strings(kinds)
+	done := map[any]bool{}
+	for _, k := range kinds {
+		h := m.handlers[ActionKind(k)]
+		f, ok := h.(Finisher)
+		if !ok {
+			continue
+		}
+		if reflect.ValueOf(h).Comparable() {
+			if done[h] {
+				continue
+			}
+			done[h] = true
+		}
+		f.Finish(ctx)
+	}
 }
 
 // RecordedCall is one Apply call seen by a Recorder.
