@@ -86,6 +86,12 @@ const (
 // records of a provider/zone are missing (Action.Alert).
 const AlertDNSMassMissing = "dns-mass-missing"
 
+// AlertPublishedInvalid marks the Invalid of a Published service whose
+// labels no longer resolve while it holds a Known route (heldInvalid): it is
+// not re-planned, so an operator must fix its labels (Action.Alert; the
+// caller notifies, deduplicated per reason).
+const AlertPublishedInvalid = "published-invalid"
+
 // RepairBreakerKey is the Key of the breaker Skip of provider/zone (zone
 // normalized): stable, and never a service key.
 func RepairBreakerKey(provider, zone string) string {
@@ -155,7 +161,12 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 				Reason: "service is present again"})
 		}
 		if e.err != nil {
-			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()})
+			x := Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()}
+			if e.heldInvalid {
+				x.Alert = AlertPublishedInvalid
+				x.Reason = fmt.Sprintf("published service has invalid labels (%v); it still holds %s through its persisted route, which is not updated until the labels are fixed", e.err, e.host)
+			}
+			p.emit(x)
 			if l, lost := losers[e.svc.Key]; lost && e.heldInvalid {
 				p.planLoser(e, l)
 			}

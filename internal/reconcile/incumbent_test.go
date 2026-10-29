@@ -126,3 +126,21 @@ func TestPhantomIncumbentKeepsHostnameAgainstSameRankNewcomer(t *testing.T) {
 	got := Plan([]model.Service{n}, obs, cfg, t0)
 	assertSums(t, got, "Conflict example.test app.example.test docker:aaa")
 }
+
+// A Published service whose labels became invalid while it holds a Known
+// route gets an Invalid flagged AlertPublishedInvalid (the caller notifies)
+// naming the hostname it still holds; an Invalid service without a Known
+// route is not flagged.
+func TestHeldInvalidIsFlaggedForNotification(t *testing.T) {
+	e := newE2E(t)
+	e.cycle([]model.Service{pub("docker:app", "app", "example.test", 8080)})
+	e.now = t0.Add(time.Hour)
+	acts := e.cycle([]model.Service{pub("docker:app", "!!!", "example.test", 8080), pub("docker:fresh", "!!!", "example.test", 1)})
+	inv := ofKind(forKey(acts, "docker:app"), Invalid)
+	if len(inv) != 1 || inv[0].Alert != AlertPublishedInvalid || !strings.Contains(inv[0].Reason, "app.example.test") {
+		t.Fatalf("held Invalid: %+v", inv)
+	}
+	if f := ofKind(forKey(acts, "docker:fresh"), Invalid); len(f) != 1 || f[0].Alert != "" {
+		t.Fatalf("fresh Invalid: %+v", f)
+	}
+}

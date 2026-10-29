@@ -231,3 +231,43 @@ func TestCloseDrainIsBounded(t *testing.T) {
 		t.Fatalf("took %v, sources closed %d", time.Since(start), e.src.closed.Load())
 	}
 }
+
+// A Published service whose labels become invalid while it holds its route
+// is notified (deduplicated per reason) and recorded in the activity log.
+func TestHeldInvalidNotified(t *testing.T) {
+	e := newEnv(t, testYAML)
+	s := svc("docker", "app")
+	e.src.set(nil, s)
+	a := e.app()
+	ctx := context.Background()
+	a.RunOnce(ctx)
+	if got := info(t, a, s.Key); got.State != model.StatePublished {
+		t.Fatalf("not published: %+v", got)
+	}
+	s.Name = "!!!"
+	e.src.set(nil, s)
+	a.RunOnce(ctx)
+	a.RunOnce(ctx)
+	var ev []notify.Event
+	for _, x := range e.notif.events() {
+		if x.Kind == "service.invalid" {
+			ev = append(ev, x)
+		}
+	}
+	if len(ev) == 0 || ev[0].Fields["key"] != s.Key || !strings.Contains(ev[0].Message, "app.example.test") {
+		t.Fatalf("invalid notifications: %+v", e.notif.events())
+	}
+	for _, x := range ev[1:] {
+		if x.DedupeKey != ev[0].DedupeKey {
+			t.Fatal("dedupe key changed")
+		}
+	}
+	act, _ := e.st.ListActivity(ctx, 100)
+	found := false
+	for _, x := range act {
+		found = found || (strings.Contains(x.Message, s.Key) && strings.Contains(strings.ToLower(x.Message), "invalid"))
+	}
+	if !found {
+		t.Fatalf("activity: %+v", act)
+	}
+}
