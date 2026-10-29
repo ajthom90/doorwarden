@@ -215,6 +215,9 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 		go func() { srvErr <- srv.Serve(ln) }()
 	}
 	dry, dryErr := a.DryRun(ctx)
+	if w := defaultZoneWarning(cfg); w != "" {
+		log.WarnContext(ctx, w)
+	}
 	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers), "dry_run", dry)
 	if dry {
 		why := "the dry-run toggle (UI/API) is on"
@@ -426,6 +429,19 @@ func sourceTargetIP(cfg *config.Config) string {
 	return ""
 }
 
+// defaultZoneWarning is the start-up warning for several zones without
+// settings.default_zone while a discovery source is enabled ("" when not
+// needed): zone-less discovered services (docker without doorwarden.zone,
+// every TrueNAS app) are then per-service errors.
+func defaultZoneWarning(cfg *config.Config) string {
+	discovery := (cfg.Sources.Docker != nil && cfg.Sources.Docker.Approval != "off") ||
+		(cfg.Sources.TrueNAS != nil && cfg.Sources.TrueNAS.Approval != "off")
+	if !discovery || len(cfg.Zones) < 2 || normZone(cfg.Settings.DefaultZone) != "" {
+		return ""
+	}
+	return fmt.Sprintf("%d zones and no settings.default_zone: discovered services without a doorwarden.zone label, and every TrueNAS app, are errors (\"no zone\") until settings.default_zone is set", len(cfg.Zones))
+}
+
 // zoneTargets maps each zone (normalized) to its target_ip, for sources
 // whose services can name their zone (docker's doorwarden.zone label).
 func zoneTargets(cfg *config.Config) map[string]string {
@@ -460,9 +476,6 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 			if s, err = truenas.New(truenas.Config{URL: t.URL, APIKey: key, TargetIP: tip}, nil); err == nil {
 				sp.Source = s
 			}
-		}
-		if err != nil && tip == "" {
-			err = fmt.Errorf("%w (the backend host is the default zone's target_ip: set settings.default_zone)", err)
 		}
 		sp.Err = err
 		out = append(out, sp)

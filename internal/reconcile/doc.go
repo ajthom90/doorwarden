@@ -13,8 +13,8 @@
 // without trailing dots (the dns/store FQDN convention). A service without a
 // zone (e.g. TrueNAS apps) uses settings.default_zone when set; otherwise,
 // when exactly one zone is configured, that zone; otherwise it is Invalid
-// ("service has no zone and no default_zone is set while N zones are
-// configured"). It never falls back to "the first configured zone".
+// ("no zone: set doorwarden.zone or settings.default_zone (N zones are
+// configured)"). It never falls back to "the first configured zone".
 //
 // Invalid: a hostname error (unknown zone, including a zone removed from the
 // config; a name with no DNS-valid characters; no zone and no default), a

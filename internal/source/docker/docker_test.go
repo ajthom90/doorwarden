@@ -387,3 +387,26 @@ func TestZoneLabelUsesThatZonesTargetIP(t *testing.T) {
 		t.Fatalf("hosts %v", host)
 	}
 }
+
+// With no default zone (several zones, no settings.default_zone) an
+// unlabelled published-port container is an Error naming the fix, not a
+// misleading port problem; a labelled one still resolves.
+func TestUnlabelledWithoutDefaultZoneIsNoZoneError(t *testing.T) {
+	srv := fake(t, []ctr{
+		container("lan", "running", lbl("doorwarden.enable", "true", "doorwarden.zone", "lan.example.test"), []map[string]any{port(80, 8080)}, nil),
+		container("def", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8081)}, nil),
+	})
+	src := newSrc(t, srv, Config{ZoneTargets: map[string]string{"lan.example.test": "10.0.0.5", "example.test": "192.0.2.10"}})
+	got := list(t, src)
+	by := map[string]model.Service{}
+	for _, g := range got {
+		by[g.Name] = g
+	}
+	if by["lan"].State == model.StateError || by["lan"].Backend.Host != "10.0.0.5" {
+		t.Fatalf("lan: %+v", by["lan"])
+	}
+	if d := by["def"]; d.State != model.StateError || len(src.Warnings()) != 1 ||
+		!strings.Contains(src.Warnings()[0], "no zone: set doorwarden.zone or settings.default_zone") {
+		t.Fatalf("def: %+v %v", d, src.Warnings())
+	}
+}

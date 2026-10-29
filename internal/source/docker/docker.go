@@ -28,6 +28,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -291,8 +292,14 @@ func (s *Source) convert(cname string, c apiContainer) (model.Service, string) {
 		return svc, ""
 	}
 	tip := s.cfg.TargetIP
-	if z := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(svc.Zone)), "."); z != "" && s.cfg.ZoneTargets[z] != "" {
+	z := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(svc.Zone)), ".")
+	if z != "" && s.cfg.ZoneTargets[z] != "" {
 		tip = s.cfg.ZoneTargets[z]
+	}
+	if z == "" && tip == "" {
+		// Several zones and no settings.default_zone: an unlabelled
+		// service has no zone (nor a host for its published port).
+		return fail(errors.New("no zone: set doorwarden.zone or settings.default_zone"))
 	}
 	if pub := published[port]; pub > 0 && tip != "" {
 		svc.Backend.Host = tip

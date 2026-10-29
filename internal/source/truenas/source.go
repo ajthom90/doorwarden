@@ -27,7 +27,7 @@ type Config struct {
 	URL         string
 	APIKey      secrets.Secret
 	InsecureTLS bool
-	TargetIP    string // host every backend uses; portal hosts are ignored
+	TargetIP    string // host every backend uses; portal hosts are ignored; "" (no default zone) makes running apps errors
 	Name        string // source name, default "truenas"
 }
 
@@ -51,9 +51,6 @@ type Source struct {
 func New(cfg Config, ports PortLookup) (*Source, error) {
 	if strings.TrimSpace(cfg.URL) == "" {
 		return nil, errors.New("truenas: URL is required")
-	}
-	if strings.TrimSpace(cfg.TargetIP) == "" {
-		return nil, errors.New("truenas: TargetIP is required")
 	}
 	c := NewClient(cfg.URL, cfg.APIKey, cfg.InsecureTLS)
 	if c.urlErr != nil {
@@ -271,6 +268,11 @@ func (s *Source) convert(ctx context.Context, a apiApp) (model.Service, string) 
 		}
 	}
 
+	if a.State == "RUNNING" && strings.TrimSpace(s.targetIP) == "" {
+		// Several zones and no settings.default_zone: apps cannot name a
+		// zone, so none has a zone or a backend host.
+		return fail(errors.New("no zone: set settings.default_zone"))
+	}
 	if a.State != "RUNNING" {
 		// Backend is unknown while not running: only Scheme is set.
 		svc.State = model.StateStopped

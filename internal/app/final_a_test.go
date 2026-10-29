@@ -376,3 +376,30 @@ func TestHeldInvalidDedupeKeyStable(t *testing.T) {
 		t.Fatalf("%q %q %q", a, b, c)
 	}
 }
+
+// Several zones and no default_zone with discovery on: one start-up
+// warning; none with a default, one zone, or static only. The truenas
+// source still builds (its apps are per-service "no zone" errors).
+func TestDefaultZoneWarning(t *testing.T) {
+	two := []config.Zone{{Name: "a.test", TargetIP: "192.0.2.1"}, {Name: "b.test", TargetIP: "192.0.2.2"}}
+	tn := &config.TrueNASSource{URL: "https://192.0.2.20", APIKey: "k"}
+	c := &config.Config{Zones: two}
+	c.Sources.TrueNAS = tn
+	if w := defaultZoneWarning(c); !strings.Contains(w, "settings.default_zone") {
+		t.Fatalf("warning = %q", w)
+	}
+	specs := BuildSources(c, nil)
+	for _, sp := range specs {
+		if sp.Name == "truenas" && (sp.Err != nil || sp.Source == nil) {
+			t.Fatalf("truenas source not built: %v", sp.Err)
+		}
+	}
+	c.Settings.DefaultZone = "b.test"
+	if w := defaultZoneWarning(c); w != "" {
+		t.Fatalf("warning with a default: %q", w)
+	}
+	c = &config.Config{Zones: two}
+	if w := defaultZoneWarning(c); w != "" {
+		t.Fatalf("warning without discovery: %q", w)
+	}
+}

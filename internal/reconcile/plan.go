@@ -278,7 +278,7 @@ func (p *planner) resolve(s model.Service) entry {
 	e := entry{svc: s, zone: normName(s.Zone)}
 	if e.zone == "" {
 		if p.defZone == "" {
-			e.err = fmt.Errorf("service has no zone and no default_zone is set while %d zones are configured", len(p.zoneNames))
+			e.err = fmt.Errorf("no zone: set doorwarden.zone or settings.default_zone (%d zones are configured)", len(p.zoneNames))
 			return e
 		}
 		e.zone = p.defZone
