@@ -102,3 +102,46 @@ func BenchmarkDecodeErrorManyBadPorts(b *testing.B) {
 		_, _ = Parse(raw, func(string) (string, bool) { return "", false })
 	}
 }
+
+// Hostile document shapes are refused before decoding, fast, with a short
+// message and without panicking: a complex (non-scalar) key, aliases
+// (billion-laughs expansion), anchors, and deep nesting.
+func TestHostileDocumentShapesRefusedFast(t *testing.T) {
+	laughs := "a: &a [x, x, x, x, x, x, x, x, x, x]\n"
+	for i := 'b'; i <= 'k'; i++ {
+		laughs += fmt.Sprintf("%c: &%c [*%c, *%c, *%c, *%c, *%c, *%c, *%c, *%c, *%c, *%c]\n", i, i, i-1, i-1, i-1, i-1, i-1, i-1, i-1, i-1, i-1, i-1)
+	}
+	bigKey := "settings:\n  ? {" + strings.Repeat("k: v, ", 1) + "}\n  : 1\n"
+	cases := map[string]struct{ doc, want string }{
+		"complex mapping key": {base + bigKey, "settings (line 13): a mapping key must be a plain scalar"},
+		"complex list key":    {base + "settings:\n  ? [a, b]\n  : 1\n", "a mapping key must be a plain scalar"},
+		"billion laughs":      {laughs, "YAML anchors and aliases are not supported"},
+		"anchor only":         {base + "settings: &s {default_zone: example.test}\n", "settings (line 12): YAML anchors and aliases are not supported"},
+		"undefined alias":     {base + "static:\n  - *nope\n", "unknown anchor"},
+		"deep nesting":        {base + "settings: " + strings.Repeat("[", 5000) + strings.Repeat("]", 5000) + "\n", "nested more than 64 levels"},
+		"deep mappings":       {base + "settings: " + strings.Repeat("{a: ", 3000) + "1" + strings.Repeat("}", 3000) + "\n", "nested more than 64 levels"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			start := time.Now()
+			_, err := Parse([]byte(tc.doc), func(string) (string, bool) { return "", false })
+			if d := time.Since(start); d > time.Second && !raceEnabled {
+				t.Fatalf("took %v", d)
+			}
+			if err == nil {
+				t.Fatal("accepted")
+			}
+			if msg := err.Error(); len(msg) > 1024 || !strings.Contains(msg, tc.want) {
+				t.Fatalf("%d bytes: %.400s", len(msg), msg)
+			}
+		})
+	}
+}
+
+// Merge keys are still reported as merge keys (checked first), and the
+// one shared check accepts an ordinary config.
+func TestCheckDocumentAcceptsOrdinaryConfig(t *testing.T) {
+	if _, err := Parse([]byte(base+"settings:\n  default_zone: example.test\n"), nil); err != nil {
+		t.Fatal(err)
+	}
+}

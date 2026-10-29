@@ -16,10 +16,6 @@ import (
 const (
 	maxDecodeProblems = 20
 	maxDecodeMsg      = 8 << 10
-	// maxMappingKeys bounds every mapping: yaml.v3's duplicate-key check
-	// is quadratic in a mapping's size, so a huge one is refused before
-	// decoding. Real configs have a few dozen keys per mapping.
-	maxMappingKeys = 4096
 )
 
 var (
@@ -184,42 +180,4 @@ func formatPath(p []pathElem) string {
 		b.WriteString(e.key)
 	}
 	return b.String()
-}
-
-// checkMappingSizes refuses a mapping with more than maxMappingKeys keys,
-// naming it by key path and line.
-func checkMappingSizes(root *yaml.Node) error {
-	var walk func(n *yaml.Node, path []pathElem) error
-	walk = func(n *yaml.Node, path []pathElem) error {
-		switch n.Kind {
-		case yaml.MappingNode:
-			if k := len(n.Content) / 2; k > maxMappingKeys {
-				where := "the document"
-				if len(path) > 0 {
-					where = formatPath(path)
-				}
-				return fmt.Errorf("%s (line %d): a mapping with %d keys (at most %d)", where, n.Line, k, maxMappingKeys)
-			}
-			for i := 0; i+1 < len(n.Content); i += 2 {
-				p := append(path[:len(path):len(path)], pathElem{key: n.Content[i].Value, idx: -1})
-				if err := walk(n.Content[i+1], p); err != nil {
-					return err
-				}
-			}
-		case yaml.SequenceNode:
-			for i, c := range n.Content {
-				if err := walk(c, append(path[:len(path):len(path)], pathElem{idx: i})); err != nil {
-					return err
-				}
-			}
-		case yaml.DocumentNode:
-			for _, c := range n.Content {
-				if err := walk(c, path); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	return walk(root, nil)
 }

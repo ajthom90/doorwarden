@@ -177,10 +177,7 @@ func parse(raw []byte, path string, env func(string) (string, bool)) (*Config, e
 	if err := yaml.Unmarshal(raw, &root); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	if err := RejectMergeKeys(&root); err != nil {
-		return nil, fmt.Errorf("config %s: %w", path, err)
-	}
-	if err := checkMappingSizes(&root); err != nil {
+	if err := CheckDocument(&root); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
 	var missing []string
