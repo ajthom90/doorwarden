@@ -1,8 +1,10 @@
 // Package web serves doorwarden's HTTP endpoints. This file has the health
 // endpoint and the mux builder; the API, auth and UI land in later tasks.
 //
-// /healthz is unauthenticated (container healthchecks call it), so its body
-// carries only booleans, source names and times: never an error text, a
+// /healthz is unauthenticated (container healthchecks call it). An
+// anonymous caller gets only {"status", "degraded"}; an authenticated one
+// (a principal set by the auth middleware) also gets the store state,
+// dry-run state, source names and reconcile times. Never an error text, a
 // host name, a path or a secret.
 package web
 
@@ -73,6 +75,13 @@ func (h Health) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	if r.Method == http.MethodHead {
+		return
+	}
+	if principalFrom(r.Context()) == nil {
+		_ = json.NewEncoder(w).Encode(struct {
+			Status   string `json:"status"`
+			Degraded bool   `json:"degraded"`
+		}{hs.Status, hs.Degraded})
 		return
 	}
 	_ = json.NewEncoder(w).Encode(hs)

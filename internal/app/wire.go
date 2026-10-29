@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -192,8 +194,23 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 			_ = a.Close(context.Background())
 			return fmt.Errorf("listen %s: %w", f.Listen, err)
 		}
-		srv = &http.Server{Handler: web.NewMux(web.MuxOptions{Health: a.HealthHandler()}),
-			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
+		api, err := web.NewServer(ctx, web.Options{
+			Store: st, Control: a, Config: cfg, ConfigPath: f.Config,
+			ValidateConfig: func(raw []byte) error { return validateConfigBytes(raw, env, box != nil) },
+			Health:         a.HealthHandler(), Metrics: a.MetricsHandler(), Log: log,
+		})
+		if err != nil {
+			_ = ln.Close()
+			_ = a.Close(context.Background())
+			return fmt.Errorf("http api: %w", err)
+		}
+		defer api.Close()
+		a.SetEventSink(api.Events().Publish)
+		// WriteTimeout bounds every response except the SSE stream, which
+		// lifts it per response (web/sse.go).
+		srv = &http.Server{Handler: api, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+			WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
+			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn)}
 		go func() { srvErr <- srv.Serve(ln) }()
 	}
 	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers))
@@ -236,6 +253,64 @@ func LoadConfig(path string, env func(string) (string, bool)) (*config.Config, e
 		return nil, fmt.Errorf("invalid config %s: %w", path, errors.Join(errs...))
 	}
 	return cfg, nil
+}
+
+// validateConfigBytes checks a config document as LoadConfig would at the
+// next start (PUT /api/v1/config): parse, Validate with the DNS registry's
+// capabilities, and the master-key requirement.
+//
+// The document comes from an API client, so it is never expanded with the
+// real environment: a client could reference any variable (e.g.
+// ${DOORWARDEN_MASTER_KEY}) in a field that fails validation and read the
+// value back from the error. Variables are checked for presence only and
+// expand to envPlaceholder (an empty variable stays empty, so ":-"
+// defaults behave as at start-up). Errors are additionally scrubbed of the
+// real values of every variable the document names.
+func validateConfigBytes(raw []byte, env func(string) (string, bool), haveMasterKey bool) error {
+	cfg, err := config.Parse(raw, placeholderEnv(env))
+	if err != nil {
+		return scrubEnvValues(err, raw, env)
+	}
+	if errs := cfg.Validate(dns.ConfigCaps()); len(errs) > 0 {
+		return scrubEnvValues(errors.Join(errs...), raw, env)
+	}
+	if !haveMasterKey && needsMasterKey(cfg) {
+		return errors.New("the config uses secret: references or ACME issuers, which need DOORWARDEN_MASTER_KEY (not set)")
+	}
+	return nil
+}
+
+// envPlaceholder is what every set variable expands to when a client's
+// config document is validated.
+const envPlaceholder = "doorwarden-env-placeholder"
+
+var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
+
+// placeholderEnv reports env's variables as set (or empty) without their
+// values.
+func placeholderEnv(env func(string) (string, bool)) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v, ok := env(k)
+		if !ok {
+			return "", false
+		}
+		if v == "" {
+			return "", true
+		}
+		return envPlaceholder, true
+	}
+}
+
+// scrubEnvValues replaces the values of the variables raw references in
+// err's text.
+func scrubEnvValues(err error, raw []byte, env func(string) (string, bool)) error {
+	msg := err.Error()
+	for _, m := range envRefRe.FindAllSubmatch(raw, -1) {
+		if v, ok := env(string(m[1])); ok && len(v) >= 3 {
+			msg = strings.ReplaceAll(msg, v, "[redacted]")
+		}
+	}
+	return errors.New(msg)
 }
 
 func hasIssuer(cfg *config.Config) bool {

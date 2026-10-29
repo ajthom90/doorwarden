@@ -109,3 +109,27 @@ func resolveScalar(s string) string {
 	}
 	return "!!str"
 }
+
+// RejectMergeKeys refuses YAML merge keys (`<<`, tagged !!merge or not)
+// anywhere in the document: they copy values between mappings after the
+// per-field rules (secret fields, ${VAR} placement) were checked against
+// where they were written.
+func RejectMergeKeys(n *yaml.Node) error {
+	if n == nil {
+		return nil
+	}
+	if n.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k := n.Content[i]
+			if k.Kind == yaml.ScalarNode && (k.ShortTag() == "!!merge" || k.Value == "<<") {
+				return fmt.Errorf("YAML merge keys (<<) are not supported (line %d)", k.Line)
+			}
+		}
+	}
+	for _, c := range n.Content {
+		if err := RejectMergeKeys(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -174,9 +174,14 @@ type App struct {
 	nextCert          time.Time
 	onCertArm         func(time.Duration) // test hook: the cert timer's delay
 
-	hmu    sync.RWMutex
-	health web.HealthStatus
-	snap   []model.Service
+	hmu     sync.RWMutex
+	health  web.HealthStatus
+	snap    []model.Service
+	listing []listed // pre-gate services of the last cycle (control.go)
+	plan    web.Plan
+	events  func(name string, v any)
+
+	ovMu sync.Mutex // serializes SetServiceOverride
 
 	closeOnce sync.Once
 }
@@ -321,8 +326,8 @@ func (a *App) HealthStatus() web.HealthStatus {
 	return h
 }
 
-// MetricsHandler returns the Prometheus handler. It is not mounted by Run:
-// the API task puts authentication in front of it.
+// MetricsHandler returns the Prometheus handler (served by the API server,
+// behind authentication).
 func (a *App) MetricsHandler() http.Handler { return a.met.Handler() }
 
 // Services returns the services of the last cycle after the approval gate

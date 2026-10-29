@@ -172,3 +172,99 @@ request.
 - Verify published hosts with `scripts/verify.sh`.
 
 See [migration.md](migration.md) when replacing Nginx Proxy Manager.
+
+## Web UI and API access
+
+Everything on the control plane's HTTP port requires authentication except
+`/healthz`, `/api/v1/auth/status`, the first-run setup and the login
+endpoints. That includes `/metrics` (scrape it with a session or through a
+trusted-header proxy) and the event stream `/api/v1/events`.
+
+- **First-run setup.** While no administrator exists, Doorwarden logs a
+  one-time setup token at start-up (`WARN no administrator yet: first-run
+  setup token ...`; read it with `docker logs doorwarden`). Setup
+  (`POST /api/v1/auth/setup` with user name, password of at least 12
+  characters and the token) creates the only administrator; it is refused
+  once one exists, and two concurrent attempts cannot both succeed. The token
+  changes on every restart until setup is done. A token was chosen over a
+  localhost-only setup because the UI is normally reached through Traefik.
+- **Sessions.** Passwords are hashed with argon2id. A session cookie
+  (`__Host-doorwarden_session`: HttpOnly, Secure, SameSite=Strict) expires
+  after `web.session_idle` (8h) without use and `web.session_max` (7d) in
+  all. Logout and a password change end sessions server side. Login is
+  throttled per (user name, client address): after 5 failures that pair
+  waits 30s, doubling up to 15 minutes; one address failing for 20 user
+  names is backed off the same way (IPv6 addresses count per /64).
+  Every attempt counts against one budget per user name of about 30 a
+  minute (at most ~1830 guesses in any hour, however many addresses are
+  used). Addresses with recent failures cannot use the last 5 of it,
+  which stay reserved for addresses without failures: at worst such a
+  login waits up to 5 seconds or is asked to retry a few seconds later, so
+  failures from elsewhere can never lock the administrator out. A login
+  the client abandons (disconnect, timeout) counts as a failure. Setup is
+  limited per address only (the setup token is 192-bit random).
+  Set `web.cookie_insecure: true` only when the UI is served over plain
+  HTTP on a trusted LAN.
+- **Behind Traefik: set `web.trusted_proxies`.** Login throttling, audit and
+  log lines use the client address. Without `web.trusted_proxies` that is
+  the TCP peer, so behind Traefik every client looks like Traefik and one
+  client's failed logins slow down everyone's. Set it to the proxy's network
+  (for the compose file, the Docker network Traefik shares with Doorwarden,
+  e.g. `trusted_proxies: ["172.18.0.0/16"]`). When the peer is in that list
+  the client is the rightmost `X-Forwarded-For` address that is not itself a
+  trusted proxy; anything further left was written by the client and is
+  ignored. Doorwarden warns in its log when it runs in a container with the
+  setting empty, when `X-Forwarded-For` arrives while it is empty, and when
+  the first requests all come from one address. This setting only affects
+  the client address; it never authenticates anyone (that is
+  `web.trusted_header`).
+- **Locked out / lost password.** With shell access to the host:
+  `docker exec doorwarden doorwarden admin unlock` ends every session and
+  clears all login limits; `docker exec doorwarden doorwarden admin
+  reset-password` also sets a new random password, printed once on the
+  terminal (never logged), and creates the administrator (`-user`, default
+  `admin`) if none exists. Both work on the database (`-db`, default
+  `$DOORWARDEN_DB`) while the server runs. They refuse to run as a user
+  other than the database file's owner (e.g. `docker exec -u 0`), since
+  SQLite's `-wal`/`-shm` files would then belong to that user and lock the
+  server out; `-allow-owner-mismatch` overrides.
+- **CSRF.** Every state-changing request needs the `X-Doorwarden-CSRF`
+  header (the token returned by login, setup and `GET /api/v1/auth/me`), a
+  JSON body, and an `Origin` that matches the request host or one of
+  `web.allowed_origins` (`scheme://host[:port]`).
+- **Trusted header (optional).** With `web.trusted_header.proxies` set to
+  CIDRs, a request whose TCP peer is in those ranges is authenticated by
+  `web.trusted_header.user_header` (default `Remote-User`) with
+  `web.trusted_header.role` (`viewer` by default, or `admin`). The peer
+  address is the connection's, never `X-Forwarded-For`; from any other peer
+  the header is stripped. An empty list turns it off. Only list the proxy
+  that sets the header (e.g. Traefik with forward auth) and make sure it
+  overwrites any client-sent copy.
+
+### Editing the config from the UI
+
+`GET /api/v1/config` returns the config file with every secret replaced by
+`<masked>` (`secret:` references and plain `${VAR}` placeholders are shown,
+since they are not secrets). `PUT /api/v1/config` takes the edited document;
+a `<masked>` value keeps the current one, but only for the same entry
+(list entries are matched by `name`/`id`/`url`/`host`-style identity fields,
+not position) and only while its destination (`url`, `host`, `server`,
+`endpoint`, `type`, `port`, ...) is unchanged; otherwise the PUT is refused
+and the secret must be re-entered. Comments are stripped from the returned
+document. `${VAR}` references are accepted only in secret fields (an
+unchanged existing one elsewhere is kept). YAML aliases are refused by the editor, and YAML
+merge keys (`<<`) are refused everywhere, including in a config file
+written by hand (the error names the line). The document is validated like at
+start-up and written atomically (mode 0600), so the config file must be
+writable by the container (it cannot be a read-only mount for this). Changes
+take effect at the next restart: the running reconciler, DNS providers and
+ACME manager are not rebuilt mid-cycle or mid-order.
+
+### Per-service overrides
+
+Publish/unpublish, rename, port and skip-verify set in the UI are stored in
+the database and applied every cycle before the approval gate. In approve
+mode a rename or skip-verify change requires approving the service again.
+Unpublishing removes the service like a disappearance: its route and DNS
+records are scheduled for removal after `settings.grace_period` (24h by
+default); publishing again within the grace cancels the removal.

@@ -785,11 +785,17 @@ static:
 	if err != nil || !strings.Contains(string(b), "web.example.test") {
 		t.Fatalf("routes file: %s %v", b, err)
 	}
-	resp, err := http.Get("http://" + ln + "/metrics")
-	if err == nil {
+	// The API is mounted behind authentication: /metrics and the API need
+	// a session; the first-run status is public.
+	for path, want := range map[string]int{"/metrics": http.StatusUnauthorized, "/api/v1/services": http.StatusUnauthorized,
+		"/api/v1/events": http.StatusUnauthorized, "/api/v1/auth/status": http.StatusOK} {
+		resp, err := http.Get("http://" + ln + path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			t.Fatal("/metrics is exposed on the default mux")
+		if resp.StatusCode != want {
+			t.Errorf("%s = %d, want %d", path, resp.StatusCode, want)
 		}
 	}
 	cancel()
