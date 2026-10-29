@@ -79,6 +79,11 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 	// The next re-render at a certificate expiry comes from the rows read
 	// this cycle, dry run included (a stale value would re-arm in the past).
 	a.nextCert = NextCertExpiry(obs.Certs, now)
+	if err == nil {
+		// Every cycle, dry run included (not only when Traefik's files are
+		// rendered).
+		a.certExpiryMetrics(obs.Certs)
+	}
 	if err != nil {
 		// Without the persisted routes nothing can be planned safely.
 		res.Err = errors.Join(append(errs, err)...)
@@ -282,21 +287,8 @@ func (a *App) observe(ctx context.Context, now time.Time, unavailable map[string
 	msg := ""
 	if len(derrs) > 0 {
 		msg = fmt.Sprintf("DNS observation incomplete; no record is created where the listing failed: %v", errors.Join(derrs...))
-		for _, z := range reconcile.DNSZoneRefs(a.cfg) {
-			if _, ok := obs.Foreign[z.Provider+"/"+z.Zone]; !ok {
-				if p := a.providers[z.Provider]; p != nil {
-					a.met.DNSOperation(p.Type(), "list", "error")
-				}
-			}
-		}
 	}
-	for _, z := range reconcile.DNSZoneRefs(a.cfg) {
-		if _, ok := obs.Foreign[z.Provider+"/"+z.Zone]; ok {
-			if p := a.providers[z.Provider]; p != nil {
-				a.met.DNSOperation(p.Type(), "list", "ok")
-			}
-		}
-	}
+	// The listings themselves are counted by meteredProvider.
 	a.logChange(ctx, "dns-observe", "warn", msg)
 	return obs, nil
 }

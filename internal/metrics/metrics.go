@@ -25,7 +25,7 @@ var (
 	serviceStates = []string{"discovered", "pending", "published", "conflict", "error", "stopped", "removed"}
 	reconcileRes  = []string{"ok", "error", "dry_run"}
 	actionKinds   = []string{"DNSEnsure", "DNSDelete", "CertEnsure", "RouteWrite", "RouteRemove", "Conflict", "Skip", "Invalid", "ScheduleRemoval", "CancelRemoval", "DNSScheduleRemoval", "DNSCancelRemoval", "DNSReassign"}
-	dnsOps        = []string{"ensure", "delete", "list"}
+	dnsOps        = []string{"ensure", "update", "delete", "list"}
 	opResults     = []string{"ok", "error"}
 	renewResults  = []string{"ok", "error"}
 	senderTypes   = []string{"webhook", "ntfy", "smtp", "dispatcher"}
@@ -233,7 +233,8 @@ func (m *Metrics) ReconcileAction(kind string, n int) {
 	m.actions.WithLabelValues(m.kinds.norm(kind)).Add(float64(n))
 }
 
-// DNSOperation counts one provider call (op: ensure|delete|list; result: ok|error).
+// DNSOperation counts one provider call (op: ensure|update|delete|list;
+// result: ok|error).
 func (m *Metrics) DNSOperation(providerType, op, result string) {
 	if m == nil {
 		return
