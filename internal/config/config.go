@@ -64,6 +64,11 @@ type Traefik struct {
 	// ExternalMiddlewares allowlists qualified references (name@provider)
 	// to middlewares defined outside doorwarden (e.g. crowdsec@docker).
 	ExternalMiddlewares []string `yaml:"external_middlewares"`
+	// FileMode is the permission of the rendered dynamic files: "0600"
+	// (default; Traefik runs as the same UID) or "0640" (Traefik reads
+	// through a dedicated shared group). The files can hold middleware
+	// secrets.
+	FileMode string `yaml:"file_mode"`
 	// TraefikTLS: tls_min_version, sni_strict, serve_expired (tls.go).
 	TraefikTLS `yaml:",inline"`
 }

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -264,5 +266,27 @@ static:
 `
 	if errs := mustLoad(t, ok).Validate(caps(true)); len(errs) != 0 {
 		t.Fatal(errs)
+	}
+}
+
+func TestTraefikFileMode(t *testing.T) {
+	for v, want := range map[string]os.FileMode{"": 0o600, "0600": 0o600, "0640": 0o640} {
+		m, err := Traefik{FileMode: v}.Mode()
+		if err != nil || m != want {
+			t.Errorf("%q: %v %v", v, m, err)
+		}
+	}
+	for _, v := range []string{"0644", "0666", "0700", "rw"} {
+		if _, err := (Traefik{FileMode: v}).Mode(); err == nil {
+			t.Errorf("%q accepted", v)
+		}
+		c := &Config{Traefik: Traefik{FileMode: v}}
+		found := false
+		for _, e := range c.validateTraefik() {
+			found = found || strings.Contains(e.Error(), "file_mode")
+		}
+		if !found {
+			t.Errorf("%q not rejected by validation", v)
+		}
 	}
 }

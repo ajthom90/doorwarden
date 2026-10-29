@@ -61,8 +61,8 @@ func TestWriteCreatesAndSkipsIdentical(t *testing.T) {
 		t.Fatalf("content %q", got)
 	}
 	fi, _ := os.Stat(filepath.Join(dir, RoutesFile))
-	if fi.Mode().Perm() != 0o644 {
-		t.Fatalf("mode %v", fi.Mode())
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v (middleware secrets: want 0600)", fi.Mode())
 	}
 	ageAll(t, dir)
 	if err := Write(dir, f); err != nil {
@@ -208,4 +208,42 @@ func TestWriteTargetIsDirectory(t *testing.T) {
 		t.Fatal("directory replaced")
 	}
 	assertNoTemps(t, dir)
+}
+
+// Final-review M4: rendered files may hold middleware secrets (basic-auth
+// hashes, forward-auth headers): 0600 by default, 0640 when configured; a
+// pre-existing file with other permissions is corrected even when its
+// content is unchanged (mtime kept); other modes are refused.
+func TestWriteModeAndPermissionCorrection(t *testing.T) {
+	dir := t.TempDir()
+	f := files("http: {}\n", "tls: {}\n")
+	p := filepath.Join(dir, RoutesFile)
+	if err := os.WriteFile(p, f[RoutesFile], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageAll(t, dir)
+	if err := Write(dir, f); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(p)
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("pre-existing mode not corrected: %v", fi.Mode())
+	}
+	if !fi.ModTime().Equal(past) {
+		t.Fatal("identical content rewritten")
+	}
+	if err := WriteMode(dir, f, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{RoutesFile, TLSFile} {
+		if fi, _ := os.Stat(filepath.Join(dir, n)); fi.Mode().Perm() != 0o640 {
+			t.Fatalf("%s mode %v, want 0640", n, fi.Mode())
+		}
+	}
+	if err := WriteMode(dir, f, 0o644); err == nil {
+		t.Fatal("0644 accepted")
+	}
 }

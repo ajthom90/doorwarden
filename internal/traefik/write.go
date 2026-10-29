@@ -21,11 +21,13 @@ var fileNameRe = regexp.MustCompile(`^doorwarden-[a-z0-9]+(-[a-z0-9]+)*\.yml$`)
 //
 //   - Each file is replaced atomically: a temp file in dir (".doorwarden-*.tmp",
 //     an extension Traefik's directory watcher does not load), fsync, chmod
-//     0644 (Traefik usually runs as another user; the content holds no
-//     secrets), rename over the target. A symlink at the target is replaced
+//     0600 (the files can hold middleware secrets: basic-auth hashes,
+//     forward-auth headers; Traefik must run as the same UID, or use
+//     WriteMode with 0640 and a shared group), rename over the target. A symlink at the target is replaced
 //     by the rename; its target is never written.
 //   - A file whose current content is byte-identical is not rewritten, so its
-//     mtime is kept and Traefik does not reload.
+//     mtime is kept and Traefik does not reload; its permissions are
+//     corrected in place when they differ.
 //   - Stale owned files are removed: regular files in dir named
 //     "doorwarden-*.yml" or "doorwarden-*.yaml" whose content starts with
 //     Header and that are not in files. Nothing else in dir is touched.
@@ -34,7 +36,20 @@ var fileNameRe = regexp.MustCompile(`^doorwarden-[a-z0-9]+(-[a-z0-9]+)*\.yml$`)
 // with Header (so what Write creates is what it may later remove); otherwise
 // nothing is written. dir must exist. Write is not safe for concurrent calls
 // on the same dir.
-func Write(dir string, files Files) error {
+func Write(dir string, files Files) error { return WriteMode(dir, files, DefaultFileMode) }
+
+// DefaultFileMode is the permission of the rendered files.
+const DefaultFileMode os.FileMode = 0o600
+
+// ValidFileMode reports whether m is a permission WriteMode accepts: 0600,
+// or 0640 for deployments where Traefik reads through a dedicated group.
+func ValidFileMode(m os.FileMode) bool { return m == 0o600 || m == 0o640 }
+
+// WriteMode is Write with the file permission mode (see ValidFileMode).
+func WriteMode(dir string, files Files, mode os.FileMode) error {
+	if !ValidFileMode(mode) {
+		return fmt.Errorf("traefik: file mode %#o not allowed (0600 or 0640)", mode)
+	}
 	names := make([]string, 0, len(files))
 	for n, b := range files {
 		if !fileNameRe.MatchString(n) {
@@ -55,7 +70,7 @@ func Write(dir string, files Files) error {
 	var errs []error
 	changed := false
 	for _, n := range names {
-		w, err := writeIfChanged(dir, n, files[n])
+		w, err := writeIfChanged(dir, n, files[n], mode)
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -118,7 +133,7 @@ func ownedFile(p string) (bool, error) {
 	return string(buf) == Header, nil
 }
 
-func writeIfChanged(dir, name string, content []byte) (bool, error) {
+func writeIfChanged(dir, name string, content []byte, mode os.FileMode) (bool, error) {
 	target := filepath.Join(dir, name)
 	fi, err := os.Lstat(target)
 	switch {
@@ -128,6 +143,11 @@ func writeIfChanged(dir, name string, content []byte) (bool, error) {
 			return false, fmt.Errorf("traefik: read %s: %w", name, err)
 		}
 		if bytes.Equal(cur, content) {
+			if fi.Mode().Perm() != mode {
+				if err := os.Chmod(target, mode); err != nil {
+					return false, fmt.Errorf("traefik: chmod %s: %w", name, err)
+				}
+			}
 			return false, nil
 		}
 	case err == nil && fi.Mode()&fs.ModeSymlink != 0:
@@ -153,7 +173,7 @@ func writeIfChanged(dir, name string, content []byte) (bool, error) {
 	if _, err := tmp.Write(content); err != nil {
 		return false, fmt.Errorf("traefik: write %s: %w", name, err)
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		return false, fmt.Errorf("traefik: chmod %s: %w", name, err)
 	}
 	if err := tmp.Sync(); err != nil {
