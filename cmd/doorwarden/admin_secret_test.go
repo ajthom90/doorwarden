@@ -186,6 +186,27 @@ func TestAdminSecretRefusals(t *testing.T) {
 	}
 }
 
+// An invalid name is not echoed: it may be the secret itself.
+func TestAdminSecretInvalidNameNotEchoed(t *testing.T) {
+	t.Setenv("DOORWARDEN_MASTER_KEY", testMasterKey)
+	p := adminDB(t, false)
+	const arg = "ghp/Zq9xW3vT7mKk2"
+	for _, action := range []string{"set", "delete"} {
+		c, out, errs := secretRun(t, "v", action, arg, "-db", p)
+		if c == 0 {
+			t.Fatalf("%s accepted %q", action, arg)
+		}
+		for i := 0; i+4 <= len(arg); i++ {
+			if strings.Contains(out+errs, arg[i:i+4]) {
+				t.Fatalf("%s: fragment %q of the argument printed: %q", action, arg[i:i+4], out+errs)
+			}
+		}
+		if !strings.Contains(errs, "invalid secret name") {
+			t.Fatalf("%s: %q", action, errs)
+		}
+	}
+}
+
 // On a terminal the value is prompted twice without echo; differing
 // entries store nothing.
 func TestAdminSecretPrompt(t *testing.T) {

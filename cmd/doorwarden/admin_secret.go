@@ -97,7 +97,7 @@ func runAdminSecret(args []string, out io.Writer) int {
 		return fail(fmt.Errorf("%d unexpected argument(s) after the flags; the value is read from stdin, never from arguments", fs.NArg()))
 	}
 	if action != "list" && !app.ValidSecretName(name) {
-		return fail(fmt.Errorf("secret name %q must be 1-128 characters of A-Z a-z 0-9 . _ -", name))
+		return fail(errors.New("invalid secret name (allowed: A-Za-z0-9._-, max 128)"))
 	}
 	var box *secrets.Box
 	if action == "set" {
