@@ -295,7 +295,7 @@ func (a *auth) clientIP(r *http.Request) netip.Addr {
 }
 
 // parseHop parses one X-Forwarded-For entry: an address, optionally with a
-// port (1.2.3.4:80) or in brackets ([::1], [::1]:443).
+// port (192.0.2.1:80) or in brackets ([::1], [::1]:443).
 func parseHop(s string) (netip.Addr, bool) {
 	s = strings.TrimSpace(s)
 	if a, err := netip.ParseAddr(s); err == nil {
