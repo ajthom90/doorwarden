@@ -26,11 +26,95 @@ func TestCreateAdminOnce(t *testing.T) {
 	if err != nil || !ok || a.Username != "admin" || a.PasswordHash != "$argon2id$x" || !a.CreatedAt.Equal(t0) {
 		t.Fatalf("admin = %+v ok=%v err=%v", a, ok, err)
 	}
-	if err := s.SetAdminPassword(ctx, "$argon2id$z"); err != nil {
+	if a.Generation != 0 {
+		t.Fatalf("fresh generation = %d", a.Generation)
+	}
+	if _, err := s.ChangeAdminPassword(ctx, "$argon2id$z", 0); err != nil {
 		t.Fatal(err)
 	}
-	if a, _, _ := s.GetAdmin(ctx); a.PasswordHash != "$argon2id$z" {
+	if a, _, _ := s.GetAdmin(ctx); a.PasswordHash != "$argon2id$z" || a.Generation != 1 {
 		t.Fatalf("password not changed: %+v", a)
+	}
+}
+
+// ChangeAdminPassword bumps the credential generation and deletes every
+// session in one transaction, and refuses a stale expected generation.
+func TestChangeAdminPasswordGeneration(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	t0 := time.Unix(1_800_000_000, 0)
+	if err := s.CreateAdmin(ctx, "admin", "h0", t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(ctx, Session{IDHash: "a", Username: "admin", CSRF: "c", CreatedAt: t0, LastSeen: t0, Generation: 0}); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := s.ChangeAdminPassword(ctx, "h1", 0)
+	if err != nil || gen != 1 {
+		t.Fatalf("change gen=%d err=%v", gen, err)
+	}
+	if _, ok, _ := s.GetSession(ctx, "a"); ok {
+		t.Fatal("session survived a password change")
+	}
+	if _, err := s.ChangeAdminPassword(ctx, "h2", 0); !errors.Is(err, ErrStaleCredentials) {
+		t.Fatalf("stale change: %v", err)
+	}
+	if a, _, _ := s.GetAdmin(ctx); a.PasswordHash != "h1" || a.Generation != 1 {
+		t.Fatalf("stale change applied: %+v", a)
+	}
+	// ResetCredentials (CLI) bumps unconditionally, optionally replacing
+	// the hash, and also deletes sessions.
+	_ = s.CreateSession(ctx, Session{IDHash: "b", Username: "admin", CSRF: "c", CreatedAt: t0, LastSeen: t0, Generation: 1})
+	if err := s.ResetCredentials(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if a, _, _ := s.GetAdmin(ctx); a.PasswordHash != "h1" || a.Generation != 2 {
+		t.Fatalf("reset without hash: %+v", a)
+	}
+	if _, ok, _ := s.GetSession(ctx, "b"); ok {
+		t.Fatal("session survived ResetCredentials")
+	}
+	if err := s.ResetCredentials(ctx, "h3"); err != nil {
+		t.Fatal(err)
+	}
+	if a, _, _ := s.GetAdmin(ctx); a.PasswordHash != "h3" || a.Generation != 3 {
+		t.Fatalf("reset with hash: %+v", a)
+	}
+}
+
+// A session minted for a generation that a password change has since
+// superseded is never inserted (conditional insert), and a row that somehow
+// carries an old generation is not returned.
+func TestCreateSessionStaleGeneration(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	t0 := time.Unix(1_800_000_000, 0)
+	if err := s.CreateSession(ctx, Session{IDHash: "x", Username: "admin", CSRF: "c", CreatedAt: t0, LastSeen: t0}); !errors.Is(err, ErrStaleCredentials) {
+		t.Fatalf("session without admin: %v", err)
+	}
+	if err := s.CreateAdmin(ctx, "admin", "h0", t0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ChangeAdminPassword(ctx, "h1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(ctx, Session{IDHash: "old", Username: "admin", CSRF: "c", CreatedAt: t0, LastSeen: t0, Generation: 0}); !errors.Is(err, ErrStaleCredentials) {
+		t.Fatalf("stale session insert: %v", err)
+	}
+	if _, ok, _ := s.GetSession(ctx, "old"); ok {
+		t.Fatal("stale session inserted")
+	}
+	if err := s.CreateSession(ctx, Session{IDHash: "new", Username: "admin", CSRF: "c", CreatedAt: t0, LastSeen: t0, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, _ := s.GetSession(ctx, "new"); !ok || v.Generation != 1 {
+		t.Fatalf("current session = %+v ok=%v", v, ok)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE sessions SET generation = 0 WHERE id_hash = 'new'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetSession(ctx, "new"); ok {
+		t.Fatal("session with an old generation returned")
 	}
 }
 
@@ -68,6 +152,9 @@ func TestSessions(t *testing.T) {
 	s, _ := openTemp(t)
 	ctx := context.Background()
 	t0 := time.Unix(1_800_000_000, 0)
+	if err := s.CreateAdmin(ctx, "admin", "h", t0); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.CreateSession(ctx, Session{IDHash: "h1", Username: "admin", CSRF: "c1", CreatedAt: t0, LastSeen: t0}); err != nil {
 		t.Fatal(err)
 	}

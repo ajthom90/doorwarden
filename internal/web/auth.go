@@ -126,6 +126,10 @@ type auth struct {
 
 	tokMu      sync.Mutex
 	setupToken string
+
+	// afterVerify, when set (tests), runs between a successful password
+	// check and the store write that acts on it.
+	afterVerify func()
 }
 
 func newAuth(ctx context.Context, st *store.Store, cfg config.Web, hasher *Hasher, now func() time.Time, log *slog.Logger, setupToken string) (*auth, error) {
@@ -381,15 +385,18 @@ func (a *auth) middleware(next http.Handler) http.Handler {
 }
 
 // newSession creates a session for user, deleting oldHash (rotation), and
-// sets the cookie. It returns the CSRF token.
-func (a *auth) newSession(w http.ResponseWriter, r *http.Request, user string) (string, error) {
+// sets the cookie. gen is the credential generation the password was
+// verified against; when a concurrent change has moved it on the store
+// refuses the insert (store.ErrStaleCredentials) and no cookie is set. It
+// returns the CSRF token.
+func (a *auth) newSession(w http.ResponseWriter, r *http.Request, user string, gen int64) (string, error) {
 	if ck, err := r.Cookie(a.cookieName()); err == nil && validSessionID(ck.Value) {
 		_ = a.st.DeleteSession(r.Context(), hashID(ck.Value))
 	}
 	id := randToken(sessionIDBytes)
 	csrf := randToken(32)
 	now := a.now()
-	if err := a.st.CreateSession(r.Context(), store.Session{IDHash: hashID(id), Username: user, CSRF: csrf, CreatedAt: now, LastSeen: now}); err != nil {
+	if err := a.st.CreateSession(r.Context(), store.Session{IDHash: hashID(id), Username: user, CSRF: csrf, CreatedAt: now, LastSeen: now, Generation: gen}); err != nil {
 		return "", err
 	}
 	// Opportunistic cleanup of expired rows.
@@ -505,7 +512,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	a.tokMu.Unlock()
 	a.thr.success(ipKey)
 	a.thr.pin(userThrottleKey(req.Username))
-	csrf, err := a.newSession(w, r, req.Username)
+	csrf, err := a.newSession(w, r, req.Username, 0)
 	if err != nil {
 		s.internal(w, "setup session", err)
 		return
@@ -547,9 +554,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid user name or password")
 		return
 	}
+	if a.afterVerify != nil {
+		a.afterVerify()
+	}
 	a.thr.success(ipKey)
 	a.thr.success(userKey)
-	csrf, err := a.newSession(w, r, adm.Username)
+	csrf, err := a.newSession(w, r, adm.Username, adm.Generation)
+	if errors.Is(err, store.ErrStaleCredentials) {
+		// The password changed after it was read: the old password must not
+		// yield a session. Same answer as a wrong password.
+		writeErr(w, http.StatusUnauthorized, "invalid user name or password")
+		return
+	}
 	if err != nil {
 		s.internal(w, "login session", err)
 		return
@@ -620,15 +636,27 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "password hash", err)
 		return
 	}
-	if err := s.st.SetAdminPassword(r.Context(), h); err != nil {
+	if a.afterVerify != nil {
+		a.afterVerify()
+	}
+	// One transaction: the hash is replaced only if the generation is the
+	// one verified above, the generation is bumped, every session goes.
+	gen, err := s.st.ChangeAdminPassword(r.Context(), h, adm.Generation)
+	if errors.Is(err, store.ErrStaleCredentials) {
+		a.clearCookie(w)
+		writeErr(w, http.StatusConflict, "the password was changed concurrently; sign in again")
+		return
+	}
+	if err != nil {
 		s.internal(w, "password set", err)
 		return
 	}
-	if err := s.st.DeleteAllSessions(r.Context()); err != nil {
-		s.internal(w, "password sessions", err)
+	csrf, err := a.newSession(w, r, adm.Username, gen)
+	if errors.Is(err, store.ErrStaleCredentials) {
+		a.clearCookie(w)
+		writeErr(w, http.StatusConflict, "the password was changed concurrently; sign in again")
 		return
 	}
-	csrf, err := a.newSession(w, r, adm.Username)
 	if err != nil {
 		s.internal(w, "password session", err)
 		return

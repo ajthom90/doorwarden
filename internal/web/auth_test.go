@@ -402,3 +402,57 @@ func TestLoginThrottleSaturation(t *testing.T) {
 		t.Fatal("admin key not pinned")
 	}
 }
+
+// A password change that commits between a login's password check and its
+// session insert wins: the login mints no session and answers the generic
+// 401 (the old password must not yield a session).
+func TestLoginRacesPasswordChange(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	ctx := context.Background()
+	e.srv.auth.afterVerify = func() {
+		adm, _, _ := e.st.GetAdmin(ctx)
+		h, _ := e.srv.auth.hasher.Hash("an-entirely-new-password")
+		if _, err := e.st.ChangeAdminPassword(ctx, h, adm.Generation); err != nil {
+			t.Error(err)
+		}
+	}
+	c := e.anon()
+	w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("login racing a password change = %d %s", w.Code, w.Body)
+	}
+	if c.cookie != nil {
+		t.Fatalf("stale login set a cookie: %v", c.cookie)
+	}
+	if strings.Contains(w.Body.String(), "csrf") {
+		t.Fatalf("stale login body: %s", w.Body)
+	}
+}
+
+// Two password changes racing: the one whose verified generation is stale
+// is refused (409) and leaves no session behind.
+func TestPasswordChangeRace(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	ctx := context.Background()
+	e.srv.auth.afterVerify = func() {
+		adm, _, _ := e.st.GetAdmin(ctx)
+		h, _ := e.srv.auth.hasher.Hash("winner-password-123")
+		if _, err := e.st.ChangeAdminPassword(ctx, h, adm.Generation); err != nil {
+			t.Error(err)
+		}
+	}
+	w := c.do("POST", "/api/v1/auth/password", map[string]string{"current": testPassword, "new": "loser-password-1234"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("stale password change = %d %s", w.Code, w.Body)
+	}
+	e.srv.auth.afterVerify = nil
+	adm, _, _ := e.st.GetAdmin(ctx)
+	if !e.srv.auth.hasher.Verify(adm.PasswordHash, "winner-password-123") {
+		t.Fatal("the losing change overwrote the winner")
+	}
+	if w := c.do("GET", "/api/v1/auth/me", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("session after a concurrent password change = %d", w.Code)
+	}
+}
