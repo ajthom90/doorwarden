@@ -392,7 +392,7 @@ middlewares:
 An `ipAllowList` only works if Traefik sees real client addresses. Behind
 Docker's userland `docker-proxy` (TrueNAS SCALE publishes ports that way) it
 sees only the bridge gateway and rejects every client; see
-[deploy.md](deploy.md#web-ui-and-authentication).
+[deploy.md](deploy.md#web-ui-and-api-access).
 
 Rules: a name matches `[A-Za-z0-9_.-]+`; each definition has exactly one type
 key; no string may contain `{{` or `}}` (Traefik templating); a `chain` must
