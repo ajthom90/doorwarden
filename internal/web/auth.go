@@ -510,7 +510,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "setup session", err)
 		return
 	}
-	s.auditAs(r.Context(), "admin:"+req.Username, "created the administrator (first-run setup)")
+	s.auditAs(r.Context(), "local:"+req.Username, "created the administrator (first-run setup)")
 	writeJSON(w, http.StatusOK, map[string]any{"user": req.Username, "role": RoleAdmin, "csrf_token": csrf})
 }
 
@@ -554,7 +554,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "login session", err)
 		return
 	}
-	s.auditAs(r.Context(), "admin:"+adm.Username, "logged in")
+	s.auditAs(r.Context(), "local:"+adm.Username, "logged in")
 	writeJSON(w, http.StatusOK, map[string]any{"user": adm.Username, "role": RoleAdmin, "csrf_token": csrf})
 }
 
