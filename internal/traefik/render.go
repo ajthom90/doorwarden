@@ -306,7 +306,9 @@ func cleanPath(p string, abs bool) error {
 // It returns the content of RoutesFile and TLSFile, Problems for everything
 // not rendered (sorted), and an error only for invalid Options or input that
 // is a programming error (duplicate route keys, a name collision). Output is
-// deterministic for any input order.
+// deterministic for any input order. A quarantined route (store.Route
+// Quarantined) is not rendered but still wins its hostname, so no other
+// row is served under that name.
 func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Options) (Files, []Problem, error) {
 	ep := opts.EntryPoint
 	if ep == "" {
@@ -370,6 +372,11 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 		for _, l := range group[1:] {
 			probs = append(probs, Problem{Kind: KindShadowed, Key: l.Key, Hostname: h,
 				Detail: fmt.Sprintf("route %s not rendered: hostname %s is held by %s", l.Key, h, w.Key)})
+		}
+		if w.Quarantined {
+			// Not served until re-approved; the name stays held (the
+			// shadowed rows above are not served either).
+			continue
 		}
 		if p, ok := checkRoute(w, h, defined, opts.ExternalMiddlewares); !ok {
 			probs = append(probs, p)

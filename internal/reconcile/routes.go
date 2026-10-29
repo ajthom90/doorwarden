@@ -20,6 +20,9 @@ type RouteStore interface {
 	// and strictly before notAfter.
 	DeleteRouteIfDue(ctx context.Context, key string, notAfter time.Time) (bool, error)
 	SetRouteRemoval(ctx context.Context, key string, at *time.Time) error
+	// QuarantineRoute keeps key's route but stops it being rendered
+	// (store.ErrRouteNotFound when absent).
+	QuarantineRoute(ctx context.Context, key string) error
 	ListRoutes(ctx context.Context) ([]store.Route, error)
 }
 
@@ -44,6 +47,10 @@ type RouteStore interface {
 //     cancelled (or re-scheduled to a later time); otherwise nothing
 //     happens. CauseTakeover and CauseRename removals are decided on the
 //     current claimants and labels and are applied as planned.
+//     CauseQuarantine does not delete the row: it marks it quarantined
+//     (store.QuarantineRoute), so it is not rendered while its key stays
+//     Known (the hostname's incumbent) and its DNS records and
+//     certificates are kept; the next Published RouteWrite clears it.
 //   - ScheduleRemoval persists Action.RemovedAfter (required);
 //     CancelRemoval clears it. For a key without a route both do nothing
 //     (store.ErrRouteNotFound is swallowed): there is nothing to remove.
@@ -92,6 +99,9 @@ func (e *routeExecutor) apply(ctx context.Context, a Action) error {
 		}
 		return e.st.UpsertRoute(ctx, r)
 	case RouteRemove:
+		if a.Cause == CauseQuarantine {
+			return ignoreNotFound(e.st.QuarantineRoute(ctx, a.Key))
+		}
 		if a.Cause == CauseTakeover || a.Cause == CauseRename {
 			return e.st.DeleteRoute(ctx, a.Key)
 		}
@@ -147,7 +157,8 @@ func ObservedFromRoutes(routes []store.Route) (known map[string]KnownService, la
 			t := *r.RemovedAfter
 			ra = &t
 		}
-		known[r.Key] = KnownService{Key: r.Key, Source: r.Source, Zone: r.Zone, Hostname: r.Hostname, RemovedAfter: ra}
+		known[r.Key] = KnownService{Key: r.Key, Source: r.Source, Zone: r.Zone, Hostname: r.Hostname, RemovedAfter: ra,
+			Quarantined: r.Quarantined}
 		lastKnown[r.Key] = model.Backend{Scheme: r.Scheme, Host: r.Host, Port: r.Port, SkipVerify: r.SkipVerify}
 	}
 	return known, lastKnown

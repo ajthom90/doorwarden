@@ -583,3 +583,22 @@ func TestRenderChainTypeCaseInsensitive(t *testing.T) {
 		t.Fatalf("problems %v", probs)
 	}
 }
+
+// A quarantined route is not rendered, and it still holds its hostname: a
+// lower-ranked row for the same name is shadowed, not served.
+func TestRenderSkipsQuarantinedRoute(t *testing.T) {
+	q := rt("static:app", "app", 8080)
+	q.Quarantined = true
+	other := rt("docker:other", "app", 9090)
+	ok := rt("docker:ok", "ok", 8081)
+	_, _, d := mustRender(t, []store.Route{q, other, ok}, nil, nil, Options{})
+	if _, has := d.HTTP.Routers[Name("static:app")]; has {
+		t.Fatal("quarantined route rendered")
+	}
+	if _, has := d.HTTP.Routers[Name("docker:other")]; has {
+		t.Fatal("shadowed route rendered in place of the quarantined one")
+	}
+	if _, has := d.HTTP.Routers[Name("docker:ok")]; !has {
+		t.Fatal("other route missing")
+	}
+}

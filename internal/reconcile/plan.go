@@ -92,6 +92,11 @@ const AlertDNSMassMissing = "dns-mass-missing"
 // caller notifies, deduplicated per reason).
 const AlertPublishedInvalid = "published-invalid"
 
+// AlertQuarantined marks the Invalid of a quarantined service
+// (Observed.Quarantined) on the cycle its route is removed: the caller
+// notifies once. Later cycles repeat the Invalid without the alert.
+const AlertQuarantined = "service-quarantined"
+
 // RepairBreakerKey is the Key of the breaker Skip of provider/zone (zone
 // normalized): stable, and never a service key.
 func RepairBreakerKey(provider, zone string) string {
@@ -133,6 +138,10 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 		if e.heldInvalid {
 			// not routable, so never serving and never able to evict anyone
 			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true, incumbent: inc})
+		} else if p.quarantined(e) && e.err == nil {
+			// not served, but its hostname stays reserved: an incumbent
+			// whether or not its route still exists
+			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, incumbent: true})
 		} else if e.err == nil {
 			pubd := e.svc.State == model.StatePublished
 			_, routable := p.routeBackend(e.svc)
@@ -171,6 +180,10 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 				p.planLoser(e, l)
 			}
 			continue // never planService: its zone may no longer be configured
+		}
+		if p.quarantined(e) {
+			p.planQuarantine(e, losers)
+			continue
 		}
 		if l, lost := losers[e.svc.Key]; lost {
 			p.planLoser(e, l)
@@ -349,6 +362,38 @@ func (p *planner) planLoser(e entry, l loss) {
 		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: old, Key: e.svc.Key, Cause: CauseRename,
 			Svc: copySvc(e.svc), Reason: "service now declares " + e.host + " (held by " + l.winner.key +
 				"); its old route for " + old + " is removed"})
+	}
+}
+
+// quarantined reports whether e is a Pending service the approval gate
+// quarantined (Observed.Quarantined).
+func (p *planner) quarantined(e entry) bool {
+	return p.obs.Quarantined[e.svc.Key] && e.svc.State == model.StatePending
+}
+
+// planQuarantine stops serving a quarantined service: its route is
+// withdrawn (RouteRemove, CauseQuarantine: the row stays, marked; the
+// alerted Invalid accompanies that one removal, so the caller notifies
+// once) and an Invalid tells the operator to re-approve on
+// every cycle. Nothing else is planned for it: it is present, so its DNS
+// records and certificates are kept, and it keeps its hostname claim. If a
+// higher source rank won the name, it is a Conflict as well.
+func (p *planner) planQuarantine(e entry, losers map[string]loss) {
+	x := Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc),
+		Reason: "backend changed; re-approve to resume: the service's backend or middlewares differ from what was approved, so " +
+			e.host + " is not served (its DNS record, certificate and hostname are kept)"}
+	k, isKnown := p.obs.Known[e.svc.Key]
+	withdraw := isKnown && !k.Quarantined
+	if withdraw {
+		x.Alert = AlertQuarantined
+	}
+	p.emit(x)
+	if withdraw {
+		p.emit(Action{Kind: RouteRemove, Zone: normName(k.Zone), Host: normName(k.Hostname), Key: e.svc.Key,
+			Cause: CauseQuarantine, Svc: copySvc(e.svc), Reason: "quarantined until re-approved (backend changed)"})
+	}
+	if l, lost := losers[e.svc.Key]; lost {
+		p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
 	}
 }
 

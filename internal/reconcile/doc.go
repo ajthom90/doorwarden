@@ -35,6 +35,17 @@
 // over (e.g. its Known zone was removed from the config) only Invalid is
 // emitted and nothing is removed.
 //
+// Quarantine: a Pending service in Observed.Quarantined (approve mode: its
+// stored approval no longer matches its content, e.g. the source reports
+// another backend port) is not served. On the first such cycle its route
+// is withdrawn with RouteRemove{Cause: CauseQuarantine}, which keeps the row
+// but marks it quarantined (the renderer skips it), together with an
+// Invalid ("backend changed; re-approve to resume") carrying
+// AlertQuarantined; later cycles repeat the Invalid without the alert. It
+// claims its hostname as an incumbent, so a same-rank squatter gets only a
+// Conflict, and being present its DNS records and certificates are kept.
+// Re-approval makes it Published: its RouteWrite clears the mark.
+//
 // Middlewares fail closed: a service with an undefined middleware is Invalid
 // and so never routable, and it can never evict a working neighbor. A route
 // it already has stays as last written: its stored middlewares are what the

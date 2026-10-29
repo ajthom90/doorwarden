@@ -71,13 +71,14 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 		}
 	}
 
-	desired, up := a.gather(ctx, res.Unavailable)
+	desired, up, quarantined := a.gather(ctx, res.Unavailable)
 	if err := ctx.Err(); err != nil {
 		res.Err = err
 		return res
 	}
 
 	obs, err := a.observe(ctx, now, res.Unavailable)
+	obs.Quarantined = quarantined
 	// The next re-render at a certificate expiry comes from the rows read
 	// this cycle, dry run included (a stale value would re-arm in the past).
 	a.nextCert = NextCertExpiry(obs.Certs, now)
@@ -147,8 +148,9 @@ func (a *App) finishCycle(start time.Time, dry bool, up map[string]bool, desired
 
 // gather lists every source and applies the approval gate. unavailable is
 // filled with every unknown source name.
-func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.Service, map[string]bool) {
+func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.Service, map[string]bool, map[string]bool) {
 	up := map[string]bool{}
+	quarantined := map[string]bool{}
 	var desired []model.Service
 	var listing []listed
 	down := map[string]bool{}
@@ -170,7 +172,7 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		for _, sp := range a.sources {
 			mark(sp.name())
 		}
-		return desired, up
+		return desired, up, quarantined
 	}
 	a.logChange(ctx, "overrides", "error", "")
 	for _, sp := range a.sources {
@@ -206,7 +208,8 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		if mode == "" {
 			mode = approval.ModeAuto
 		}
-		res, err := a.gate.Resolve(ctx, mode, svcs)
+		rd, err := a.gate.ResolveDetail(ctx, mode, svcs)
+		res := rd.Services
 		if err != nil {
 			// Its approvals could not be loaded: its services would look
 			// absent and be removed. Unknown instead.
@@ -220,6 +223,12 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		for _, s := range svcs {
 			a.alias(name, s.Source)
 		}
+		for _, k := range rd.Migrated {
+			a.appendActivity(ctx, "info", "approval", "service "+k+": migrated approval v1->v2 (the approved content is unchanged; the approval now also covers the backend and the middleware order)")
+		}
+		for k := range rd.Quarantined {
+			quarantined[k] = true
+		}
 		for i := range ls {
 			ls[i].state = stateOf(res, ls[i].svc, mode)
 		}
@@ -229,7 +238,7 @@ func (a *App) gather(ctx context.Context, unavailable map[string]bool) ([]model.
 		a.logChange(ctx, "source/"+name, "info", "")
 		desired = append(desired, res...)
 	}
-	return desired, up
+	return desired, up, quarantined
 }
 
 func (a *App) alias(name, src string) {
@@ -295,6 +304,14 @@ func (a *App) observe(ctx context.Context, now time.Time, unavailable map[string
 	return obs, nil
 }
 
+// backendOf is s's backend as scheme://host:port ("" for nil).
+func backendOf(s *model.Service) string {
+	if s == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s://%s:%d", s.Backend.Scheme, s.Backend.Host, s.Backend.Port)
+}
+
 // countAndAlert counts the plan's actions per kind and notifies an operator
 // of every Alert (and of hostname/DNS conflicts), deduplicated by key; a
 // Published service gone Invalid while it holds its route
@@ -313,6 +330,12 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 			}
 		}
 		switch {
+		case x.Alert == reconcile.AlertQuarantined:
+			// Planned once, with the route's withdrawal.
+			a.notify(ctx, notify.Event{Kind: "service.quarantined", Severity: notify.Warning,
+				Subject: "doorwarden: " + x.Key + " changed; re-approve to resume", Message: x.Reason,
+				Fields:    map[string]string{"key": x.Key, "zone": x.Zone, "host": x.Host},
+				DedupeKey: "quarantined/" + x.Key + "/" + backendOf(x.Svc)})
 		case x.Alert == reconcile.AlertPublishedInvalid:
 			a.notify(ctx, notify.Event{Kind: "service.invalid", Severity: notify.Warning,
 				Subject: "doorwarden: " + x.Key + " has invalid labels", Message: x.Reason,
