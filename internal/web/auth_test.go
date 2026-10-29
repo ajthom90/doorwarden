@@ -375,3 +375,30 @@ func TestPasswordChangeInvalidatesSessions(t *testing.T) {
 		t.Fatalf("new password: %d", w.Code)
 	}
 }
+
+// Flooding the throttle table with locked addresses does not open an
+// unthrottled path to the administrator.
+func TestLoginThrottleSaturation(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	th := e.srv.auth.thr
+	th.mu.Lock()
+	th.maxKeys = 20
+	th.mu.Unlock()
+	for k := 0; k < 20; k++ {
+		for i := 0; i < throttleThreshold; i++ {
+			th.fail(fmt.Sprintf("ip:198.51.100.%d", 100+k))
+		}
+	}
+	// A new address trying the admin is refused, right password or not.
+	for i := 0; i < throttleThreshold+2; i++ {
+		c := e.anon()
+		c.remote = fmt.Sprintf("203.0.113.%d:1", 60+i)
+		if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d from a new address while saturated: %d", i, w.Code)
+		}
+	}
+	if th.pinned[userThrottleKey("admin")] == nil {
+		t.Fatal("admin key not pinned")
+	}
+}

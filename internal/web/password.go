@@ -124,12 +124,20 @@ func parsePHC(s string) (Argon2Params, []byte, []byte, bool) {
 // or user name) the key is locked for throttleBase, doubling with every
 // further failure up to throttleMax. A success resets the key; an entry
 // with no failure for throttleForget is dropped.
+//
+// Fail closed under table pressure: pinned keys (the administrator's user
+// name) live in their own map that is never evicted, so the per-user lock
+// always holds however many addresses or names an attacker cycles through.
+// The general table holds at most throttleMaxKeys entries; when it is full
+// of locked entries a new key cannot be recorded and every key not in the
+// table is refused until the earliest lock ends (saturated).
 const (
 	throttleThreshold = 5
 	throttleBase      = 30 * time.Second
 	throttleMax       = 15 * time.Minute
 	throttleForget    = time.Hour
 	throttleMaxKeys   = 10000
+	throttleMaxPinned = 8
 )
 
 type throttleEntry struct {
@@ -139,24 +147,70 @@ type throttleEntry struct {
 }
 
 type throttle struct {
-	mu  sync.Mutex
-	m   map[string]*throttleEntry
-	now func() time.Time
+	mu        sync.Mutex
+	m         map[string]*throttleEntry
+	pinned    map[string]*throttleEntry
+	saturated time.Time // until: keys not in m are refused
+	now       func() time.Time
+	maxKeys   int
 }
 
 func newThrottle(now func() time.Time) *throttle {
-	return &throttle{m: map[string]*throttleEntry{}, now: now}
+	return &throttle{m: map[string]*throttleEntry{}, pinned: map[string]*throttleEntry{}, now: now, maxKeys: throttleMaxKeys}
+}
+
+// pin makes key non-evictable (bounded; the oldest unlocked pin is
+// replaced when full).
+func (t *throttle) pin(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.pinned[key]; ok {
+		return
+	}
+	if len(t.pinned) >= throttleMaxPinned {
+		now := t.now()
+		for k, v := range t.pinned {
+			if !now.Before(v.lockedUntil) {
+				delete(t.pinned, k)
+				break
+			}
+		}
+		if len(t.pinned) >= throttleMaxPinned {
+			return
+		}
+	}
+	e := t.m[key]
+	if e == nil {
+		e = &throttleEntry{}
+	}
+	delete(t.m, key)
+	t.pinned[key] = e
 }
 
 // allowed reports whether key may try now; when not, how long to wait.
 func (t *throttle) allowed(key string) (bool, time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	e := t.m[key]
+	now := t.now()
+	e := t.pinned[key]
 	if e == nil {
+		e = t.m[key]
+	}
+	if e == nil {
+		if now.Before(t.saturated) {
+			return false, t.saturated.Sub(now)
+		}
+		if len(t.m) >= t.maxKeys {
+			// A failure of this key could not be recorded: refuse it
+			// while every entry is locked.
+			t.prune(now)
+			if until := t.allLocked(now); !until.IsZero() {
+				t.saturated = until
+				return false, until.Sub(now)
+			}
+		}
 		return true, 0
 	}
-	now := t.now()
 	if now.Before(e.lockedUntil) {
 		return false, e.lockedUntil.Sub(now)
 	}
@@ -168,17 +222,24 @@ func (t *throttle) fail(key string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
-	e := t.m[key]
+	e := t.pinned[key]
 	if e == nil {
-		if len(t.m) >= throttleMaxKeys {
+		e = t.m[key]
+	}
+	if e == nil {
+		if len(t.m) >= t.maxKeys {
 			t.prune(now)
 		}
-		if len(t.m) >= throttleMaxKeys {
-			// Full of live entries: forget the oldest unlocked one.
+		if len(t.m) >= t.maxKeys {
+			// Full: forget the oldest unlocked entry.
 			var oldK string
 			var old *throttleEntry
+			earliest := time.Time{}
 			for k, v := range t.m {
 				if now.Before(v.lockedUntil) {
+					if earliest.IsZero() || v.lockedUntil.Before(earliest) {
+						earliest = v.lockedUntil
+					}
 					continue
 				}
 				if old == nil || v.last.Before(old.last) {
@@ -186,7 +247,10 @@ func (t *throttle) fail(key string) {
 				}
 			}
 			if old == nil {
-				return // every entry is locked; this key stays unthrottled until one expires
+				// Every entry is locked: the key cannot be recorded, so
+				// unrecorded keys are refused until a lock ends.
+				t.saturated = earliest
+				return
 			}
 			delete(t.m, oldK)
 		}
@@ -208,7 +272,29 @@ func (t *throttle) fail(key string) {
 func (t *throttle) success(key string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if e := t.pinned[key]; e != nil {
+		*e = throttleEntry{}
+		return
+	}
 	delete(t.m, key)
+}
+
+// allLocked returns the earliest lock end when the table is full and every
+// entry is locked, else the zero time.
+func (t *throttle) allLocked(now time.Time) time.Time {
+	if len(t.m) < t.maxKeys {
+		return time.Time{}
+	}
+	var earliest time.Time
+	for _, v := range t.m {
+		if !now.Before(v.lockedUntil) {
+			return time.Time{}
+		}
+		if earliest.IsZero() || v.lockedUntil.Before(earliest) {
+			earliest = v.lockedUntil
+		}
+	}
+	return earliest
 }
 
 func (t *throttle) prune(now time.Time) {

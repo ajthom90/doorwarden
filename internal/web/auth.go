@@ -145,9 +145,12 @@ func newAuth(ctx context.Context, st *store.Store, cfg config.Web, hasher *Hashe
 	if _, err := rand.Read(a.hdrKey); err != nil {
 		return nil, err
 	}
-	_, exists, err := st.GetAdmin(ctx)
+	adm, exists, err := st.GetAdmin(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if exists {
+		a.thr.pin(userThrottleKey(adm.Username))
 	}
 	if !exists {
 		if setupToken == "" {
@@ -414,6 +417,11 @@ func validUsername(u string) bool {
 	return true
 }
 
+// userThrottleKey is the throttle key of a user name.
+func userThrottleKey(name string) string {
+	return "user:" + strings.ToLower(truncate(name, maxUsernameLen))
+}
+
 func passwordProblem(pw string) string {
 	switch {
 	case len(pw) < minPasswordLen:
@@ -496,6 +504,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	a.setupToken = ""
 	a.tokMu.Unlock()
 	a.thr.success(ipKey)
+	a.thr.pin(userThrottleKey(req.Username))
 	csrf, err := a.newSession(w, r, req.Username)
 	if err != nil {
 		s.internal(w, "setup session", err)
@@ -515,7 +524,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	a := s.auth
 	ipKey := a.clientKey(r)
-	userKey := "user:" + strings.ToLower(truncate(req.Username, maxUsernameLen))
+	userKey := userThrottleKey(req.Username)
 	if a.locked(w, ipKey, userKey) {
 		return
 	}
@@ -588,7 +597,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := s.auth
-	userKey := "user:" + strings.ToLower(p.User)
+	userKey := userThrottleKey(p.User)
 	if a.locked(w, userKey) {
 		return
 	}

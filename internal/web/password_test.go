@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -67,5 +68,42 @@ func TestThrottleLockoutAndBackoff(t *testing.T) {
 	th.success("ip:a")
 	if ok, _ := th.allowed("ip:a"); !ok {
 		t.Fatal("success did not reset")
+	}
+}
+
+// A table full of locked entries fails closed: a new address is refused,
+// and the pinned administrator lock holds regardless of table pressure.
+func TestThrottleSaturationFailsClosed(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	th := newThrottle(func() time.Time { return now })
+	th.maxKeys = 50
+	th.pin("user:admin")
+	for i := 0; i < throttleThreshold; i++ {
+		th.fail("user:admin")
+	}
+	for k := 0; k < th.maxKeys; k++ {
+		for i := 0; i < throttleThreshold; i++ {
+			th.fail(fmt.Sprintf("ip:198.51.100.%d", k))
+		}
+	}
+	// One more address: cannot be recorded, so it is refused.
+	th.fail("ip:203.0.113.1")
+	if ok, retry := th.allowed("ip:203.0.113.1"); ok || retry <= 0 {
+		t.Fatal("unrecordable key allowed while the table is full of locks")
+	}
+	if ok, _ := th.allowed("user:admin"); ok {
+		t.Fatal("pinned user lock lost under table pressure")
+	}
+	if _, ok := th.m["user:admin"]; ok || th.pinned["user:admin"] == nil {
+		t.Fatal("pinned key in the evictable table")
+	}
+	// Once the locks end, new keys are allowed again; the user lock ran out
+	// as well.
+	now = now.Add(throttleMax + time.Second)
+	if ok, _ := th.allowed("ip:203.0.113.1"); !ok {
+		t.Fatal("still saturated after the locks ended")
+	}
+	if ok, _ := th.allowed("user:admin"); !ok {
+		t.Fatal("user lock never ended")
 	}
 }
