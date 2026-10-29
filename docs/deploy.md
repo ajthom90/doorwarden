@@ -224,7 +224,10 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   reset-password` also sets a new random password, printed once on the
   terminal (never logged), and creates the administrator (`-user`, default
   `admin`) if none exists. Both work on the database (`-db`, default
-  `$DOORWARDEN_DB`) while the server runs.
+  `$DOORWARDEN_DB`) while the server runs. They refuse to run as a user
+  other than the database file's owner (e.g. `docker exec -u 0`), since
+  SQLite's `-wal`/`-shm` files would then belong to that user and lock the
+  server out; `-allow-owner-mismatch` overrides.
 - **CSRF.** Every state-changing request needs the `X-Doorwarden-CSRF`
   header (the token returned by login, setup and `GET /api/v1/auth/me`), a
   JSON body, and an `Origin` that matches the request host or one of

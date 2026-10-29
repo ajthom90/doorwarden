@@ -128,3 +128,25 @@ func TestAdminErrors(t *testing.T) {
 		t.Fatal("unlock without an administrator succeeded")
 	}
 }
+
+// Run as another user than the database's owner (typically root via
+// `docker exec`), the CLI would leave root-owned -wal/-shm files the
+// server cannot open: it refuses unless -allow-owner-mismatch is given.
+func TestAdminRefusesForeignOwner(t *testing.T) {
+	p := adminDB(t, true)
+	old := dbOwner
+	dbOwner = func(string) (int, bool) { return 4242, true }
+	t.Cleanup(func() { dbOwner = old })
+	before, _, _ := openDB(t, p).GetAdmin(context.Background())
+	var out bytes.Buffer
+	if c := run([]string{"admin", "unlock", "-db", p}, &out); c == 0 {
+		t.Fatalf("ran as a foreign user: %s", out.String())
+	}
+	after, _, _ := openDB(t, p).GetAdmin(context.Background())
+	if after.Generation != before.Generation {
+		t.Fatal("refused run still changed the database")
+	}
+	if c := run([]string{"admin", "unlock", "-db", p, "-allow-owner-mismatch"}, &out); c != 0 {
+		t.Fatalf("override refused: %d", c)
+	}
+}

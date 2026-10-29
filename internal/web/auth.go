@@ -282,8 +282,8 @@ func (a *auth) clientIP(r *http.Request) netip.Addr {
 	}
 	client := peer
 	for i := len(hops) - 1; i >= 0; i-- {
-		h, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
-		if err != nil {
+		h, ok := parseHop(hops[i])
+		if !ok {
 			return client
 		}
 		client = h.Unmap()
@@ -292,6 +292,24 @@ func (a *auth) clientIP(r *http.Request) netip.Addr {
 		}
 	}
 	return client
+}
+
+// parseHop parses one X-Forwarded-For entry: an address, optionally with a
+// port (1.2.3.4:80) or in brackets ([::1], [::1]:443).
+func parseHop(s string) (netip.Addr, bool) {
+	s = strings.TrimSpace(s)
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a, true
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		return ap.Addr(), true
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		if a, err := netip.ParseAddr(s[1 : len(s)-1]); err == nil && a.Is6() {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // watchUnsetProxies warns, once each, when web.trusted_proxies is unset but

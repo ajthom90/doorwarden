@@ -29,6 +29,10 @@ database (host access is the authority), also while the server runs.
                   is unchanged.
 
   -db PATH        SQLite database (default $DOORWARDEN_DB or /data/doorwarden.db)
+  -allow-owner-mismatch
+                  run although the database file belongs to another user
+                  (refused by default: files SQLite creates would then be
+                  owned by this user, e.g. root, and lock the server out)
 `
 
 // runAdmin implements `doorwarden admin ...`. Secrets go to out (stdout)
@@ -47,6 +51,7 @@ func runAdmin(args []string, out io.Writer) int {
 	}
 	dbPath := fs.String("db", def, "SQLite database (env DOORWARDEN_DB)")
 	user := fs.String("user", "admin", "user name when reset-password creates the administrator")
+	allowOwner := fs.Bool("allow-owner-mismatch", false, "run although the database belongs to another user")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -57,6 +62,12 @@ func runAdmin(args []string, out io.Writer) int {
 	// Never create an empty database by mistyping the path.
 	if _, err := os.Stat(*dbPath); err != nil {
 		return fail(fmt.Errorf("database %s: %w", *dbPath, err))
+	}
+	// SQLite creates -wal/-shm files owned by whoever opens the database;
+	// root-owned ones would lock the server (running as the file's owner)
+	// out of it.
+	if uid, mismatch := dbOwner(*dbPath); mismatch && !*allowOwner {
+		return fail(fmt.Errorf("database %s belongs to uid %d, but this runs as uid %d; run it as that user (e.g. docker exec -u %d ...) or pass -allow-owner-mismatch", *dbPath, uid, os.Geteuid(), uid))
 	}
 	st, err := store.Open(*dbPath)
 	if err != nil {

@@ -53,6 +53,12 @@ func TestClientIPRightmostUntrusted(t *testing.T) {
 		{"192.0.2.10:1", []string{"junk, 198.51.100.7"}, "198.51.100.7"},
 		// Every entry trusted: the leftmost of them.
 		{"192.0.2.10:1", []string{"192.0.2.13, 192.0.2.11"}, "192.0.2.13"},
+		// Entries with a port or brackets are addresses too.
+		{"192.0.2.10:1", []string{"198.51.100.7:80"}, "198.51.100.7"},
+		{"192.0.2.10:1", []string{"[2001:db8::7]"}, "2001:db8::7"},
+		{"192.0.2.10:1", []string{"[2001:db8::7]:443"}, "2001:db8::7"},
+		{"192.0.2.10:1", []string{"198.51.100.7:80, 192.0.2.11:1234"}, "198.51.100.7"},
+		{"192.0.2.10:1", []string{"198.51.100.7, [::ffff:192.0.2.11]:9"}, "198.51.100.7"},
 		// The rightmost entry unparseable: fall back to the peer.
 		{"192.0.2.10:1", []string{"198.51.100.7, junk"}, "192.0.2.10"},
 		// Peer not a trusted proxy: XFF ignored.
