@@ -411,6 +411,19 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   the first requests all come from one address. This setting only affects
   the client address; it never authenticates anyone (that is
   `web.trusted_header`).
+- **Published ports can hide the real client address (TrueNAS).** When
+  Docker publishes a container port through its userland `docker-proxy`
+  (the default on TrueNAS SCALE), the container sees every connection as
+  coming from the bridge gateway (for example `172.30.250.1`), whoever the
+  real client is. Verified on TrueNAS SCALE 27: a `403` from an `ipAllowList`
+  middleware for a client inside the allowed range. Consequences: an
+  `ipAllowList` on Traefik cannot restrict by client, and Doorwarden's login
+  throttling treats all UI users as one client (it fails toward throttling,
+  never open). Do not rely on client addresses for access control with this
+  setup. To get real client addresses run Traefik on the host network
+  (`network_mode: host`, entry points on the real ports, reaching Doorwarden
+  through its published loopback port), then test the allowlist from an
+  address outside the range before relying on it.
 - **Locked out / lost password.** With shell access to the host:
   `docker exec <project>-doorwarden-1 /doorwarden admin unlock` ends every
   session and clears all login limits; `docker exec <project>-doorwarden-1
