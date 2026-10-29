@@ -172,3 +172,58 @@ request.
 - Verify published hosts with `scripts/verify.sh`.
 
 See [migration.md](migration.md) when replacing Nginx Proxy Manager.
+
+## Web UI and API access
+
+Everything on the control plane's HTTP port requires authentication except
+`/healthz`, `/api/v1/auth/status`, the first-run setup and the login
+endpoints. That includes `/metrics` (scrape it with a session or through a
+trusted-header proxy) and the event stream `/api/v1/events`.
+
+- **First-run setup.** While no administrator exists, Doorwarden logs a
+  one-time setup token at start-up (`WARN no administrator yet: first-run
+  setup token ...`; read it with `docker logs doorwarden`). Setup
+  (`POST /api/v1/auth/setup` with user name, password of at least 12
+  characters and the token) creates the only administrator; it is refused
+  once one exists, and two concurrent attempts cannot both succeed. The token
+  changes on every restart until setup is done. A token was chosen over a
+  localhost-only setup because the UI is normally reached through Traefik.
+- **Sessions.** Passwords are hashed with argon2id. A session cookie
+  (`__Host-doorwarden_session`: HttpOnly, Secure, SameSite=Strict) expires
+  after `web.session_idle` (8h) without use and `web.session_max` (7d) in
+  all. Logout and a password change end sessions server side. Login is
+  throttled per client address and per user name: after 5 failures the key
+  is locked for 30s, doubling up to 15 minutes. Set `web.cookie_insecure:
+  true` only when the UI is served over plain HTTP on a trusted LAN.
+- **CSRF.** Every state-changing request needs the `X-Doorwarden-CSRF`
+  header (the token returned by login, setup and `GET /api/v1/auth/me`), a
+  JSON body, and an `Origin` that matches the request host or one of
+  `web.allowed_origins` (`scheme://host[:port]`).
+- **Trusted header (optional).** With `web.trusted_header.proxies` set to
+  CIDRs, a request whose TCP peer is in those ranges is authenticated by
+  `web.trusted_header.user_header` (default `Remote-User`) with
+  `web.trusted_header.role` (`viewer` by default, or `admin`). The peer
+  address is the connection's, never `X-Forwarded-For`; from any other peer
+  the header is stripped. An empty list turns it off. Only list the proxy
+  that sets the header (e.g. Traefik with forward auth) and make sure it
+  overwrites any client-sent copy.
+
+### Editing the config from the UI
+
+`GET /api/v1/config` returns the config file with every secret replaced by
+`<masked>` (`secret:` references and plain `${VAR}` placeholders are shown,
+since they are not secrets). `PUT /api/v1/config` takes the edited document;
+a `<masked>` value keeps the current one. The document is validated like at
+start-up and written atomically (mode 0600), so the config file must be
+writable by the container (it cannot be a read-only mount for this). Changes
+take effect at the next restart: the running reconciler, DNS providers and
+ACME manager are not rebuilt mid-cycle or mid-order.
+
+### Per-service overrides
+
+Publish/unpublish, rename, port and skip-verify set in the UI are stored in
+the database and applied every cycle before the approval gate. In approve
+mode a rename or skip-verify change requires approving the service again.
+Unpublishing removes the service like a disappearance: its route and DNS
+records are scheduled for removal after `settings.grace_period` (24h by
+default); publishing again within the grace cancels the removal.

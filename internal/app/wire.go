@@ -192,8 +192,23 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 			_ = a.Close(context.Background())
 			return fmt.Errorf("listen %s: %w", f.Listen, err)
 		}
-		srv = &http.Server{Handler: web.NewMux(web.MuxOptions{Health: a.HealthHandler()}),
-			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
+		api, err := web.NewServer(ctx, web.Options{
+			Store: st, Control: a, Config: cfg, ConfigPath: f.Config,
+			ValidateConfig: func(raw []byte) error { return validateConfigBytes(raw, env, box != nil) },
+			Health:         a.HealthHandler(), Metrics: a.MetricsHandler(), Log: log,
+		})
+		if err != nil {
+			_ = ln.Close()
+			_ = a.Close(context.Background())
+			return fmt.Errorf("http api: %w", err)
+		}
+		defer api.Close()
+		a.SetEventSink(api.Events().Publish)
+		// WriteTimeout bounds every response except the SSE stream, which
+		// lifts it per response (web/sse.go).
+		srv = &http.Server{Handler: api, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+			WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
+			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn)}
 		go func() { srvErr <- srv.Serve(ln) }()
 	}
 	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers))
@@ -236,6 +251,23 @@ func LoadConfig(path string, env func(string) (string, bool)) (*config.Config, e
 		return nil, fmt.Errorf("invalid config %s: %w", path, errors.Join(errs...))
 	}
 	return cfg, nil
+}
+
+// validateConfigBytes checks a config document as LoadConfig would at the
+// next start (PUT /api/v1/config): parse, Validate with the DNS registry's
+// capabilities, and the master-key requirement.
+func validateConfigBytes(raw []byte, env func(string) (string, bool), haveMasterKey bool) error {
+	cfg, err := config.Parse(raw, env)
+	if err != nil {
+		return err
+	}
+	if errs := cfg.Validate(dns.ConfigCaps()); len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	if !haveMasterKey && needsMasterKey(cfg) {
+		return errors.New("the config uses secret: references or ACME issuers, which need DOORWARDEN_MASTER_KEY (not set)")
+	}
+	return nil
 }
 
 func hasIssuer(cfg *config.Config) bool {

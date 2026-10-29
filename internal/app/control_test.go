@@ -174,3 +174,18 @@ func TestRenameNeedsReapproval(t *testing.T) {
 		t.Fatalf("renamed service still approved: %+v", s)
 	}
 }
+
+func TestValidateConfigBytes(t *testing.T) {
+	env := func(string) (string, bool) { return "", false }
+	ok := "zones:\n  - name: example.test\n    target_ip: 192.0.2.10\n"
+	if err := validateConfigBytes([]byte(ok), env, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfigBytes([]byte("zones:\n  - name: example.test\n    target_ip: nope\n"), env, false); err == nil {
+		t.Fatal("invalid config accepted")
+	}
+	issuer := ok + "    certificate: {issuer: le, challenge: dns-01, dns_provider: cf}\nproviders:\n  cf: {type: cloudflare, api_token: x}\nissuers:\n  le: {email: a@example.test}\n"
+	if err := validateConfigBytes([]byte(issuer), env, false); err == nil || !strings.Contains(err.Error(), "MASTER_KEY") {
+		t.Fatalf("master key requirement: %v", err)
+	}
+}
