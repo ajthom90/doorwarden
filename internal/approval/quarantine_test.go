@@ -36,12 +36,12 @@ func TestResolveQuarantinesChangedApproved(t *testing.T) {
 	if err := f.SetApproval(ctx, s.Key, Fingerprint(s)); err != nil {
 		t.Fatal(err)
 	}
-	r, err := g.ResolveDetail(ctx, ModeApprove, []model.Service{s})
+	r, err := g.ResolveDetail(ctx, ModeApprove, []model.Service{s}, Options{})
 	if err != nil || r.Services[0].State != model.StatePublished || len(r.Quarantined) != 0 {
 		t.Fatalf("unchanged: %+v %v", r, err)
 	}
 	s.Backend.Port = 8081
-	r, err = g.ResolveDetail(ctx, ModeApprove, []model.Service{s})
+	r, err = g.ResolveDetail(ctx, ModeApprove, []model.Service{s}, Options{})
 	if err != nil || r.Services[0].State != model.StatePending || !r.Quarantined[s.Key] || len(r.Migrated) != 0 {
 		t.Fatalf("changed: %+v %v", r, err)
 	}
@@ -52,7 +52,7 @@ func TestResolveQuarantinesChangedApproved(t *testing.T) {
 	if err := g.Approve(ctx, s.Key, Fingerprint(s)); err != nil {
 		t.Fatal(err)
 	}
-	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{s})
+	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{s}, Options{})
 	if r.Services[0].State != model.StatePublished || r.Quarantined[s.Key] {
 		t.Fatalf("re-approved: %+v", r)
 	}
@@ -64,18 +64,18 @@ func TestResolveQuarantineOnlyWithStaleApproval(t *testing.T) {
 	f := newFake()
 	g := NewGate(f)
 	s := svc("docker:a", model.StateDiscovered)
-	r, _ := g.ResolveDetail(ctx, ModeApprove, []model.Service{s})
+	r, _ := g.ResolveDetail(ctx, ModeApprove, []model.Service{s}, Options{})
 	if r.Services[0].State != model.StatePending || len(r.Quarantined) != 0 {
 		t.Fatalf("unapproved: %+v", r)
 	}
 	_ = f.SetApproval(ctx, s.Key, "stale")
-	r, _ = g.ResolveDetail(ctx, ModeAuto, []model.Service{s})
+	r, _ = g.ResolveDetail(ctx, ModeAuto, []model.Service{s}, Options{})
 	if r.Services[0].State != model.StatePublished || len(r.Quarantined) != 0 || len(r.Migrated) != 0 {
 		t.Fatalf("auto: %+v", r)
 	}
 	// Stopped/Error keep their state and are never quarantined.
 	st := svc("docker:a", model.StateStopped)
-	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{st})
+	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{st}, Options{})
 	if r.Services[0].State != model.StateStopped || len(r.Quarantined) != 0 {
 		t.Fatalf("stopped: %+v", r)
 	}
@@ -89,14 +89,14 @@ func TestResolveMigratesV1Approval(t *testing.T) {
 	g := NewGate(f)
 	s := svc("docker:a", model.StateDiscovered)
 	_ = f.SetApproval(ctx, s.Key, FingerprintV1(s))
-	r, err := g.ResolveDetail(ctx, ModeApprove, []model.Service{s})
+	r, err := g.ResolveDetail(ctx, ModeApprove, []model.Service{s}, opts(false, s))
 	if err != nil || r.Services[0].State != model.StatePublished || len(r.Migrated) != 1 || r.Migrated[0] != s.Key || len(r.Quarantined) != 0 {
 		t.Fatalf("migrate: %+v %v", r, err)
 	}
 	if f.m[s.Key] != Fingerprint(s) {
 		t.Fatal("not rewritten to v2")
 	}
-	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{s})
+	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{s}, Options{})
 	if len(r.Migrated) != 0 || r.Services[0].State != model.StatePublished {
 		t.Fatalf("second resolve: %+v", r)
 	}
@@ -104,7 +104,7 @@ func TestResolveMigratesV1Approval(t *testing.T) {
 	b := svc("docker:b", model.StateDiscovered)
 	_ = f.SetApproval(ctx, b.Key, FingerprintV1(b))
 	b.Zone = "other.test" // content changed after the v1 approval
-	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{b})
+	r, _ = g.ResolveDetail(ctx, ModeApprove, []model.Service{b}, Options{})
 	if r.Services[0].State != model.StatePending || !r.Quarantined[b.Key] || len(r.Migrated) != 0 {
 		t.Fatalf("changed v1: %+v", r)
 	}

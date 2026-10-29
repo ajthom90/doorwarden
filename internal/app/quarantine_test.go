@@ -89,13 +89,41 @@ func TestApprovedBackendChangeQuarantines(t *testing.T) {
 	}
 }
 
-// A stored v1 approval of the unchanged content is migrated at the first
-// cycle (audited) and the service stays served; one of changed content is
-// not migrated.
+// served runs one auto-mode cycle so svcs have persisted routes, as they
+// would after running in auto mode (or before an upgrade).
+func served(t *testing.T, e *env, svcs ...model.Service) {
+	t.Helper()
+	e.src.set(nil, svcs...)
+	e.app().RunOnce(context.Background())
+	for _, s := range svcs {
+		if _, ok, _ := e.st.GetRoute(context.Background(), s.Key); !ok {
+			t.Fatalf("%s not routed", s.Key)
+		}
+	}
+}
+
+func activityCount(t *testing.T, e *env, sub string) int {
+	t.Helper()
+	acts, _ := e.st.ListActivity(context.Background(), 200)
+	n := 0
+	for _, x := range acts {
+		if strings.Contains(x.Message, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// A stored v1 approval of the unchanged content, still served as its route
+// serves it, is migrated at the first cycle (audited once) and the service
+// stays served. One of changed content, and one whose service returns on
+// another port than its route (v1 never covered the port), is not
+// migrated: quarantined.
 func TestLegacyApprovalMigration(t *testing.T) {
 	e := newEnv(t, testYAML)
 	ctx := context.Background()
-	same, changed := svc("docker", "app"), svc("docker", "other")
+	same, changed, moved := svc("docker", "app"), svc("docker", "other"), svc("docker", "moved")
+	served(t, e, same, changed, moved)
 	if err := e.st.SetApproval(ctx, same.Key, approval.FingerprintV1(same)); err != nil {
 		t.Fatal(err)
 	}
@@ -104,14 +132,24 @@ func TestLegacyApprovalMigration(t *testing.T) {
 	if err := e.st.SetApproval(ctx, changed.Key, approval.FingerprintV1(old)); err != nil {
 		t.Fatal(err)
 	}
-	e.src.set(nil, same, changed)
+	if err := e.st.SetApproval(ctx, moved.Key, approval.FingerprintV1(moved)); err != nil {
+		t.Fatal(err)
+	}
+	back := moved
+	back.Backend.Port = 9001
+	e.src.set(nil, same, changed, back)
 	a := e.app(func(o *Options) { o.Sources = []SourceSpec{{Source: e.src, Mode: approval.ModeApprove}} })
 	a.RunOnce(ctx)
 	if s := info(t, a, same.Key); s.State != model.StatePublished {
 		t.Fatalf("migrated: %+v", s)
 	}
-	if s := info(t, a, changed.Key); s.State != model.StatePending {
-		t.Fatalf("changed: %+v", s)
+	for _, k := range []string{changed.Key, moved.Key} {
+		if s := info(t, a, k); s.State != model.StatePending {
+			t.Fatalf("%s: %+v", k, s)
+		}
+		if r, ok, _ := e.st.GetRoute(ctx, k); !ok || !r.Quarantined {
+			t.Fatalf("%s not quarantined: %+v %v", k, r, ok)
+		}
 	}
 	if fp, _, _ := e.st.GetApproval(ctx, same.Key); fp != approval.Fingerprint(same) {
 		t.Fatal("not rewritten to v2")
@@ -119,26 +157,90 @@ func TestLegacyApprovalMigration(t *testing.T) {
 	if fp, _, _ := e.st.GetApproval(ctx, changed.Key); fp != approval.FingerprintV1(old) {
 		t.Fatal("changed v1 approval rewritten")
 	}
-	acts, _ := e.st.ListActivity(ctx, 100)
-	n := 0
-	for _, x := range acts {
-		if x.Kind == "approval" && strings.Contains(x.Message, "migrated approval v1->v2") {
-			n++
-			if !strings.Contains(x.Message, same.Key) {
-				t.Fatalf("wrong key: %s", x.Message)
-			}
-		}
+	if fp, _, _ := e.st.GetApproval(ctx, moved.Key); fp != approval.FingerprintV1(moved) {
+		t.Fatal("moved v1 approval rewritten")
+	}
+	n := activityCount(t, e, "migrated approval v1->v2")
+	a.RunOnce(ctx)
+	if m := activityCount(t, e, "migrated approval v1->v2"); n != 1 || m != 1 {
+		t.Fatalf("migration audited %d then %d times, want once", n, m)
+	}
+}
+
+// Dry run migrates nothing: the v1 approval stays as stored and the
+// service keeps being served.
+func TestLegacyApprovalMigrationDryRun(t *testing.T) {
+	e := newEnv(t, testYAML)
+	ctx := context.Background()
+	same := svc("docker", "app")
+	served(t, e, same)
+	_ = e.st.SetApproval(ctx, same.Key, approval.FingerprintV1(same))
+	a := e.app(func(o *Options) { o.Sources = []SourceSpec{{Source: e.src, Mode: approval.ModeApprove}} })
+	if err := a.SetDryRun(ctx, true); err != nil {
+		t.Fatal(err)
 	}
 	a.RunOnce(ctx)
-	acts, _ = e.st.ListActivity(ctx, 100)
-	m := 0
-	for _, x := range acts {
-		if strings.Contains(x.Message, "migrated approval v1->v2") {
-			m++
+	if fp, _, _ := e.st.GetApproval(ctx, same.Key); fp != approval.FingerprintV1(same) {
+		t.Fatal("dry run rewrote the approval")
+	}
+	if s := info(t, a, same.Key); s.State != model.StatePublished {
+		t.Fatalf("dry: %+v", s)
+	}
+	for _, x := range a.LastPlan().Actions {
+		if x.Key == same.Key && (x.Kind == reconcile.RouteRemove || x.Kind == reconcile.Invalid) {
+			t.Fatalf("dry run plans a quarantine: %+v", x)
 		}
 	}
-	if n != 1 || m != 1 {
-		t.Fatalf("migration audited %d then %d times, want once", n, m)
+}
+
+// A source switched from auto to approve: a served service whose content is
+// unchanged is grandfathered (approval recorded, audited, still served); one
+// whose backend changed is quarantined; dry run writes no approval.
+func TestModeSwitchGrandfathersUnchanged(t *testing.T) {
+	e := newEnv(t, testYAML)
+	ctx := context.Background()
+	same, other := svc("docker", "app"), svc("docker", "other")
+	served(t, e, same, other)
+	moved := other
+	moved.Backend.Port = 9001
+	e.src.set(nil, same, moved)
+	a := e.app(func(o *Options) { o.Sources = []SourceSpec{{Source: e.src, Mode: approval.ModeApprove}} })
+
+	if err := a.SetDryRun(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	a.RunOnce(ctx)
+	if _, ok, _ := e.st.GetApproval(ctx, same.Key); ok {
+		t.Fatal("dry run recorded an approval")
+	}
+	if r, _, _ := e.st.GetRoute(ctx, other.Key); r.Quarantined {
+		t.Fatal("dry run quarantined a route")
+	}
+	if err := a.SetDryRun(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	a.RunOnce(ctx)
+	if s := info(t, a, same.Key); s.State != model.StatePublished {
+		t.Fatalf("grandfathered: %+v", s)
+	}
+	if fp, ok, _ := e.st.GetApproval(ctx, same.Key); !ok || fp != approval.Fingerprint(same) {
+		t.Fatal("no approval recorded")
+	}
+	if n := activityCount(t, e, "grandfathered on mode switch"); n != 1 {
+		t.Fatalf("grandfather audited %d times", n)
+	}
+	if r, ok, _ := e.st.GetRoute(ctx, same.Key); !ok || r.Quarantined {
+		t.Fatalf("grandfathered route %+v %v", r, ok)
+	}
+	if s := info(t, a, other.Key); s.State != model.StatePending {
+		t.Fatalf("changed: %+v", s)
+	}
+	if r, ok, _ := e.st.GetRoute(ctx, other.Key); !ok || !r.Quarantined || r.Port != 8080 {
+		t.Fatalf("changed route not quarantined: %+v %v", r, ok)
+	}
+	if _, ok, _ := e.st.GetApproval(ctx, other.Key); ok {
+		t.Fatal("changed content approved")
 	}
 }
 
