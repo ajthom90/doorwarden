@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"github.com/ajthom90/doorwarden/internal/notify"
 	"github.com/ajthom90/doorwarden/internal/reconcile"
 	"github.com/ajthom90/doorwarden/internal/traefik"
+
+	_ "modernc.org/sqlite"
 )
 
 // Approve mode: an approved service whose source reports another port is
@@ -320,5 +323,47 @@ func TestQuarantineNotificationRetriedAfterQueueFull(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("quarantine notifications delivered = %d, want 1 (retried after the drop): %+v", n, dn.sent)
+	}
+}
+
+// If marking the route quarantined fails, that cycle's render still leaves
+// the quarantined service out (the gate's verdict, not only the stored
+// flag, withholds it), and the next cycle retries the mark.
+func TestQuarantineFlagWriteFailureStillNotRendered(t *testing.T) {
+	e := newEnv(t, testYAML)
+	ctx := context.Background()
+	app := svc("docker", "app")
+	served(t, e, app)
+	db, err := sql.Open("sqlite", "file:"+e.dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER no_quarantine BEFORE UPDATE OF quarantined ON routes
+		WHEN NEW.quarantined = 1 BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.st.SetApproval(ctx, app.Key, approval.Fingerprint(app))
+	moved := app
+	moved.Backend.Port = 8099
+	e.src.set(nil, moved)
+	a := e.app(func(o *Options) { o.Sources = []SourceSpec{{Source: e.src, Mode: approval.ModeApprove}} })
+	res := a.RunOnce(ctx)
+	if res.Err == nil || !res.Rendered {
+		t.Fatalf("want an apply error and a render: %+v", res)
+	}
+	if r, _, _ := e.st.GetRoute(ctx, app.Key); r.Quarantined {
+		t.Fatal("flag written despite the trigger")
+	}
+	b, _ := os.ReadFile(filepath.Join(e.dir, traefik.RoutesFile))
+	if strings.Contains(string(b), "app.example.test") {
+		t.Fatalf("quarantined service rendered after a failed flag write: %s", b)
+	}
+	if _, err := db.Exec(`DROP TRIGGER no_quarantine`); err != nil {
+		t.Fatal(err)
+	}
+	a.RunOnce(ctx)
+	if r, _, _ := e.st.GetRoute(ctx, app.Key); !r.Quarantined {
+		t.Fatal("mark not retried")
 	}
 }

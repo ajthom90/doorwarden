@@ -108,7 +108,7 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 	if !dry {
 		a.persistServices(ctx, desired, now)
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTimeout)
-		if err := a.render(rctx, now); err != nil {
+		if err := a.render(rctx, now, quarantined); err != nil {
 			errs = append(errs, err)
 		} else {
 			res.Rendered = true
