@@ -13,12 +13,13 @@ import (
 )
 
 // Everything but /healthz and the login/setup/status endpoints needs auth,
-// /metrics and SSE included; unknown paths are 401, not 404.
+// /metrics and SSE included; unknown paths are 401, not 404. The embedded
+// UI's exact files ("/" among them) are public; see ui_test.go.
 func TestUnauthenticated401(t *testing.T) {
 	e := newTestEnv(t)
 	c := e.anon()
 	for _, p := range []string{"/api/v1/services", "/api/v1/config", "/metrics", "/api/v1/events",
-		"/api/v1/activity", "/api/v1/auth/me", "/api/v1/nope", "/", "/healthz/../api/v1/services"} {
+		"/api/v1/activity", "/api/v1/auth/me", "/api/v1/nope", "/nope", "/index.html/", "/js/", "/healthz/../api/v1/services"} {
 		if w := c.do("GET", p, nil); w.Code != http.StatusUnauthorized {
 			t.Errorf("GET %s = %d", p, w.Code)
 		}
