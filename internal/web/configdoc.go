@@ -33,6 +33,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/dns"
 )
 
@@ -157,6 +158,9 @@ func parseDoc(raw []byte) (*yaml.Node, error) {
 	}
 	if root.Kind == 0 {
 		root = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}}
+	}
+	if err := config.RejectMergeKeys(&root); err != nil {
+		return nil, errors.New("config: " + err.Error())
 	}
 	return &root, nil
 }

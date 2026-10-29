@@ -3,6 +3,9 @@ package web
 import (
 	"strings"
 	"testing"
+
+	"github.com/ajthom90/doorwarden/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 const docYAML = `zones:
@@ -245,5 +248,64 @@ settings: {default_zone: example.test} # s3cr3t-foot
 	}
 	if !strings.Contains(s, "visible-value") {
 		t.Fatalf("plain header masked:\n%s", s)
+	}
+}
+
+// Fix round 2: ${VAR} cannot reach a plain field through YAML merge keys
+// (PoC), tags, flow style or extra documents. Every accepted document,
+// once loaded with the variable set, shows the expanded value only in
+// fields GET masks.
+func TestEnvRefCannotReachPlainFields(t *testing.T) {
+	const secret = "s3cr3t-expanded"
+	env := func(k string) (string, bool) { return secret, k == "DW_SECRET" }
+	old := "providers:\n  cf:\n    type: cloudflare\n    api_token: x\n"
+	cases := map[string]string{
+		"merge key (PoC)":   old + "  leak:\n    <<: {type: \"${DW_SECRET}\"}\n",
+		"tagged merge key":  old + "  leak:\n    !!merge <<: {type: \"${DW_SECRET}\"}\n",
+		"quoted merge key":  old + "  leak:\n    \"<<\": {type: \"${DW_SECRET}\"}\n",
+		"merge with alias":  "providers:\n  cf: &a\n    type: cloudflare\n    api_token: x\n  leak:\n    <<: *a\n",
+		"str tag":           old + "settings:\n  default_zone: !!str \"${DW_SECRET}\"\n",
+		"custom tag":        old + "settings:\n  default_zone: !x \"${DW_SECRET}\"\n",
+		"flow style":        "providers: {cf: {type: cloudflare, api_token: x}}\nsettings: {default_zone: \"${DW_SECRET}\"}\n",
+		"flow sequence":     old + "notifications:\n  webhooks: [{name: \"${DW_SECRET}\", url: \"https://hook.example.test\"}]\n",
+		"second document":   old + "---\nsettings:\n  default_zone: \"${DW_SECRET}\"\n",
+		"key reference":     "providers:\n  \"${DW_SECRET}\":\n    type: cloudflare\n    api_token: x\n",
+		"secret field (ok)": "providers:\n  cf:\n    type: cloudflare\n    api_token: \"${DW_SECRET}\"\n",
+		"block scalar":      old + "settings:\n  default_zone: |-\n    ${DW_SECRET}\n",
+	}
+	for name, doc := range cases {
+		merged, err := MergeMasked([]byte(doc), []byte(old))
+		if err != nil {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%s: error echoes a value: %v", name, err)
+			}
+			if strings.Contains(name, "merge") && !strings.Contains(err.Error(), "merge key") {
+				t.Errorf("%s: want a merge-key error, got %v", name, err)
+			}
+			continue
+		}
+		if strings.Contains(name, "merge") {
+			t.Errorf("%s: accepted:\n%s", name, merged)
+			continue
+		}
+		c, err := config.Parse(merged, env)
+		if err != nil {
+			t.Logf("%s: refused by the loader: %v", name, err)
+			continue // nothing expands
+		}
+		out, err := yaml.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "secret field (ok)" && !strings.Contains(string(out), secret) {
+			t.Fatalf("control case did not expand: %s", out)
+		}
+		masked, err := MaskConfig(out)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if strings.Contains(string(masked), secret) {
+			t.Errorf("%s: expanded value reaches a plain field:\n%s", name, masked)
+		}
 	}
 }

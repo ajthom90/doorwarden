@@ -249,7 +249,9 @@ not position) and only while its destination (`url`, `host`, `server`,
 `endpoint`, `type`, `port`, ...) is unchanged; otherwise the PUT is refused
 and the secret must be re-entered. Comments are stripped from the returned
 document. `${VAR}` references are accepted only in secret fields (an
-unchanged existing one elsewhere is kept). The document is validated like at
+unchanged existing one elsewhere is kept). YAML aliases are refused by the editor, and YAML
+merge keys (`<<`) are refused everywhere, including in a config file
+written by hand (the error names the line). The document is validated like at
 start-up and written atomically (mode 0600), so the config file must be
 writable by the container (it cannot be a read-only mount for this). Changes
 take effect at the next restart: the running reconciler, DNS providers and
