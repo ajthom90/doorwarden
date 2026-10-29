@@ -132,8 +132,18 @@ entryPoints:
           priority: 1
 ```
 
-Every other request on `:80` is still redirected. If you keep an older copy
-of `traefik.yml`, add `priority: 1` and restart Traefik (static
+Every other request on `:80` is still redirected, **unless another router
+is attached to the `web` entry point**: at priority 1 the redirection loses
+to every such router, which then serves its host over plain HTTP instead of
+redirecting it. Doorwarden's own routers use only `traefik.entry_point`, but
+other routers can attach to `web`: a router that names no entry point
+(a Docker-provider router without an `entrypoints` label, a hand-written
+file router without `entryPoints`) attaches to every entry point marked
+`asDefault` (to all of them when none is), and a router may list `web`
+explicitly. Keep other routers off `web`: mark the HTTPS entry point as the
+only default (`entryPoints.websecure.asDefault: true` in `traefik.yml`) or
+give each such router explicit `entryPoints: [websecure]`. If you keep an
+older copy of `traefik.yml`, add `priority: 1` and restart Traefik (static
 configuration is not reloaded). This was checked by hand with Traefik v3.5:
 with `priority: 1` the challenge path of a listed host reaches Doorwarden
 and every other request is redirected; without it the challenge request is
@@ -142,6 +152,22 @@ running Traefik.) If Traefik runs
 outside this compose project, set `acme.http01_backend` to the URL Traefik
 uses to reach Doorwarden's challenge port, and publish that port only to
 Traefik.
+
+### Upgrading: HTTP-01 route
+
+Releases that render the HTTP-01 challenge route change two things for
+existing installations:
+
+- The shipped `traefik/traefik.yml` sets `priority: 1` on the `web`
+  redirection. Copy the change into your `traefik.yml` and restart Traefik;
+  check that no other router is attached to `web` (see above).
+- If you routed `/.well-known/acme-challenge/` to `acme.http01_listen`
+  yourself, Doorwarden's router (priority 1073741824, to
+  `acme.http01_backend`) now takes those requests for the hosts it lists.
+  Set `acme.http01_backend` to the URL your route used and remove your own
+  route. Doorwarden logs a warning at start-up while `http01_backend` is
+  left at its default. Configurations without an http-01 zone are not
+  affected.
 
 ## Discovery sources and approval
 
