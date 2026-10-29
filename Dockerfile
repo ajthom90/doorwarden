@@ -20,6 +20,8 @@ RUN mkdir -p /out/rootfs/data /out/rootfs/config
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/doorwarden /doorwarden
+# License of Doorwarden and of every Go module compiled into the binary.
+COPY --from=build /src/LICENSE /src/THIRD_PARTY_NOTICES.md /usr/share/doc/doorwarden/
 # /data holds SQLite state and certificates, /config the config file; both
 # are pre-created owned by 65532 (the distroless nonroot user). No VOLUME
 # directive: it would create root-owned anonymous volumes; bind mount your

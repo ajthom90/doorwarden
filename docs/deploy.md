@@ -9,7 +9,8 @@ Create a dataset, e.g. `/mnt/<pool>/apps/doorwarden/`, containing:
 
 ```
 config/doorwarden.yaml     Doorwarden config (read-only mount)
-data/                      SQLite state and data/certs/ (owned by uid 65532)
+data/                      SQLite state (owned by uid 65532)
+certs/                     certificates: /data/certs in Doorwarden (rw), /certs in Traefik (ro)
 traefik-dynamic/           written by Doorwarden, read by Traefik
 traefik/traefik.yml        copy of deploy/traefik/traefik.yml
 ```
@@ -40,6 +41,12 @@ check the value the container sees:
 If it is not 0, uncomment `cap_add: [NET_BIND_SERVICE]` on the `traefik`
 service (it is the only capability to add back).
 
+**TrueNAS's own web interface uses 80/443 by default.** Before Traefik can
+publish 80/443 on the TrueNAS host, move the TrueNAS web interface to other
+ports (in the system's general/GUI settings; the menu path depends on the
+TrueNAS version), and reach it at the new port from then on. During the
+alternate-port trial ([migration.md](migration.md)) this is not needed yet.
+
 ## Certificates in Traefik
 
 Doorwarden writes certificates to `./certs` (its `acme.certs_dir`, mounted at
@@ -59,6 +66,12 @@ is used. Settings under `traefik:`:
 - `serve_expired` (default false): keep serving an expired certificate when
   nothing valid covers its names (clients then see an expiry error for the
   right host instead of the default certificate).
+- `file_mode` (default `0600`; `0640` also allowed): permissions of the
+  generated dynamic files. They can contain middleware secrets (basic-auth
+  hashes, forward-auth settings). With `0600` Traefik must run as Doorwarden's
+  UID (65532 in the compose file); `0640` only if Traefik reads them through a
+  shared group. Files with a wrong mode are rewritten on the next write.
+  `traefik.dynamic_dir` must already exist; Doorwarden does not create it.
 
 Do not define `tls.options.default` or `tls.stores.default` in another file of
 Traefik's dynamic directory: Traefik keeps only one of them.
@@ -80,11 +93,36 @@ the grace period). Defaults:
 sources:
   truenas:
     url: https://nas.example.test
-    api_key: secret:truenas-api-key
+    api_key: ${TRUENAS_API_KEY}
     # approval: approve   # the default; set auto only if every app may be public
   docker:
     host: tcp://docker-socket-proxy:2375
 ```
+
+`${TRUENAS_API_KEY}` reads the key from the container's environment. To keep
+it in Doorwarden's database instead (encrypted with `DOORWARDEN_MASTER_KEY`),
+store it once and reference it as `secret:<name>`:
+
+```
+printf %s "$TOKEN" | docker exec -i <project>-doorwarden-1 /doorwarden admin secret set truenas-api-key
+# or, on a terminal, prompt twice without echo:
+#   docker exec -it <project>-doorwarden-1 /doorwarden admin secret set truenas-api-key
+```
+
+The value never goes on the command line. `docker exec` inherits
+`DOORWARDEN_MASTER_KEY` from the container's `environment:`; do not add
+`-e DOORWARDEN_MASTER_KEY`, which would replace it with your shell's value
+(possibly empty). Restart Doorwarden afterwards.
+
+```yaml
+sources:
+  truenas:
+    url: https://nas.example.test
+    api_key: secret:truenas-api-key
+```
+
+See [configuration.md](configuration.md#secrets-and-the-master-key) for the
+`admin secret` commands.
 
 ## Deploy
 
@@ -93,6 +131,14 @@ sources:
 2. Copy `deploy/.env.example` to `.env` (or enter them as app environment
    variables) and fill in the values. Never commit real values.
 3. Paste the compose YAML into a new Custom App and deploy.
+
+A TrueNAS Custom App has no `.env` file next to the YAML. The compose file
+uses `${DOORWARDEN_TAG:?...}` and `${DOORWARDEN_MASTER_KEY:?...}`, which make
+the deployment fail when the variable is unset: replace them in the pasted
+YAML with literal values (for example `image: ghcr.io/ajthom90/doorwarden:1.0.0`),
+and set the same for `${DOCKER_GID:-999}` and the port variables if the
+defaults do not fit. Treat the pasted YAML as a secret once it holds the master
+key or API keys.
 
 Services: `doorwarden` (control plane), `traefik` (published 80/443; routing
 from the file provider only, no ACME, no dashboard, no docker provider) and
@@ -108,13 +154,26 @@ verified to start under Docker Desktop, not against a real Linux/TrueNAS
 socket group id. After the first start confirm the proxy can reach the socket
 and that Doorwarden's one allowed call works, from a container on the
 `socket` network (the proxy only answers the `doorwarden` hostname, so run it
-in that container's network namespace) or simply read the proxy logs for
-`permission denied` on the socket:
+in that container's network namespace) or simply read the proxy logs: a
+wrong group shows up at start-up as `msg="socket not available"
+error="dial unix /var/run/docker.sock: connect: permission denied"`:
 
 ```
 docker logs <project>-docker-socket-proxy-1 2>&1 | grep -i "socket not available"
 docker exec <project>-doorwarden-1 /doorwarden healthcheck   # control plane health
 ```
+
+The image is distroless: there is no shell in it, and the binary is
+`/doorwarden`, not on `PATH`. Always call it with the absolute path through
+`docker exec <container> /doorwarden ...`. With the provided compose file
+(project `name: doorwarden`, no `container_name`) the containers are
+`<project>-doorwarden-1`, `<project>-traefik-1` and
+`<project>-docker-socket-proxy-1`; `docker ps` shows the real names.
+
+The socket proxy has no healthcheck in the compose file (its image has
+none); a broken proxy shows up as the docker source being down
+(`doorwarden_source_up{source="docker"} 0`, `degraded: true` on `/healthz`,
+and an error on the Services page).
 
 If the first command prints a permission error, fix `DOCKER_GID`
 (`stat -c %g /var/run/docker.sock`) and redeploy. A direct end-to-end check
@@ -163,7 +222,46 @@ request.
 - The default issuer directory is **staging** (untrusted certificates); switch
   to production only after verification.
 - Start with `settings.dry_run: true`: Doorwarden reports what it would do
-  and changes nothing.
+  and changes nothing. Dry run still lists sources and providers, plans every
+  cycle and logs the plan; actions that would change something from the UI
+  (Renew now, Switch to production, Adopt a DNS conflict) are refused with
+  `409 Conflict` while it is on. Turn dry run off for them.
+- **Stop timeout.** Shutdown can take up to about 40 seconds (HTTP, then
+  certificate orders in progress); the compose file sets
+  `stop_grace_period: 45s`. Keep it when you adapt the file. Stopping deletes
+  nothing ([operations.md](operations.md#stopping)).
+- **Several zones.** With more than one zone and Docker or TrueNAS discovery,
+  set `settings.default_zone`. Without it Doorwarden still starts (and logs a
+  warning), but every TrueNAS app and every container without
+  `doorwarden.zone` is an error (`no zone`).
+- **Reaching the UI.** Doorwarden publishes no host port, and nothing routes
+  to its port 8080 until you add a route. Add a static entry for the UI to the
+  config (static entries need no approval, so it is published in the first
+  cycle that is not dry):
+
+  ```yaml
+  static:
+    - name: doorwarden          # https://doorwarden.example.test
+      host: doorwarden          # compose service name, reachable from Traefik
+      port: 8080
+  ```
+
+  In dry run Doorwarden writes no Traefik file, so this route only appears once
+  dry run is off. To use the UI before that (first-run setup, reviewing the
+  dry-run plan, approving TrueNAS apps), publish the port on the host's
+  loopback only, for a trial:
+
+  ```yaml
+  services:
+    doorwarden:
+      ports:
+        - "127.0.0.1:8090:8080"   # trial only; remove once the route works
+  ```
+
+  and open it through an SSH tunnel: `ssh -L 8090:127.0.0.1:8090 <truenas-host>`,
+  then `http://localhost:8090/`. Browsers keep the `Secure` session cookie on
+  `http://localhost`; if yours does not, set `web.cookie_insecure: true` for
+  the trial only. Never publish port 8080 on all interfaces.
 - Confirm health: the `doorwarden` container's healthcheck runs
   `/doorwarden healthcheck`, which GETs `http://127.0.0.1:8080/healthz`
   (override with `DOORWARDEN_HEALTH_URL`; the endpoint is served by the
@@ -182,7 +280,7 @@ trusted-header proxy) and the event stream `/api/v1/events`.
 
 - **First-run setup.** While no administrator exists, Doorwarden logs a
   one-time setup token at start-up (`WARN no administrator yet: first-run
-  setup token ...`; read it with `docker logs doorwarden`). Setup
+  setup token ...`; read it with `docker logs <project>-doorwarden-1`). Setup
   (`POST /api/v1/auth/setup` with user name, password of at least 12
   characters and the token) creates the only administrator; it is refused
   once one exists, and two concurrent attempts cannot both succeed. The token
@@ -209,8 +307,10 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   log lines use the client address. Without `web.trusted_proxies` that is
   the TCP peer, so behind Traefik every client looks like Traefik and one
   client's failed logins slow down everyone's. Set it to the proxy's network
-  (for the compose file, the Docker network Traefik shares with Doorwarden,
-  e.g. `trusted_proxies: ["172.18.0.0/16"]`). When the peer is in that list
+  (for the compose file, the subnet of the `default` network Traefik shares
+  with Doorwarden: `docker network inspect <project>_default --format
+  '{{(index .IPAM.Config 0).Subnet}}'`, then for example
+  `trusted_proxies: ["198.51.100.0/24"]` with your subnet). When the peer is in that list
   the client is the rightmost `X-Forwarded-For` address that is not itself a
   trusted proxy; anything further left was written by the client and is
   ignored. Doorwarden warns in its log when it runs in a container with the
@@ -219,9 +319,9 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   the client address; it never authenticates anyone (that is
   `web.trusted_header`).
 - **Locked out / lost password.** With shell access to the host:
-  `docker exec doorwarden doorwarden admin unlock` ends every session and
-  clears all login limits; `docker exec doorwarden doorwarden admin
-  reset-password` also sets a new random password, printed once on the
+  `docker exec <project>-doorwarden-1 /doorwarden admin unlock` ends every
+  session and clears all login limits; `docker exec <project>-doorwarden-1
+  /doorwarden admin reset-password` also sets a new random password, printed once on the
   terminal (never logged), and creates the administrator (`-user`, default
   `admin`) if none exists. Both work on the database (`-db`, default
   `$DOORWARDEN_DB`) while the server runs. They refuse to run as a user
@@ -258,9 +358,10 @@ file and whose destination is unchanged, and an existing reference is
 refused when its entry's destination changes. `DOORWARDEN_*` variables
 (such as `DOORWARDEN_MASTER_KEY`) can never be referenced from the editor.
 To add a new entry that takes its secret from the environment, or to move
-one to another destination, edit the config file itself. YAML aliases are refused by the editor, and YAML
-merge keys (`<<`) are refused everywhere, including in a config file
-written by hand (the error names the line). The document is validated like at
+one to another destination, edit the config file itself. YAML anchors,
+aliases and merge keys (`<<`) are refused everywhere, in the editor and in a
+config file written by hand (the error names the line; see
+[configuration.md](configuration.md) for the other limits). The document is validated like at
 start-up and written atomically (mode 0600), so the config file must be
 writable by the container (it cannot be a read-only mount for this). Changes
 take effect at the next restart: the running reconciler, DNS providers and
@@ -270,7 +371,10 @@ ACME manager are not rebuilt mid-cycle or mid-order.
 
 Publish/unpublish, rename, port and skip-verify set in the UI are stored in
 the database and applied every cycle before the approval gate. In approve
-mode a rename or skip-verify change requires approving the service again.
+mode a UI override carries the service's approval over to the changed
+content, while a change from the source (labels, the TrueNAS app) to an
+approved service quarantines it until it is approved again
+([labels.md](labels.md#approval)).
 Unpublishing removes the service like a disappearance: its route and DNS
 records are scheduled for removal after `settings.grace_period` (24h by
 default); publishing again within the grace cancels the removal.

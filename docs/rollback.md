@@ -1,8 +1,16 @@
 # Rolling back to Nginx Proxy Manager
 
 Use this if Doorwarden/Traefik misbehaves after cutover. It works because the
-cutover never deletes NPM, never changes DNS, and never touches NPM's
-certificates.
+cutover never deletes NPM and never touches NPM's certificates, and because
+the DNS records point at the same host (`target_ip`) for both setups.
+
+What Doorwarden does to DNS: it never changes or deletes a record it did not
+create (records that existed before it are reported as conflicts, or adopted
+only when you choose so). Records it created itself stay in place when it is
+stopped: stopping deletes nothing. But a Doorwarden left **running** deletes
+its own per-host records about `settings.grace_period` (24h by default) after
+their service disappears or is unpublished. **Stop Doorwarden when you roll
+back to NPM**, and keep it stopped while NPM serves.
 
 > Every TrueNAS state-changing command below must be shown to the operator
 > and confirmed before it is run. App names and menus are examples and vary
@@ -13,12 +21,13 @@ certificates.
    environment before restarting the Doorwarden stack, otherwise it will take
    80/443 back from NPM. (After a cutover those variables are 80/443; the
    trial values only apply to the alternate-port stage.)
-1. **Stop Traefik (the Doorwarden app).** Stop the whole app so ports 80/443
-   are released. Doorwarden does not delete anything on stop.
+1. **Stop the Doorwarden app (Traefik and Doorwarden).** Stop the whole app,
+   not just Traefik, so ports 80/443 are released and Doorwarden stops
+   reconciling DNS. Doorwarden does not delete anything on stop.
 2. **Start the NPM app.** It still has its dataset, database and certificates.
-3. **DNS is unchanged.** Records point at `192.0.2.10` (your TrueNAS host) in
-   both setups, so no DNS edits are needed. Do not let Doorwarden run while
-   NPM serves, or it may re-assert records; leave it stopped.
+3. **DNS needs no edits.** Records point at `192.0.2.10` (your TrueNAS host)
+   in both setups. Records Doorwarden created remain and still resolve to that
+   host. Do not let Doorwarden run while NPM serves; leave it stopped.
 4. **Certificates are untouched.** NPM keeps using its own; Doorwarden's
    certificates remain on disk in its data dataset and can be reused later.
 
