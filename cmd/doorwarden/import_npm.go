@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/ajthom90/doorwarden/internal/config"
@@ -20,11 +21,12 @@ func init() { subcommands["import-npm"] = runImportNPM }
 // nothing is applied. Flags in the output are not errors (exit 0).
 func runImportNPM(args []string, out io.Writer) int {
 	fs := flag.NewFlagSet("import-npm", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(stderr)
 	dbPath := fs.String("db", "", "path to NPM database.sqlite (required)")
 	_ = fs.Bool("copy", true, "snapshot-copy the database to a private temp dir (default; flag kept for compatibility)")
 	noCopy := fs.Bool("no-copy", false, "UNSAFE: read the database in place; SQLite may create -wal/-shm next to NPM's files. Refused when sidecars exist or the directory is not writable")
 	cfgPath := fs.String("config", "", "doorwarden config file (for zones)")
+	envFile := fs.String("env-file", "", "KEY=VALUE file (docker --env-file format) for the config's ${VAR}s; the process environment wins")
 	disc := fs.String("discovered", "", `JSON file of discovered services: [{"key":"truenas:app","name":"app","host":"192.0.2.10","port":8080}]`)
 	asYAML := fs.Bool("yaml", false, "emit only suggested static: entries")
 	_ = fs.Bool("table", false, "print the human table (default)")
@@ -32,7 +34,7 @@ func runImportNPM(args []string, out io.Writer) int {
 		return 2
 	}
 	fail := func(err error) int {
-		fmt.Fprintf(os.Stderr, "doorwarden import-npm: %v\n", err)
+		fmt.Fprintf(stderr, "doorwarden import-npm: %v\n", err)
 		return 1
 	}
 	if *dbPath == "" {
@@ -40,11 +42,14 @@ func runImportNPM(args []string, out io.Writer) int {
 	}
 	var cfg *config.Config
 	if *cfgPath != "" {
-		c, err := config.Load(*cfgPath, nil)
+		c, unset, err := cliConfig(*cfgPath, *envFile)
 		if err != nil {
 			return fail(err)
 		}
+		noteUnset(unset)
 		cfg = c
+	} else if *envFile != "" {
+		return fail(fmt.Errorf("-env-file needs -config"))
 	}
 	var found []model.Service
 	if *disc != "" {
@@ -81,4 +86,12 @@ func runImportNPM(args []string, out io.Writer) int {
 	fmt.Fprint(out, "\n", npm.CertGuidance(snap))
 	fmt.Fprintln(out, "\nNothing was applied. Review the table; use --yaml for paste-ready static entries.")
 	return 0
+}
+
+// noteUnset tells the operator which config variables were not set (they
+// expanded to empty; only the zones are used).
+func noteUnset(unset []string) {
+	if len(unset) > 0 {
+		fmt.Fprintf(stderr, "note: config variable(s) %s are not set and were treated as empty (only zones and the certificate directory are used here; pass -env-file to supply them)\n", strings.Join(unset, ", "))
+	}
 }
