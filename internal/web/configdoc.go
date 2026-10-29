@@ -424,17 +424,41 @@ func (m merger) merge(n, o *yaml.Node, path docPath, sens bool, ptype string, ch
 			n.Value, n.Tag, n.Style = o.Value, o.Tag, o.Style
 			return nil
 		}
-		// ${VAR} is expanded at load time; in a plain field the result
-		// would be echoed by the API. Only secret fields may gain one.
-		if !sens && strings.Contains(n.Value, "${") {
-			if ov, ok := scalarVal(o); !ok || ov != n.Value {
+		// ${VAR} is expanded at load time. In a plain field the result
+		// would be echoed by the API; in a secret field it is sent to the
+		// entry's destination, so it is bound to that destination like a
+		// masked secret: a new or changed reference needs an existing
+		// entry whose destination is unchanged, and an unchanged stored
+		// reference must not follow a changed destination. DOORWARDEN_*
+		// variables (master key, setup) are never accepted from here.
+		if strings.Contains(n.Value, "${") {
+			ov, ok := scalarVal(o)
+			unchanged := ok && ov == n.Value
+			switch {
+			case !unchanged && reservedEnvRef(n.Value):
+				return fmt.Errorf("%s: references to DOORWARDEN_* environment variables are not allowed", path)
+			case !unchanged && !sens:
 				return fmt.Errorf("%s: ${...} environment references are only allowed in secret fields", path)
+			case sens && changed:
+				return fmt.Errorf("%s: ${...} references are only allowed in an existing entry whose destination is unchanged; add or move them by editing the config file", path)
 			}
 		}
 	case yaml.AliasNode:
 		return fmt.Errorf("config: YAML aliases are not supported (at %s)", path)
 	}
 	return nil
+}
+
+var envRefName = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
+
+// reservedEnvRef reports whether v references a DOORWARDEN_* variable.
+func reservedEnvRef(v string) bool {
+	for _, m := range envRefName.FindAllStringSubmatch(v, -1) {
+		if strings.HasPrefix(strings.ToUpper(m[1]), "DOORWARDEN_") {
+			return true
+		}
+	}
+	return false
 }
 
 // MergeMasked returns newRaw with every Masked scalar replaced by the

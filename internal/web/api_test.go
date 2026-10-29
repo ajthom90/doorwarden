@@ -475,7 +475,9 @@ func TestConfigPutErrorsEchoNoValues(t *testing.T) {
 			t.Fatalf("environment value echoed: %s", w.Body)
 		}
 	}
-	w := c.do("PUT", "/api/v1/config", map[string]string{"yaml": "providers:\n  cf: {type: cloudflare, api_token: \"${NOT_SET_VAR}\"}\n"})
+	// A new reference in an existing entry with an unchanged destination
+	// reaches the loader, whose error names the variable only.
+	w := c.do("PUT", "/api/v1/config", map[string]string{"yaml": strings.Replace(testConfigYAML, `"secret:fk-token"`, `"${NOT_SET_VAR}"`, 1)})
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "NOT_SET_VAR") {
 		t.Fatalf("unset variable: %d %s", w.Code, w.Body)
 	}
