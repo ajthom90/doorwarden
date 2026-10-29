@@ -63,6 +63,29 @@ is used. Settings under `traefik:`:
 Do not define `tls.options.default` or `tls.stores.default` in another file of
 Traefik's dynamic directory: Traefik keeps only one of them.
 
+## Discovery sources and approval
+
+Each source has an `approval` mode: `auto` (publish what is discovered),
+`approve` (each new service waits for an operator's approval) or `off`
+(publish nothing from the source; its existing routes are removed after
+the grace period). Defaults:
+
+| source  | unset `approval` means | why |
+|---------|------------------------|-----|
+| truenas | `approve`              | TrueNAS apps have no opt-in of their own: every installed app would otherwise be published |
+| docker  | `auto`                 | containers opt in with `doorwarden.*` labels |
+| static  | `auto`                 | written by the operator in the config |
+
+```yaml
+sources:
+  truenas:
+    url: https://nas.example.test
+    api_key: secret:truenas-api-key
+    # approval: approve   # the default; set auto only if every app may be public
+  docker:
+    host: tcp://docker-socket-proxy:2375
+```
+
 ## Deploy
 
 1. Copy `deploy/compose.truenas.yml` and `deploy/traefik/traefik.yml` onto the

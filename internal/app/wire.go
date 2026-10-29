@@ -142,10 +142,11 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 
 	var appRef atomic.Pointer[App]
 	var mgr *acme.Manager
+	var liveInit, beforeRenew func(context.Context) error
 	if hasIssuer(cfg) {
-		if err := os.MkdirAll(cfg.CertsRoot(), 0o700); err != nil {
-			return fmt.Errorf("creating the certificate directory: %w", err)
-		}
+		hosts := NewRouteHosts(st, log)
+		// Start-up housekeeping (cert dir creation and cleanup, stale issuer
+		// switches) waits for the first cycle that is not a dry run.
 		mgr, err = acme.NewManager(acme.ManagerConfig{
 			Config: cfg, Store: st, Box: box, CertsDir: cfg.CertsRoot(), Logger: log,
 			SettingValue: sec.SettingValue,
@@ -155,18 +156,28 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 					a.Trigger()
 				}
 			},
-			Wanted: RouteHostsWanted(st),
+			Wanted:              hosts.Wanted,
+			DeferStartupCleanup: true,
 		})
 		if err != nil {
 			return err
 		}
+		m := mgr
+		liveInit = func(ctx context.Context) error {
+			if err := os.MkdirAll(cfg.CertsRoot(), 0o700); err != nil {
+				return fmt.Errorf("creating the certificate directory: %w", err)
+			}
+			m.StartupCleanup(ctx)
+			return nil
+		}
+		beforeRenew = hosts.Load
 	}
 	if fi, err := os.Stat(cfg.Traefik.DynamicDir); err != nil || !fi.IsDir() {
 		return fmt.Errorf("traefik.dynamic_dir %q must be an existing directory", cfg.Traefik.DynamicDir)
 	}
 
 	a, err := New(Options{Config: cfg, Store: st, Sources: srcs, Providers: providers, ACME: mgr,
-		Notifier: disp, Metrics: met, Log: log})
+		Notifier: disp, Metrics: met, Log: log, LiveInit: liveInit, BeforeRenew: beforeRenew})
 	if err != nil {
 		return err
 	}
@@ -302,9 +313,11 @@ func BuildProviders(cfg *config.Config, sr dns.SecretResolver) (map[string]dns.P
 	return out, errors.Join(errs...)
 }
 
-func approvalMode(v string) approval.Mode {
+// approvalMode is the configured mode, or def when unset (config.Load sets
+// truenas's default to approve; def repeats it for hand-built configs).
+func approvalMode(v string, def approval.Mode) approval.Mode {
 	if v == "" {
-		return approval.ModeAuto
+		return def
 	}
 	return approval.Mode(v)
 }
@@ -330,14 +343,14 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 	tip := sourceTargetIP(cfg)
 	if d := cfg.Sources.Docker; d != nil {
 		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip})
-		sp := SourceSpec{Name: "docker", Mode: approvalMode(d.Approval), Err: err}
+		sp := SourceSpec{Name: "docker", Mode: approvalMode(d.Approval, approval.ModeAuto), Err: err}
 		if err == nil {
 			sp.Source = s
 		}
 		out = append(out, sp)
 	}
 	if t := cfg.Sources.TrueNAS; t != nil {
-		sp := SourceSpec{Name: "truenas", Mode: approvalMode(t.Approval)}
+		sp := SourceSpec{Name: "truenas", Mode: approvalMode(t.Approval, approval.ModeApprove)}
 		key, err := sec.Value(t.APIKey)
 		if err == nil {
 			var s *truenas.Source
@@ -362,25 +375,59 @@ func closeSources(srcs []SourceSpec) {
 	}
 }
 
-// RouteHostsWanted is the ACME Wanted callback: the hostnames of the
-// persisted routes of a zone.
-func RouteHostsWanted(st *store.Store) func(zone string) []string {
-	return func(zone string) []string {
-		ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
-		defer cancel()
-		routes, err := st.ListRoutes(ctx)
-		if err != nil {
-			return nil
-		}
-		z := normZone(zone)
-		var out []string
-		for _, r := range routes {
-			if normZone(r.Zone) == z {
-				out = append(out, r.Hostname)
-			}
-		}
-		return out
+// RouteHosts is the ACME Wanted callback over the persisted routes. Load
+// snapshots the routes before a renewal round (App's BeforeRenew): when the
+// store cannot be read the round is skipped, so Wanted never reports a zone
+// as empty because of a read error (that would mark every certificate in it
+// unwanted).
+type RouteHosts struct {
+	st   *store.Store
+	snap atomic.Pointer[[]store.Route]
+	log  *slog.Logger
+}
+
+// NewRouteHosts returns the Wanted source over st.
+func NewRouteHosts(st *store.Store, log *slog.Logger) *RouteHosts {
+	if log == nil {
+		log = slog.Default()
 	}
+	return &RouteHosts{st: st, log: log}
+}
+
+// Load snapshots the persisted routes.
+func (r *RouteHosts) Load(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
+	defer cancel()
+	routes, err := r.st.ListRoutes(ctx)
+	if err != nil {
+		return fmt.Errorf("reading routes for certificate renewal: %w", err)
+	}
+	r.snap.Store(&routes)
+	return nil
+}
+
+// Wanted returns the hostnames of zone's routes in the last snapshot.
+// Without one it loads it; if that fails it fails open and reports the
+// zone's apex and wildcard as wanted (a read error must never make
+// certificates unwanted).
+func (r *RouteHosts) Wanted(zone string) []string {
+	p := r.snap.Load()
+	if p == nil {
+		if err := r.Load(context.Background()); err != nil {
+			r.log.Warn("acme wanted hosts unavailable; treating the zone as wanted", "zone", zone, "error", err)
+			z := normZone(zone)
+			return []string{z, "*." + z}
+		}
+		p = r.snap.Load()
+	}
+	z := normZone(zone)
+	var out []string
+	for _, rt := range *p {
+		if normZone(rt.Zone) == z {
+			out = append(out, rt.Hostname)
+		}
+	}
+	return out
 }
 
 // acmeNotifier adapts certificate events to the notification dispatcher.

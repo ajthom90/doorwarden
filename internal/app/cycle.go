@@ -58,6 +58,17 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 		a.seenPrev, a.seenCur = a.seenCur, map[string]bool{}
 	}()
 
+	if !dry && !a.liveInitOK {
+		if a.liveInit == nil {
+			a.liveInitOK = true
+		} else if err := a.liveInit(ctx); err != nil {
+			a.logChange(ctx, "live-init", "error", fmt.Sprintf("start-up housekeeping failed (retried next cycle): %v", err))
+		} else {
+			a.liveInitOK = true
+			a.logChange(ctx, "live-init", "", "")
+		}
+	}
+
 	desired, up := a.gather(ctx, res.Unavailable)
 	if err := ctx.Err(); err != nil {
 		res.Err = err
@@ -65,6 +76,9 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 	}
 
 	obs, err := a.observe(ctx, now, res.Unavailable)
+	// The next re-render at a certificate expiry comes from the rows read
+	// this cycle, dry run included (a stale value would re-arm in the past).
+	a.nextCert = NextCertExpiry(obs.Certs, now)
 	if err != nil {
 		// Without the persisted routes nothing can be planned safely.
 		res.Err = errors.Join(append(errs, err)...)
@@ -289,8 +303,14 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 	}
 }
 
+// notify sends e to the operator; in a dry-run cycle nothing goes out (the
+// event is logged; the activity log already has it).
 func (a *App) notify(ctx context.Context, e notify.Event) {
 	if a.notifier == nil {
+		return
+	}
+	if a.cycleDry.Load() {
+		a.log.InfoContext(ctx, "dry run: notification not sent", "kind", e.Kind, "subject", e.Subject)
 		return
 	}
 	if e.At.IsZero() {
@@ -315,8 +335,7 @@ func (a *App) persistServices(ctx context.Context, desired []model.Service, now 
 	defer cancel()
 	var errs []error
 	for _, s := range desired {
-		if err := a.st.UpsertService(sctx, store.Service{Key: s.Key, Source: s.Source, State: s.State,
-			OverridesJSON: "{}", FirstSeen: now, LastSeen: now}); err != nil {
+		if err := a.st.TouchService(sctx, s.Key, s.Source, s.State, now); err != nil {
 			errs = append(errs, err)
 		}
 	}

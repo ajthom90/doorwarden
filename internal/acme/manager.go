@@ -188,6 +188,11 @@ type ManagerConfig struct {
 	// certificate gets StatusUnwanted, is not renewed and sends no
 	// notifications. nil: every managed certificate is wanted.
 	Wanted func(zone string) []string
+	// DeferStartupCleanup leaves out NewManager's startup housekeeping
+	// (removing unrecorded certificate version directories, clearing stale
+	// issuer switches); the caller runs StartupCleanup later, e.g. on the
+	// first cycle that is not a dry run.
+	DeferStartupCleanup bool
 }
 
 // Manager issues and renews certificates. It is safe for concurrent use.
@@ -209,6 +214,7 @@ type Manager struct {
 	issueTimeout   time.Duration
 	renewBefore    time.Duration
 	wanted         func(zone string) []string
+	startupOnce    sync.Once
 	log            *slog.Logger
 	red            *redactor
 
@@ -327,9 +333,21 @@ func NewManager(mc ManagerConfig) (*Manager, error) {
 	legoLogOnce.Do(func() {
 		legolog.Logger = slog.NewLogLogger(redactHandler{inner: defaultHandler{}, r: globalRedactor}, slog.LevelDebug)
 	})
-	m.cleanupCertDirs(context.Background())
-	m.clearStaleOverrides(context.Background())
+	if !mc.DeferStartupCleanup {
+		m.StartupCleanup(context.Background())
+	}
 	return m, nil
+}
+
+// StartupCleanup removes certificate version directories the store does
+// not know about and clears stale issuer switches. It runs once per
+// Manager (later calls do nothing); NewManager calls it unless
+// ManagerConfig.DeferStartupCleanup is set.
+func (m *Manager) StartupCleanup(ctx context.Context) {
+	m.startupOnce.Do(func() {
+		m.cleanupCertDirs(ctx)
+		m.clearStaleOverrides(ctx)
+	})
 }
 
 // ValidateConfig checks everything certificate-related that needs the lego

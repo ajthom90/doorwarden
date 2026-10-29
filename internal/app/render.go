@@ -14,7 +14,7 @@ import (
 
 // render writes Traefik's dynamic files from the persisted routes and cert
 // rows (traefikwire's composition, plus an on-disk check of the default
-// certificate) and remembers the next certificate expiry.
+// certificate) and records the certificate expiry metrics.
 func (a *App) render(ctx context.Context, now time.Time) error {
 	routes, err := a.st.ListRoutes(ctx)
 	if err != nil {
@@ -63,7 +63,6 @@ func (a *App) render(ctx context.Context, now time.Time) error {
 	if err := traefik.Write(a.cfg.Traefik.DynamicDir, files); err != nil {
 		return fmt.Errorf("traefik write: %w", err)
 	}
-	a.nextCert = NextCertExpiry(rows, now)
 	a.certExpiryMetrics(rows)
 	return nil
 }

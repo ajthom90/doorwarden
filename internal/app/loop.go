@@ -67,13 +67,28 @@ func (a *App) Run(ctx context.Context) error {
 		a.cycleMu.Unlock()
 		certTimer.Stop()
 		if !next.IsZero() {
-			d := next.Sub(a.now()) + time.Second
-			if d < time.Second {
-				d = time.Second
+			d := certDelay(next, a.now())
+			if a.onCertArm != nil {
+				a.onCertArm(d)
 			}
 			certTimer.Reset(d)
 		}
 	}
+}
+
+// MinCertRearm is the shortest delay the certificate-expiry timer is armed
+// for, so the timer alone never runs more than one cycle a minute (an
+// expiry that is already past, a failing write, ...).
+const MinCertRearm = time.Minute
+
+// certDelay is how long to wait before the re-render at next (one second
+// past it), never less than MinCertRearm.
+func certDelay(next, now time.Time) time.Duration {
+	d := next.Sub(now) + time.Second
+	if d < MinCertRearm {
+		d = MinCertRearm
+	}
+	return d
 }
 
 func drain(c chan struct{}) {
@@ -111,6 +126,12 @@ func (a *App) renewOnce(ctx context.Context) {
 	}
 	if dry, _ := a.DryRun(ctx); dry {
 		return
+	}
+	if a.beforeRenew != nil {
+		if err := a.beforeRenew(ctx); err != nil {
+			a.log.WarnContext(ctx, "certificate renewal round skipped", "error", err)
+			return
+		}
 	}
 	rctx, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()

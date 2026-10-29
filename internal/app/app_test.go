@@ -520,7 +520,7 @@ func TestUnconstructedSourceUnavailable(t *testing.T) {
 // /healthz is 503 when the store is unusable.
 func TestHealthzStoreUnusable(t *testing.T) {
 	e := newEnv(t, testYAML)
-	a := e.app()
+	a := e.app(func(o *Options) { o.HealthProbeInterval = time.Nanosecond })
 	rec := httptest.NewRecorder()
 	a.HealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK {
@@ -723,15 +723,10 @@ func TestLoadConfigValidates(t *testing.T) {
 	if _, err := LoadConfig(path, nil); err == nil || !strings.Contains(err.Error(), "unknown type") {
 		t.Fatalf("invalid config accepted: %v", err)
 	}
-	// Per-host mode with an unknown type passes Validate; building the
-	// providers then fails the start.
+	// Per-host mode is checked too.
 	path, _, _ = writeConfig(t, yml)
-	cfg, err := LoadConfig(path, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := BuildProviders(cfg, nil); err == nil {
-		t.Fatal("unknown provider type built")
+	if _, err := LoadConfig(path, nil); err == nil || !strings.Contains(err.Error(), "unknown type") {
+		t.Fatalf("per-host unknown type accepted: %v", err)
 	}
 }
 

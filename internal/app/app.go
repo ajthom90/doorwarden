@@ -124,6 +124,19 @@ type Options struct {
 	// default certificate is checked with it before Traefik's TLS file is
 	// written.
 	StatFile func(path string) error
+	// HealthProbeInterval is how long a /healthz store probe result is
+	// reused (default web.DefaultProbeInterval).
+	HealthProbeInterval time.Duration
+	// LiveInit runs once, on the first cycle that is not a dry run, before
+	// it plans (start-up side effects such as creating the certificate
+	// directory and the ACME manager's StartupCleanup). A failure is logged
+	// and retried on the next live cycle.
+	LiveInit func(ctx context.Context) error
+	// BeforeRenew runs before each ACME renewal round; an error skips the
+	// round (e.g. RouteHosts.Load: Wanted must not see an empty host list
+	// because the store could not be read, which would mark every
+	// certificate unwanted).
+	BeforeRenew func(ctx context.Context) error
 }
 
 // App is the control plane.
@@ -144,6 +157,11 @@ type App struct {
 
 	gate   *approval.Gate
 	runner *reconcile.Runner
+	probe  *web.CachedProbe
+
+	liveInit    func(context.Context) error
+	liveInitOK  bool // guarded by cycleMu
+	beforeRenew func(context.Context) error
 
 	cycleMu  sync.Mutex // serializes cycles (RunOnce)
 	cycleDry atomic.Bool
@@ -154,6 +172,7 @@ type App struct {
 	aliases           map[string]map[string]bool // source name -> Service.Source values
 	lastLogged        map[string]string
 	nextCert          time.Time
+	onCertArm         func(time.Duration) // test hook: the cert timer's delay
 
 	hmu    sync.RWMutex
 	health web.HealthStatus
@@ -172,6 +191,7 @@ func New(o Options) (*App, error) {
 		cfg: o.Config, st: o.Store, sources: o.Sources, providers: o.Providers, mgr: o.ACME,
 		notifier: o.Notifier, met: o.Metrics, now: o.Now, log: o.Log,
 		srcTO: o.SourceTimeout, dnsTO: o.DNSTimeout, renewTO: o.RenewEvery, stat: o.StatFile,
+		liveInit: o.LiveInit, beforeRenew: o.BeforeRenew,
 		trigger:  make(chan struct{}, 1),
 		seenPrev: map[string]bool{}, seenCur: map[string]bool{},
 		aliases: map[string]map[string]bool{}, lastLogged: map[string]string{},
@@ -198,6 +218,7 @@ func New(o Options) (*App, error) {
 		a.providers = map[string]dns.Provider{}
 	}
 	a.gate = approval.NewGate(a.st)
+	a.probe = web.NewCachedProbe(a.st.Ping, o.HealthProbeInterval)
 
 	multi := reconcile.NewMultiExecutor(a.recordActivity)
 	re := reconcile.NewRouteExecutor(a.st, a.now)
@@ -277,9 +298,11 @@ func (a *App) SetDryRun(ctx context.Context, on bool) error {
 	return nil
 }
 
-// HealthHandler returns the /healthz handler.
+// HealthHandler returns the /healthz handler. Its store probe is shared
+// and cached (HealthProbeInterval), so a request flood cannot starve the
+// store.
 func (a *App) HealthHandler() http.Handler {
-	return web.Health{Probe: a.st.Ping, Status: a.HealthStatus}
+	return web.Health{Probe: a.probe.Probe, Status: a.HealthStatus}
 }
 
 // HealthStatus returns a copy of the last cycle's health snapshot.

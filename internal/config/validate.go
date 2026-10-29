@@ -59,10 +59,10 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 			p, ok := c.Providers[z.Records.Provider]
 			if !ok {
 				add("%s: records.provider %q is not defined", id, z.Records.Provider)
+			} else if cp, known := caps(p.Type); !known {
+				add("%s: records.provider %q has unknown type %q", id, z.Records.Provider, p.Type)
 			} else if z.Records.Mode == "wildcard" {
-				if cp, known := caps(p.Type); !known {
-					add("%s: records.provider %q has unknown type %q", id, z.Records.Provider, p.Type)
-				} else if !cp.WildcardA {
+				if !cp.WildcardA {
 					add("%s: records.mode wildcard requires a provider with wildcard A record support; %q (type %s) lacks it", id, z.Records.Provider, p.Type)
 				}
 			}
