@@ -231,6 +231,7 @@ func (c *Config) applyDefaults() {
 	if c.ACME.HTTP01Backend == "" && c.ACME.HTTP01Listen != "" {
 		if _, port, err := net.SplitHostPort(c.ACME.HTTP01Listen); err == nil && port != "" {
 			c.ACME.HTTP01Backend = "http://doorwarden:" + port
+			c.ACME.http01BackendDefaulted = true
 		}
 	}
 	if c.Traefik.CertPathPrefix == "" {

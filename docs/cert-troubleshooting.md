@@ -57,6 +57,25 @@ Only names that are routes are ordered; a host without a route (an apex with
 no `apex: true` entry, for example) gets neither a certificate nor a
 challenge route.
 
+### Upgrading
+
+Doorwarden used to leave the challenge route to you; it now renders it.
+At start-up, when a zone uses http-01, it logs:
+
+- `acme.http01: Doorwarden now renders the Traefik route ...` while
+  `acme.http01_backend` is left at its default
+  (`http://doorwarden:<port of http01_listen>`). Its router overrides a
+  route you added yourself; if Traefik reaches the challenge server under
+  another URL, set `acme.http01_backend` to it, then remove your route.
+- `acme.http01_listen ... is a loopback address` when `http01_listen` is
+  `127.0.0.1`, `::1` or `localhost` and the backend is the default: Traefik
+  cannot reach a loopback listener in Doorwarden's container. Listen on all
+  interfaces (`":8089"`) or set `acme.http01_backend`.
+- `acme.http01: ensure Traefik's web entry-point redirection has
+  priority: 1 ...` every time: Doorwarden cannot read Traefik's static
+  configuration. Add the setting once
+  ([deploy.md](deploy.md#upgrading-http-01-route)).
+
 ## From staging to production
 
 Issuers default to Let's Encrypt **staging**: real orders against a test CA

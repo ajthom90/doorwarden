@@ -28,6 +28,9 @@ type ACME struct {
 	// http://doorwarden:<port of http01_listen>). Doorwarden renders a
 	// challenge router to it (internal/traefik, ChallengeFile).
 	HTTP01Backend string `yaml:"http01_backend"`
+	// http01BackendDefaulted: HTTP01Backend was derived from HTTP01Listen
+	// (not set in the file).
+	http01BackendDefaulted bool
 	// DNSPropagationTimeout bounds the wait for a DNS-01 TXT record to
 	// propagate (default: the challenge provider's own timeout).
 	DNSPropagationTimeout time.Duration `yaml:"dns_propagation_timeout"`

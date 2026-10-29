@@ -218,6 +218,9 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 	if w := defaultZoneWarning(cfg); w != "" {
 		log.WarnContext(ctx, w)
 	}
+	for _, w := range cfg.HTTP01Warnings() {
+		log.WarnContext(ctx, w)
+	}
 	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers), "dry_run", dry)
 	if dry {
 		why := "the dry-run toggle (UI/API) is on"
