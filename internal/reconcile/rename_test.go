@@ -41,14 +41,10 @@ func TestE2ERenamedLoserOldRowRemoved(t *testing.T) {
 			} // absent: the holder is simply missing
 			mov := pub(movKey, "web", "example.test", 8080)
 			acts := e.cycle(append([]model.Service{mov}, others...))
-			if variant == "stopped-static-same-rank" {
-				// same rank, serving tier: the renamed service wins web and
-				// the Stopped holder is the loser; the mover's write moves
-				// its own row, so nothing is orphaned.
-				if w := ofKind(forKey(acts, movKey), RouteWrite); len(w) != 1 || w[0].Host != "web.example.test" {
-					t.Fatalf("mover should win web: %v", sums(acts))
-				}
-			} else {
+			{
+				// (stopped-static-same-rank: the Stopped holder is the
+				// incumbent of web since final-review H1, so the mover loses
+				// like in the other variants)
 				ma := forKey(acts, movKey)
 				assertSums(t, ma, "Conflict example.test web.example.test "+movKey,
 					"RouteRemove example.test app.example.test "+movKey)

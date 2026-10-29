@@ -26,11 +26,12 @@
 // Published service with neither a backend nor a last-known backend. It is never planned (no DNS,
 // cert or RouteWrite) and, being present, never scheduled for removal. It is
 // not routable, so it never causes another service's route to be removed.
-// Its existing route is left as is UNLESS a Published, routable claimant that
-// outranks or out-tiers it takes over its hostname: an Invalid Published
-// service with a Known route claims its stored (Known) zone and hostname as a
-// non-serving holder (see Stored-hostname claim), so it then gets Conflict
-// and its stored row is removed like any loser. When nobody takes the name
+// Its existing route is left as is UNLESS a Published, routable claimant of a
+// HIGHER source rank takes over its hostname: an Invalid Published service
+// with a Known route claims its stored (Known) zone and hostname as a
+// non-serving holder (see Stored-hostname claim) and is the incumbent of
+// that hostname (a same-rank newcomer gets only a Conflict), so only a
+// higher-ranked winner gives it a Conflict and removes its stored row. When nobody takes the name
 // over (e.g. its Known zone was removed from the config) only Invalid is
 // emitted and nothing is removed.
 //
@@ -65,12 +66,15 @@
 // service keeps its hostname against every lower-ranked claimant until its
 // grace period ends (the newcomer gets a Conflict naming it): a lower-trust
 // source never takes a hostname from a higher-trust one, even a briefly
-// absent one. Within its own rank an absent claimant yields to every present
-// claimant; when the winner is a present Published, routable service of the
-// same or a higher rank, its route is removed at once (RouteRemove, no grace,
-// no ScheduleRemoval; its DNS record follows the orphan rule). Against a
-// present but non-routable winner it keeps its route until its grace period
-// ends. The same takeover rule (planner.takesOver: winner Published,
+// absent one. An absent service is the incumbent of its hostname, so within
+// its own rank it also keeps it until its grace period ends (final-review
+// H1: no same-source takeover; a container recreated under a NEW name, or a
+// static entry renamed without an id, waits out the grace period). When the
+// winner is a present Published, routable service of a higher rank, its
+// route is removed at once (RouteRemove, no grace, no ScheduleRemoval; its
+// DNS record follows the orphan rule, and a same-value record is
+// reassigned). Against a non-routable winner it keeps its route until its
+// grace period ends. The same takeover rule (planner.takesOver: winner Published,
 // routable, not a phantom, rank <= loser's; loser's source available)
 // decides the RouteRemove of present losers and of absent services.
 //
@@ -92,8 +96,10 @@
 // a Skip reports the label problem instead of Invalid. A non-Published
 // service without a Known entry claims from its labels as before (it has no
 // route); a Published service always claims from its current labels. Its
-// tier is unchanged: it is not in the serving tier, so a Published service of
-// the same source rank still takes the name over (and its route is removed).
+// tier is unchanged (it is not in the serving tier), but it is the incumbent
+// of its stored hostname, so a Published service of the same source rank
+// gets only a Conflict; one of a higher rank takes the name over (and its
+// route is removed).
 //
 // Renamed Published loser: when a Published service's current labels name
 // a different hostname than its persisted row and it LOSES that hostname,
@@ -114,9 +120,9 @@
 //     RouteRemove of one Apply (a crash, or a failed RouteRemove batch); the
 //     next cycle re-emits the RouteRemove and converges to one row;
 //   - a source outage: a phantom's row is never removed, so if a present
-//     Published service outranks it (higher source rank, or same rank with a
-//     smaller key; both are in the serving tier) both rows exist until the
-//     source is back and the phantom loses as a present service.
+//     Published service outranks it (a higher source rank; a phantom is the
+//     incumbent within its own rank) both rows exist until the source is
+//     back and the phantom loses as a present service.
 //
 // In both the renderer's rule (source rank, then key) picks Plan's winner.
 // Rows that already share a hostname for any other reason (left by an
@@ -134,20 +140,31 @@
 //     the stable key prefix ("static:", "truenas:", "docker:") because source
 //     names are configurable (Service.Source is only a fallback for unknown
 //     prefixes);
-//  2. within one source rank, the serving tier first: a Published service
-//     that will get a RouteWrite this cycle (authoritative backend or an
-//     authoritative last-known one), or a phantom (it still has a Known
-//     route); everything else (Pending, Discovered, Stopped, Error, Published
-//     without any backend) is the lower tier;
-//  3. the lexicographically smaller key.
+//  2. within one source rank, the INCUMBENT first: the claimant whose
+//     persisted route (Known) already serves this hostname, whatever its
+//     state (present, Stopped, Pending, held-Invalid, absent in grace, or a
+//     phantom). A same-source challenger (e.g. a container with a
+//     lexicographically smaller name and doorwarden.name=<victim>) gets a
+//     Conflict, is not served and is notified, until the incumbent's route
+//     is removed (grace period over) or an operator renames/skips one of
+//     them (final-review H1);
+//  3. then, among incumbents (rows sharing a name in a crash window) or
+//     first-time claimants: an absent claimant yields to a present one;
+//  4. then the serving tier: a Published service that will get a RouteWrite
+//     this cycle (authoritative backend or an authoritative last-known one),
+//     or a phantom (it still has a Known route); everything else (Pending,
+//     Discovered, Stopped, Error, Published without any backend) is the
+//     lower tier;
+//  5. the lexicographically smaller key.
 //
 // A lower-trust source can therefore never take a hostname from a
 // higher-trust one, whatever their states. Trade-off, chosen fail-safe: a
 // Pending, Error or Stopped static/truenas entry blocks a Published docker
 // service of the same hostname until it is fixed, approved or removed; this
-// is visible as a Conflict on the docker service. Within one source a
-// Stopped v1 never beats a Published v2, and equal-tier claimants are decided
-// by key whichever of them is Known (no flapping). During an outage a
+// is visible as a Conflict on the docker service. Within one source the
+// incumbent keeps its name (a Stopped incumbent v1 keeps it against a
+// Published v2; no flapping, no takeover by key order); first-time ties are
+// decided by key. During an outage a
 // phantom keeps its name, and a lower-ranked or non-serving claimant gets
 // only a Conflict; recovery does not flip the name either.
 //

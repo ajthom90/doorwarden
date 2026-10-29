@@ -122,26 +122,28 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 	var claims []claimant
 	for _, e := range entries {
 		present[e.svc.Key] = true
+		k, isKnown := obs.Known[e.svc.Key]
+		inc := isKnown && e.host != "" && normName(k.Hostname) == e.host
 		if e.heldInvalid {
 			// not routable, so never serving and never able to evict anyone
-			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true})
+			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true, incumbent: inc})
 		} else if e.err == nil {
 			pubd := e.svc.State == model.StatePublished
 			_, routable := p.routeBackend(e.svc)
 			routable = routable && pubd
 			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host,
-				published: pubd, routable: routable, serving: routable})
+				published: pubd, routable: routable, serving: routable, incumbent: inc})
 		}
 	}
 	for _, k := range sortedKnown(obs.Known) {
 		if !present[k.Key] && p.unavailable(k) && k.Hostname != "" {
 			// it is Known, i.e. it still has a route: serving tier
-			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true})
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true, incumbent: true})
 		} else if !present[k.Key] && k.Hostname != "" && (k.RemovedAfter == nil || !now.After(*k.RemovedAfter)) {
 			// gone from an available source, route not yet removed and grace
 			// not over: it holds its hostname as a non-serving claimant (past
 			// grace it is removed this cycle, so it must not hold the name)
-			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, absent: true})
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, absent: true, incumbent: true})
 		}
 	}
 	winners, losers := resolveHostnames(claims)
@@ -307,6 +309,16 @@ func (p *planner) middlewareProblem(s model.Service) error {
 // takes the name over, RouteRemove for its existing route (only if it has
 // one, so this does not repeat once the caller forgets the Known entry). DNS
 // is untouched.
+//
+// Known residual (T9, parked; benign): docker:app has a route, docker goes
+// down, static:app is Published and gets its own route, then static:app goes
+// Stopped and docker comes back. static:app keeps its RouteWrite (last-known
+// backend) and docker:app gets a Conflict but no RouteRemove, because a
+// Stopped winner is not Published (takesOver). Two rows share the hostname
+// while static stays Stopped; the renderer serves the higher-rank row
+// (static), which is Plan's winner, so nothing is taken over and the name is
+// never unserved. It converges once static is Published again (docker's row
+// is removed then) or static is removed.
 func (p *planner) planLoser(e entry, l loss) {
 	p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
 	k, ok := p.obs.Known[e.svc.Key]
