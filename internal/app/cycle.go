@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -315,7 +317,7 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 			a.notify(ctx, notify.Event{Kind: "service.invalid", Severity: notify.Warning,
 				Subject: "doorwarden: " + x.Key + " has invalid labels", Message: x.Reason,
 				Fields:    map[string]string{"key": x.Key, "zone": x.Zone, "host": x.Host},
-				DedupeKey: "invalid/" + x.Key + "/" + x.Reason})
+				DedupeKey: invalidDedupeKey(x.Key, x.Reason)})
 		case x.Alert != "":
 			a.notify(ctx, notify.Event{Kind: "dns.alert", Severity: notify.Critical,
 				Subject: "doorwarden: " + x.Alert, Message: x.Reason,
@@ -331,6 +333,19 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 	for k, c := range n {
 		a.met.ReconcileAction(string(k), c)
 	}
+}
+
+// invalidDedupeKey is the dedupe key of a held-invalid notification: the
+// service key plus a short hash of the reason's sorted words, so the same
+// problems reported in a different order (map iteration) are not notified
+// again, while a different problem is.
+func invalidDedupeKey(key, reason string) string {
+	words := strings.FieldsFunc(reason, func(r rune) bool {
+		return r == ' ' || r == ';' || r == ',' || r == '(' || r == ')' || r == ':' || r == '\n'
+	})
+	sort.Strings(words)
+	sum := sha256.Sum256([]byte(strings.Join(words, " ")))
+	return "invalid/" + key + "/" + hex.EncodeToString(sum[:8])
 }
 
 // notify sends e to the operator; in a dry-run cycle nothing goes out (the

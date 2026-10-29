@@ -363,3 +363,15 @@ func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
 		})
 	}
 }
+
+// The held-invalid dedupe key is the service key plus a hash of the
+// reason's sorted problems: word order (map iteration) does not change it;
+// a different problem does.
+func TestHeldInvalidDedupeKeyStable(t *testing.T) {
+	a := invalidDedupeKey("docker:app", "labels invalid (bad port; bad scheme)")
+	b := invalidDedupeKey("docker:app", "labels invalid (bad scheme; bad port)")
+	c := invalidDedupeKey("docker:app", "labels invalid (bad zone)")
+	if a != b || a == c || !strings.HasPrefix(a, "invalid/docker:app/") || strings.Contains(a, "scheme") {
+		t.Fatalf("%q %q %q", a, b, c)
+	}
+}
