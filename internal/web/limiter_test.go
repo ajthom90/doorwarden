@@ -240,3 +240,23 @@ func TestSetupThrottlePerAddressOnly(t *testing.T) {
 	}
 	e.setupAdmin() // from a clean address
 }
+
+// `doorwarden admin unlock` (store.ResetCredentials) takes effect on the
+// running server: the next login sees the new generation and the limits
+// are gone.
+func TestUnlockClearsRunningLimits(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	for range pairThreshold {
+		e.login("admin", "wrong-password-xyz")
+	}
+	if _, w := e.login("admin", testPassword); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("not locked: %d", w.Code)
+	}
+	if err := e.st.ResetCredentials(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, w := e.login("admin", testPassword); w.Code != 200 {
+		t.Fatalf("still locked after unlock: %d %s", w.Code, w.Body)
+	}
+}

@@ -807,3 +807,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "changed the administrator password (all sessions ended)")
 	writeJSON(w, http.StatusOK, map[string]any{"csrf_token": csrf})
 }
+
+// ValidUsername reports whether u is an acceptable administrator name
+// (1-64 of letters, digits and . _ - @).
+func ValidUsername(u string) bool { return validUsername(u) }

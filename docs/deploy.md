@@ -213,6 +213,13 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   the first requests all come from one address. This setting only affects
   the client address; it never authenticates anyone (that is
   `web.trusted_header`).
+- **Locked out / lost password.** With shell access to the host:
+  `docker exec doorwarden doorwarden admin unlock` ends every session and
+  clears all login limits; `docker exec doorwarden doorwarden admin
+  reset-password` also sets a new random password, printed once on the
+  terminal (never logged), and creates the administrator (`-user`, default
+  `admin`) if none exists. Both work on the database (`-db`, default
+  `$DOORWARDEN_DB`) while the server runs.
 - **CSRF.** Every state-changing request needs the `X-Doorwarden-CSRF`
   header (the token returned by login, setup and `GET /api/v1/auth/me`), a
   JSON body, and an `Origin` that matches the request host or one of
