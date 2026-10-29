@@ -76,6 +76,71 @@ is used. Settings under `traefik:`:
 Do not define `tls.options.default` or `tls.stores.default` in another file of
 Traefik's dynamic directory: Traefik keeps only one of them.
 
+## HTTP-01 challenge route
+
+Zones with `certificate.challenge: http-01` are validated by the CA over
+plain HTTP on port 80 at `http://<host>/.well-known/acme-challenge/<token>`.
+Doorwarden's challenge server listens on `acme.http01_listen` inside its
+container; Traefik must forward those requests to it. When `http01_listen` is
+set and at least one zone uses `http-01`, Doorwarden writes
+`doorwarden-acme-http01.yml` into the dynamic directory with one router:
+
+```yaml
+http:
+  routers:
+    doorwarden-acme-http01:
+      entryPoints: [web]                 # traefik.http_entry_point
+      rule: (Host(`example.test`) || Host(`www.example.test`)) && PathPrefix(`/.well-known/acme-challenge/`)
+      priority: 1073741824
+      service: doorwarden-acme-http01
+  services:
+    doorwarden-acme-http01:
+      loadBalancer:
+        servers: [{url: "http://doorwarden:8089"}]   # acme.http01_backend
+        passHostHeader: true
+```
+
+- It matches only the exact host names of http-01 zones that are routes
+  (the names Doorwarden orders and renews, the zone apex included), never a
+  wildcard or catch-all, and only the challenge path. Before a cycle orders a
+  name that is not in the file yet, the file is rewritten with it and
+  Doorwarden waits a few seconds for Traefik to load it.
+- It has no TLS and no middleware, and lives only on the plain-HTTP entry
+  point, so it never shadows the HTTPS routers.
+- The Host header is passed through: the challenge server answers only for
+  the name being validated.
+- When no zone uses `http-01` (or no host needs a certificate) the file is
+  removed. With HTTP-01 off nothing changes.
+
+**The `web` redirection.** The shipped `traefik/traefik.yml` redirects all of
+`:80` to HTTPS at the entry point. Traefik implements this as a router with
+priority MaxInt-1 attached to every request on the entry point, above the
+highest priority any provider's router may use, so it would answer the CA's
+request with a redirect to HTTPS (where no certificate exists yet). The
+shipped file therefore sets the redirection's priority to 1:
+
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+          priority: 1
+```
+
+Every other request on `:80` is still redirected. If you keep an older copy
+of `traefik.yml`, add `priority: 1` and restart Traefik (static
+configuration is not reloaded). This design was checked against Traefik's
+documentation (`redirections.entryPoint.priority`, router priorities), not
+against a running Traefik in Doorwarden's test suite. If Traefik runs
+outside this compose project, set `acme.http01_backend` to the URL Traefik
+uses to reach Doorwarden's challenge port, and publish that port only to
+Traefik.
+
 ## Discovery sources and approval
 
 Each source has an `approval` mode: `auto` (publish what is discovered),
