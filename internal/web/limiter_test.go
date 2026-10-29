@@ -131,8 +131,8 @@ func TestLimiterCleanSurvivesDirtyFlood(t *testing.T) {
 		ran++
 		at.done(false)
 	}
-	if ran > dirtyBurst {
-		t.Fatalf("%d dirty attempts ran, the dirty bucket allows %d", ran, dirtyBurst)
+	if ran > totalBurst-cleanReserve {
+		t.Fatalf("%d dirty attempts ran, the dirty share is %d", ran, totalBurst-cleanReserve)
 	}
 	at, err := l.begin("admin", ipa("198.51.100.77"))
 	if err != nil || at.delay > limiterMaxDelay {
@@ -141,22 +141,22 @@ func TestLimiterCleanSurvivesDirtyFlood(t *testing.T) {
 	at.done(true)
 
 	// Clean attempts that never complete: the bucket runs dry, the next
-	// one is delayed, then refused (transiently).
+	// ones are delayed (up to limiterMaxDelay), then refused (transiently).
 	l2 := newLimiter(clk.now)
 	var got []error
-	for i := range cleanBurst + 3 {
+	for i := range totalBurst + 3 {
 		at, err := l2.begin("admin", ipa(fmt.Sprintf("198.51.100.%d", i)))
 		got = append(got, err)
-		if err == nil && i == cleanBurst && at.delay == 0 {
-			t.Fatal("clean attempt past the burst not delayed")
+		if err == nil && i >= totalBurst && (at.delay == 0 || at.delay > limiterMaxDelay) {
+			t.Fatalf("clean attempt %d past the burst: delay %v", i, at.delay)
 		}
 	}
-	if got[cleanBurst] != nil || got[cleanBurst+2] == nil {
-		t.Fatalf("clean refusals = %v", got)
+	if got[totalBurst] != nil || got[totalBurst+1] != nil || got[totalBurst+2] == nil {
+		t.Fatalf("clean refusals = %v", got[totalBurst:])
 	}
 	clk.add(time.Minute)
 	if _, err := l2.begin("admin", ipa("198.51.100.99")); err != nil {
-		t.Fatalf("clean bucket did not refill: %v", err)
+		t.Fatalf("bucket did not refill: %v", err)
 	}
 }
 
@@ -165,7 +165,7 @@ func TestLimiterCleanWaiterCap(t *testing.T) {
 	clk := newFakeNow()
 	l := newLimiter(clk.now)
 	l.delayed = limiterMaxDelayed
-	for i := range cleanBurst {
+	for i := range totalBurst {
 		at, err := l.begin("admin", ipa(fmt.Sprintf("198.51.100.%d", i)))
 		if err != nil {
 			t.Fatal(err)
@@ -233,7 +233,7 @@ func TestLimiterSetupSeparate(t *testing.T) {
 		l.login.pairs[fmt.Sprintf("admin\x00198.51.100.%d", i)] = lockedEntry(now)
 		l.login.ips[fmt.Sprintf("198.51.100.%d", i)] = lockedEntry(now)
 	}
-	for range cleanBurst {
+	for range totalBurst {
 		if at, err := l.begin("admin", ipa("203.0.113.50")); err == nil {
 			at.cancel()
 		}
@@ -296,8 +296,8 @@ func TestLimiterNameSprayBounded(t *testing.T) {
 		clk.add(50 * time.Millisecond)
 	}
 	sc := l.login
-	if len(sc.users) > 2 || len(sc.pairs) > l.maxKeys || len(sc.ips) > l.maxKeys || len(sc.inflight) != 0 {
-		t.Fatalf("tables grew: users=%d pairs=%d ips=%d inflight=%d", len(sc.users), len(sc.pairs), len(sc.ips), len(sc.inflight))
+	if len(sc.buckets) > 2 || len(sc.pairs) > l.maxKeys || len(sc.ips) > l.maxKeys || len(sc.inflight) != 0 {
+		t.Fatalf("tables grew: buckets=%d pairs=%d ips=%d inflight=%d", len(sc.buckets), len(sc.pairs), len(sc.ips), len(sc.inflight))
 	}
 	if got := limitUser("ADMIN", adm, true); got != "admin" {
 		t.Fatalf("admin bucket = %q", got)
@@ -409,9 +409,8 @@ func TestSetupThrottlePerAddressOnly(t *testing.T) {
 	if w := bad.do("POST", "/api/v1/auth/setup", map[string]string{"username": "admin", "password": testPassword, "token": testToken}); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("setup address not throttled: %d", w.Code)
 	}
-	// The wrong tokens drained the clean setup bucket; it refills, and
-	// then setup from a clean address goes through.
-	e.advance(time.Minute)
+	// Setup budgets are per source: setup from another address goes
+	// through at once.
 	e.setupAdmin()
 }
 
@@ -432,5 +431,115 @@ func TestUnlockClearsRunningLimits(t *testing.T) {
 	}
 	if _, w := e.login("admin", testPassword); w.Code != 200 {
 		t.Fatalf("still locked after unlock: %d %s", w.Code, w.Body)
+	}
+}
+
+// Amendment 1: clean attempts are counted in flight like dirty ones, so a
+// concurrent burst from one new address admits at most the pair bound.
+func TestLimiterCleanBurstBounded(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	admitted := 0
+	var held []*attempt
+	for range 200 {
+		if at, err := l.begin("admin", ipa("198.51.100.5")); err == nil {
+			admitted++
+			held = append(held, at)
+		}
+	}
+	if admitted != pairThreshold {
+		t.Fatalf("admitted %d concurrent attempts from one new address, bound %d", admitted, pairThreshold)
+	}
+	for _, at := range held {
+		at.done(false)
+	}
+	if _, err := l.begin("admin", ipa("198.51.100.5")); err == nil {
+		t.Fatal("pair not locked after the burst's failures")
+	}
+	// Across names, one source is bounded by ipThreshold.
+	admitted = 0
+	for i := range 200 {
+		if _, err := l.begin(fmt.Sprintf("u%d", i), ipa("198.51.100.6")); err == nil {
+			admitted++
+		}
+	}
+	if admitted != ipThreshold {
+		t.Fatalf("admitted %d across names from one source, bound %d", admitted, ipThreshold)
+	}
+	if len(l.login.inflight) == 0 {
+		t.Fatal("clean attempts not counted in flight")
+	}
+}
+
+// Amendment 2: every attempt is charged to the user's total bucket, so
+// rotating fresh sources cannot exceed the total rate; dirty traffic
+// exhausts only the dirty share and the clean reserve stays available.
+func TestLimiterTotalCap(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	admitted := 0
+	for i := range 36_000 { // one fresh source every 100ms for an hour
+		ip := netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)})
+		if at, err := l.begin("admin", ip); err == nil {
+			admitted++
+			at.done(false)
+		}
+		clk.add(100 * time.Millisecond)
+	}
+	if limit := totalBurst + int(60*totalRate) + 2; admitted > limit {
+		t.Fatalf("%d guesses in an hour from rotating sources, cap %d", admitted, limit)
+	}
+	if admitted < int(60*totalRate)/2 {
+		t.Fatalf("only %d admitted: clean sources starved", admitted)
+	}
+
+	// Reserve: dirty sources drain only down to cleanReserve.
+	l = newLimiter(clk.now)
+	for i := range 100 {
+		failN(t, l, clk, "admin", fmt.Sprintf("203.0.113.%d", i), 1)
+	}
+	clk.add(time.Minute)
+	for i := range 1000 {
+		if at, err := l.begin("admin", ipa(fmt.Sprintf("203.0.113.%d", i%100))); err == nil {
+			at.cancel()
+		}
+	}
+	for i := range cleanReserve {
+		at, err := l.begin("admin", ipa(fmt.Sprintf("192.0.2.%d", i)))
+		if err != nil || at.delay != 0 {
+			t.Fatalf("clean reserve %d not available: %v", i, err)
+		}
+		at.cancel()
+	}
+}
+
+// Amendment 3: setup budgets are per source only. Exhausting one source's
+// setup budget, or more sources than the table holds, never delays or
+// refuses a new source's first attempt.
+func TestLimiterSetupPerSource(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	l.maxKeys = 50
+	for range 3 * setupBurst {
+		if at, err := l.begin("", ipa("203.0.113.9")); err == nil {
+			at.cancel()
+		}
+	}
+	if _, err := l.begin("", ipa("203.0.113.9")); err == nil {
+		t.Fatal("one source's setup budget is unbounded")
+	}
+	for i := range 1000 {
+		ip := netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)})
+		at, err := l.begin("", ip)
+		if err != nil || at.delay != 0 {
+			t.Fatalf("new setup source %d: %v delay %v", i, err, at)
+		}
+		at.cancel()
+	}
+	if len(l.setup.buckets) > l.maxKeys {
+		t.Fatalf("setup buckets = %d", len(l.setup.buckets))
+	}
+	if len(l.login.buckets) != 0 {
+		t.Fatal("setup charged a login bucket")
 	}
 }

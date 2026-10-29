@@ -14,27 +14,40 @@ import (
 //     so traffic in one cannot exhaust the other.
 //   - A source is DIRTY for a user when its (user, source) pair, or (login
 //     only) the source across all names, has a recorded failure within
-//     limiterForget; otherwise CLEAN. Entries exist only for recorded
-//     failures (a success deletes them), so a clean source needs no entry.
-//   - Dirty attempts: refused (429 + Retry-After) while the pair or source
-//     is in backoff (pairThreshold / ipThreshold failures, then limiterBase
-//     doubling to limiterMax), while the pair already has as many attempts
-//     in flight as failures left, or when the user's DIRTY bucket is
-//     empty.
-//   - Clean attempts draw only from the user's CLEAN bucket, which dirty
-//     attempts never touch. With it empty the attempt is delayed until its
-//     token is due, at most limiterMaxDelay, with at most limiterMaxDelayed
-//     callers waiting; beyond that it gets 429 + Retry-After for that
-//     attempt only. The clean bucket refills one token per limiterMaxDelay,
-//     so a dirty flood of any size never keeps a clean source out: its
-//     login gets in within limiterMaxDelay. Nothing ever runs uncharged.
+//     limiterForget; otherwise CLEAN. Failure entries exist only for
+//     recorded failures (a success deletes them).
+//   - Every attempt, clean or dirty, is counted in flight under its pair
+//     and (login) source key, bounded by max(1, threshold - fails) with
+//     fails = 0 when there is no entry, so a concurrent burst cannot
+//     overrun a threshold before its failures are recorded.
+//   - Dirty attempts are refused (429 + Retry-After) while the pair or
+//     source is in backoff (pairThreshold / ipThreshold failures, then
+//     limiterBase doubling to limiterMax).
+//   - Login budget: one TOTAL bucket per user name (totalBurst, totalRate)
+//     charged by every attempt. cleanReserve tokens of it are a share that
+//     only clean attempts may use: a dirty attempt is refused when taking a
+//     token would leave less than cleanReserve, so a dirty flood of any
+//     size exhausts only the dirty share. A clean attempt may use any
+//     token; with none left it is delayed until its token is due, at most
+//     limiterMaxDelay, with at most limiterMaxDelayed callers waiting, and
+//     beyond that gets 429 + Retry-After for that attempt only. Nothing
+//     ever runs uncharged.
+//   - Accepted residual risk: rotating fresh (clean) sources cannot exceed
+//     the total rate, i.e. at most totalBurst + 60*totalRate = 1830 guesses
+//     in any hour (about 43k a day) against the administrator's name, each
+//     an argon2id check of a password of at least 15 characters.
 //   - Buckets exist for the administrator's name and one shared
 //     unknownUser (every other name), so name sprays cannot grow tables.
+//   - Setup budget: per SOURCE only (setupBurst, setupRate), no shared
+//     bucket: the setup token is 192-bit random, so global brute-force
+//     protection is unnecessary and a shared bucket would only let anyone
+//     block first-run setup. A full setup bucket table evicts the least
+//     recently used bucket.
 //   - Tables are bounded (maxKeys). Recording a failure in a full table
 //     evicts the least recently used entry that is not in backoff; when
 //     every entry is in backoff the failure is not recorded (fail closed
 //     for dirty state only: the source then stays clean, which is still
-//     throttled by the small clean bucket). Idle entries are pruned after
+//     charged against the total bucket). Idle entries are pruned after
 //     limiterForget, lazily at most once per limiterPruneEvery.
 //   - Attempts are reserved before the argon2 check and re-checked for a
 //     new backoff once a hashing slot is held.
@@ -49,11 +62,12 @@ const (
 	limiterForget     = time.Hour
 	limiterPruneEvery = time.Minute
 	limiterMaxKeys    = 10000
-	dirtyBurst        = 30
-	dirtyRate         = 30.0 // per minute
-	cleanBurst        = 5
+	totalBurst        = 30
+	totalRate         = 30.0 // per minute
+	cleanReserve      = 5
+	setupBurst        = 5
+	setupRate         = 12.0 // per minute
 	limiterMaxDelay   = 5 * time.Second
-	cleanRate         = float64(time.Minute) / float64(limiterMaxDelay) // per minute: one per max delay
 	limiterMaxDelayed = 16
 	// unknownUser is the shared bucket of every name that is not the
 	// administrator's.
@@ -83,22 +97,31 @@ func (b *bucket) refill(now time.Time) {
 	b.at = now
 }
 
-// due is how long until the next token.
-func (b *bucket) due() time.Duration {
-	return time.Duration((1 - b.tokens) / b.rate * float64(time.Minute))
+// due is how long until the bucket holds n tokens.
+func (b *bucket) due(n float64) time.Duration {
+	return time.Duration((n - b.tokens) / b.rate * float64(time.Minute))
 }
-
-type userBuckets struct{ dirty, clean bucket }
 
 type scope struct {
 	pairs    map[string]*limEntry
 	ips      map[string]*limEntry // login only
-	inflight map[string]int       // dirty pair/source keys with attempts in flight
-	users    map[string]*userBuckets
+	inflight map[string]int       // pair/source keys with attempts in flight
+	// buckets: login per user name (limitUser), setup per source.
+	buckets map[string]*bucket
+	setup   bool
+	reserve float64
+	burst   float64
+	rate    float64
 }
 
-func newScope() *scope {
-	return &scope{pairs: map[string]*limEntry{}, ips: map[string]*limEntry{}, inflight: map[string]int{}, users: map[string]*userBuckets{}}
+func newScope(setup bool) *scope {
+	sc := &scope{pairs: map[string]*limEntry{}, ips: map[string]*limEntry{}, inflight: map[string]int{}, buckets: map[string]*bucket{}, setup: setup}
+	if setup {
+		sc.burst, sc.rate = setupBurst, setupRate
+	} else {
+		sc.burst, sc.rate, sc.reserve = totalBurst, totalRate, cleanReserve
+	}
+	return sc
 }
 
 type limiter struct {
@@ -120,7 +143,7 @@ func newLimiter(now func() time.Time) *limiter {
 }
 
 func (l *limiter) reset() {
-	l.login, l.setup = newScope(), newScope()
+	l.login, l.setup = newScope(false), newScope(true)
 }
 
 // resetAll clears every limit (the administrator was just created).
@@ -160,7 +183,7 @@ type attempt struct {
 	pairK string
 	ipK   string // "" for setup
 	// trackPair, trackIP: the attempt is counted in sc.inflight under
-	// pairK / ipK (dirty source).
+	// pairK / ipK.
 	trackPair, trackIP bool
 	// delay is how long the caller must wait before checking the password
 	// (its clean token is not due yet); undelay ends the wait.
@@ -182,29 +205,40 @@ func (l *limiter) maybePrune(now time.Time) {
 				}
 			}
 		}
-		for k, b := range sc.users {
-			if now.Sub(b.dirty.at) > limiterForget && now.Sub(b.clean.at) > limiterForget {
-				delete(sc.users, k)
+		for k, b := range sc.buckets {
+			if now.Sub(b.at) > limiterForget {
+				delete(sc.buckets, k)
 			}
 		}
 	}
 }
 
-func (l *limiter) buckets(sc *scope, user string, now time.Time) *userBuckets {
-	if b := sc.users[user]; b != nil {
+// bucket returns the bucket for key. A full table falls back to the shared
+// unknownUser bucket (login) or evicts the least recently used bucket
+// (setup: per source only, never shared).
+func (l *limiter) bucket(sc *scope, key string, now time.Time) *bucket {
+	if b := sc.buckets[key]; b != nil {
 		return b
 	}
-	if len(sc.users) >= l.maxKeys {
-		user = unknownUser
-		if b := sc.users[user]; b != nil {
-			return b
+	if len(sc.buckets) >= l.maxKeys {
+		if !sc.setup {
+			key = unknownUser
+			if b := sc.buckets[key]; b != nil {
+				return b
+			}
+		} else {
+			var oldK string
+			var old *bucket
+			for k, b := range sc.buckets {
+				if old == nil || b.at.Before(old.at) {
+					oldK, old = k, b
+				}
+			}
+			delete(sc.buckets, oldK)
 		}
 	}
-	b := &userBuckets{
-		dirty: bucket{tokens: dirtyBurst, at: now, rate: dirtyRate, burst: dirtyBurst},
-		clean: bucket{tokens: cleanBurst, at: now, rate: cleanRate, burst: cleanBurst},
-	}
-	sc.users[user] = b
+	b := &bucket{tokens: sc.burst, at: now, rate: sc.rate, burst: sc.burst}
+	sc.buckets[key] = b
 	return b
 }
 
@@ -221,52 +255,55 @@ func (l *limiter) begin(user string, ip netip.Addr) (*attempt, error) {
 		sc = l.setup
 	}
 	at := &attempt{l: l, sc: sc, pairK: user + "\x00" + src}
-	if sc == l.login {
+	if !sc.setup {
 		at.ipK = src
 	}
 	pair, ipe := sc.pairs[at.pairK], sc.ips[at.ipK]
-	b := l.buckets(sc, user, now)
-	if pair != nil || ipe != nil { // dirty
-		for _, x := range []struct {
-			e         *limEntry
-			k         string
-			threshold int
-		}{{pair, at.pairK, pairThreshold}, {ipe, at.ipK, ipThreshold}} {
-			if x.e == nil {
-				continue
-			}
+	dirty := pair != nil || ipe != nil
+	for _, x := range []struct {
+		e         *limEntry
+		k         string
+		threshold int
+	}{{pair, at.pairK, pairThreshold}, {ipe, at.ipK, ipThreshold}} {
+		if x.k == "" {
+			continue
+		}
+		fails := 0
+		if x.e != nil {
 			if x.e.locked(now) {
 				return nil, throttledError{x.e.lockedUntil.Sub(now)}
 			}
-			if sc.inflight[x.k] >= max(1, x.threshold-x.e.fails) {
-				return nil, throttledError{time.Second}
-			}
+			fails = x.e.fails
 		}
-		b.dirty.refill(now)
-		if b.dirty.tokens < 1 {
-			return nil, throttledError{b.dirty.due()}
+		if sc.inflight[x.k] >= max(1, x.threshold-fails) {
+			return nil, throttledError{time.Second}
 		}
-		b.dirty.tokens--
-		if pair != nil {
-			sc.inflight[at.pairK]++
-			at.trackPair = true
-		}
-		if ipe != nil {
-			sc.inflight[at.ipK]++
-			at.trackIP = true
-		}
-		return at, nil
 	}
-	b.clean.refill(now)
-	if b.clean.tokens < 1 {
-		wait := b.clean.due()
+	bk := user
+	if sc.setup {
+		bk = src
+	}
+	b := l.bucket(sc, bk, now)
+	b.refill(now)
+	switch {
+	case dirty && b.tokens < 1+sc.reserve:
+		// Dirty attempts never take the clean share.
+		return nil, throttledError{b.due(1 + sc.reserve)}
+	case !dirty && b.tokens < 1:
+		wait := b.due(1)
 		if wait > limiterMaxDelay || l.delayed >= limiterMaxDelayed {
 			return nil, throttledError{wait}
 		}
 		at.delay, at.delayed = wait, true
 		l.delayed++
 	}
-	b.clean.tokens--
+	b.tokens--
+	sc.inflight[at.pairK]++
+	at.trackPair = true
+	if at.ipK != "" {
+		sc.inflight[at.ipK]++
+		at.trackIP = true
+	}
 	return at, nil
 }
 

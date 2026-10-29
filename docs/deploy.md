@@ -195,12 +195,13 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   throttled per (user name, client address): after 5 failures that pair
   waits 30s, doubling up to 15 minutes; one address failing for 20 user
   names is backed off the same way (IPv6 addresses count per /64).
-  Addresses with recent failures share a budget of about 30 attempts a
-  minute per user name. Addresses without failures draw from a separate,
-  small budget that failing addresses can never use up: at worst such a
+  Every attempt counts against one budget per user name of about 30 a
+  minute (at most ~1830 guesses in any hour, however many addresses are
+  used). Addresses with recent failures cannot use the last 5 of it,
+  which stay reserved for addresses without failures: at worst such a
   login waits up to 5 seconds or is asked to retry a few seconds later, so
-  failures from elsewhere can never lock the administrator out. Setup has
-  its own separate limits.
+  failures from elsewhere can never lock the administrator out. Setup is
+  limited per address only (the setup token is 192-bit random).
   Set `web.cookie_insecure: true` only when the UI is served over plain
   HTTP on a trusted LAN.
 - **Behind Traefik: set `web.trusted_proxies`.** Login throttling, audit and
