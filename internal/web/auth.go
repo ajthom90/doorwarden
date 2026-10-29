@@ -647,6 +647,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	a.tokMu.Lock()
 	a.setupToken = ""
 	a.tokMu.Unlock()
+	a.lim.resetAll() // a new administrator starts with no limits
 	a.lim.observeGeneration(0)
 	csrf, err := a.newSession(w, r, req.Username, 0)
 	if err != nil {

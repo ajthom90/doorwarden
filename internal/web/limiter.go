@@ -7,41 +7,40 @@ import (
 	"time"
 )
 
-// Login limiting. Goals: slow password guessing, never run an attempt
-// unthrottled, and never let failures from elsewhere lock the
-// administrator out for longer than the rate limit's refill.
+// Login limiting. Model:
 //
-//   - Source: the client address; IPv6 is aggregated to its /64 so one host
-//     cannot mint unlimited keys.
-//   - Failures are tracked per (user bucket, source) pair. After
-//     pairThreshold failures the pair waits limiterBase, doubling with each
-//     further failure up to limiterMax. A success deletes the pair.
-//   - Per source (all names): the same backoff after ipThreshold failures.
-//   - Per user name, across all sources: a token bucket of userBurst
-//     attempts refilled at userRate. Every attempt is charged a token. When
-//     the bucket is empty, an attempt from a source with recent failures is
-//     refused (429 + Retry-After); one from a clean source is delayed until
-//     its token is due if that is at most limiterMaxDelay away and fewer
-//     than limiterMaxDelayed callers are waiting, else refused too. Tokens
-//     refill with time, so this is a delay, never a lasting lock: once the
-//     bucket refills a clean source gets in whatever other sources did.
-//     Buckets exist only for the administrator's name; every other name
-//     shares one unknownUser bucket (and one pair per source), so spraying
-//     names cannot grow the tables. Setup ("" user) has no bucket: it is
-//     limited per source only.
-//   - The attempt is reserved (in flight) before the argon2 check, so
-//     concurrent attempts cannot overrun a threshold: a pair may have at
-//     most as many attempts in flight as it has failures left.
-//   - Entries are created only when a failure is recorded, and a success
-//     deletes them, so every entry holds failure state; entries idle for
-//     limiterForget are pruned, lazily at most once per limiterPruneEvery.
-//     A table holds at most maxKeys entries; a full table never drops
-//     failure state: attempts from sources it does not know are refused
-//     (fail closed) until pruning frees room. With the buckets capping
-//     failures at about 2*userRate per minute (admin + unknown), filling
-//     10000 entries within limiterForget takes far more than an hour.
-//   - A new admin credential generation (password change, `doorwarden
-//     admin unlock`/`reset-password`) clears everything.
+//   - Source: the client address, IPv4 per /32, IPv6 per /64.
+//   - Scopes: "login" and "setup" each have their own tables and buckets,
+//     so traffic in one cannot exhaust the other.
+//   - A source is DIRTY for a user when its (user, source) pair, or (login
+//     only) the source across all names, has a recorded failure within
+//     limiterForget; otherwise CLEAN. Entries exist only for recorded
+//     failures (a success deletes them), so a clean source needs no entry.
+//   - Dirty attempts: refused (429 + Retry-After) while the pair or source
+//     is in backoff (pairThreshold / ipThreshold failures, then limiterBase
+//     doubling to limiterMax), while the pair already has as many attempts
+//     in flight as failures left, or when the user's DIRTY bucket is
+//     empty.
+//   - Clean attempts draw only from the user's CLEAN bucket, which dirty
+//     attempts never touch. With it empty the attempt is delayed until its
+//     token is due, at most limiterMaxDelay, with at most limiterMaxDelayed
+//     callers waiting; beyond that it gets 429 + Retry-After for that
+//     attempt only. The clean bucket refills one token per limiterMaxDelay,
+//     so a dirty flood of any size never keeps a clean source out: its
+//     login gets in within limiterMaxDelay. Nothing ever runs uncharged.
+//   - Buckets exist for the administrator's name and one shared
+//     unknownUser (every other name), so name sprays cannot grow tables.
+//   - Tables are bounded (maxKeys). Recording a failure in a full table
+//     evicts the least recently used entry that is not in backoff; when
+//     every entry is in backoff the failure is not recorded (fail closed
+//     for dirty state only: the source then stays clean, which is still
+//     throttled by the small clean bucket). Idle entries are pruned after
+//     limiterForget, lazily at most once per limiterPruneEvery.
+//   - Attempts are reserved before the argon2 check and re-checked for a
+//     new backoff once a hashing slot is held.
+//   - All state is cleared on a new credential generation (password change,
+//     `doorwarden admin unlock`/`reset-password`) and when the
+//     administrator is created.
 const (
 	pairThreshold     = 5
 	ipThreshold       = 20
@@ -50,9 +49,11 @@ const (
 	limiterForget     = time.Hour
 	limiterPruneEvery = time.Minute
 	limiterMaxKeys    = 10000
-	userBurst         = 30
-	userRate          = 30 // per minute
+	dirtyBurst        = 30
+	dirtyRate         = 30.0 // per minute
+	cleanBurst        = 5
 	limiterMaxDelay   = 5 * time.Second
+	cleanRate         = float64(time.Minute) / float64(limiterMaxDelay) // per minute: one per max delay
 	limiterMaxDelayed = 16
 	// unknownUser is the shared bucket of every name that is not the
 	// administrator's.
@@ -65,18 +66,46 @@ type limEntry struct {
 	last        time.Time
 }
 
+func (e *limEntry) locked(now time.Time) bool { return e != nil && now.Before(e.lockedUntil) }
+
 type bucket struct {
 	tokens float64
 	at     time.Time
+	rate   float64 // per minute
+	burst  float64
+}
+
+func (b *bucket) refill(now time.Time) {
+	b.tokens += now.Sub(b.at).Minutes() * b.rate
+	if b.tokens > b.burst {
+		b.tokens = b.burst
+	}
+	b.at = now
+}
+
+// due is how long until the next token.
+func (b *bucket) due() time.Duration {
+	return time.Duration((1 - b.tokens) / b.rate * float64(time.Minute))
+}
+
+type userBuckets struct{ dirty, clean bucket }
+
+type scope struct {
+	pairs    map[string]*limEntry
+	ips      map[string]*limEntry // login only
+	inflight map[string]int       // dirty pair/source keys with attempts in flight
+	users    map[string]*userBuckets
+}
+
+func newScope() *scope {
+	return &scope{pairs: map[string]*limEntry{}, ips: map[string]*limEntry{}, inflight: map[string]int{}, users: map[string]*userBuckets{}}
 }
 
 type limiter struct {
 	mu        sync.Mutex
 	now       func() time.Time
-	pairs     map[string]*limEntry
-	ips       map[string]*limEntry
-	inflight  map[string]int // pair and source keys with attempts in flight
-	users     map[string]*bucket
+	login     *scope
+	setup     *scope
 	maxKeys   int
 	lastPrune time.Time
 	gen       int64
@@ -91,10 +120,14 @@ func newLimiter(now func() time.Time) *limiter {
 }
 
 func (l *limiter) reset() {
-	l.pairs = map[string]*limEntry{}
-	l.ips = map[string]*limEntry{}
-	l.inflight = map[string]int{}
-	l.users = map[string]*bucket{}
+	l.login, l.setup = newScope(), newScope()
+}
+
+// resetAll clears every limit (the administrator was just created).
+func (l *limiter) resetAll() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reset()
 }
 
 // observeGeneration clears all state when the admin credential generation
@@ -108,8 +141,8 @@ func (l *limiter) observeGeneration(g int64) {
 	l.gen, l.genSeen = g, true
 }
 
-// sourceKey is the limiter's key for a client address: IPv4 as is, IPv6
-// as its /64.
+// sourceKey is the limiter's key for a client address: IPv4 per /32, IPv6
+// per /64.
 func sourceKey(ip netip.Addr) string {
 	ip = ip.Unmap()
 	if ip.Is6() {
@@ -123,10 +156,14 @@ func sourceKey(ip netip.Addr) string {
 // attempt is a reserved login attempt.
 type attempt struct {
 	l     *limiter
+	sc    *scope
 	pairK string
-	ipK   string
+	ipK   string // "" for setup
+	// trackPair, trackIP: the attempt is counted in sc.inflight under
+	// pairK / ipK (dirty source).
+	trackPair, trackIP bool
 	// delay is how long the caller must wait before checking the password
-	// (its token is not due yet); undelay ends the wait.
+	// (its clean token is not due yet); undelay ends the wait.
 	delay   time.Duration
 	delayed bool
 	closed  bool
@@ -137,105 +174,99 @@ func (l *limiter) maybePrune(now time.Time) {
 		return
 	}
 	l.lastPrune = now
-	for _, m := range []map[string]*limEntry{l.pairs, l.ips} {
-		for k, e := range m {
-			if !now.Before(e.lockedUntil) && now.Sub(e.last) > limiterForget && l.inflight[k] == 0 {
-				delete(m, k)
+	for _, sc := range []*scope{l.login, l.setup} {
+		for _, m := range []map[string]*limEntry{sc.pairs, sc.ips} {
+			for k, e := range m {
+				if !e.locked(now) && now.Sub(e.last) > limiterForget && sc.inflight[k] == 0 {
+					delete(m, k)
+				}
+			}
+		}
+		for k, b := range sc.users {
+			if now.Sub(b.dirty.at) > limiterForget && now.Sub(b.clean.at) > limiterForget {
+				delete(sc.users, k)
 			}
 		}
 	}
-	for k, b := range l.users {
-		if now.Sub(b.at) > limiterForget {
-			delete(l.users, k)
+}
+
+func (l *limiter) buckets(sc *scope, user string, now time.Time) *userBuckets {
+	if b := sc.users[user]; b != nil {
+		return b
+	}
+	if len(sc.users) >= l.maxKeys {
+		user = unknownUser
+		if b := sc.users[user]; b != nil {
+			return b
 		}
 	}
+	b := &userBuckets{
+		dirty: bucket{tokens: dirtyBurst, at: now, rate: dirtyRate, burst: dirtyBurst},
+		clean: bucket{tokens: cleanBurst, at: now, rate: cleanRate, burst: cleanBurst},
+	}
+	sc.users[user] = b
+	return b
 }
 
-// refusal applies e's backoff and the in-flight bound for key.
-func (l *limiter) refusal(e *limEntry, key string, now time.Time, threshold int) (time.Duration, bool) {
-	fails := 0
-	if e != nil {
-		if now.Before(e.lockedUntil) {
-			return e.lockedUntil.Sub(now), true
-		}
-		fails = e.fails
-	}
-	left := threshold - fails
-	if left < 1 {
-		left = 1 // past the threshold: one attempt per backoff window
-	}
-	if l.inflight[key] >= left {
-		return time.Second, true
-	}
-	return 0, false
-}
-
-// room reports whether m can take key (present, or not full).
-func (l *limiter) room(m map[string]*limEntry, key string) bool {
-	_, ok := m[key]
-	return ok || len(m) < l.maxKeys
-}
-
-func (b *bucket) refill(now time.Time) {
-	b.tokens += now.Sub(b.at).Minutes() * userRate
-	if b.tokens > userBurst {
-		b.tokens = userBurst
-	}
-	b.at = now
-}
-
-// begin reserves an attempt for user (the bucket name from limitUser;
-// "" for setup) from ip, or refuses it with a throttledError. A refused
-// attempt changes no state.
+// begin reserves an attempt for user (the bucket name from limitUser; ""
+// for setup) from ip, or refuses it with a throttledError.
 func (l *limiter) begin(user string, ip netip.Addr) (*attempt, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 	l.maybePrune(now)
 	src := sourceKey(ip)
-	at := &attempt{l: l, pairK: "p\x00" + user + "\x00" + src}
-	full := throttledError{limiterBase}
-	if !l.room(l.pairs, at.pairK) || (l.inflight[at.pairK] == 0 && len(l.inflight) >= 2*l.maxKeys) {
-		return nil, full // fail closed: no room to record a failure
+	sc := l.login
+	if user == "" {
+		sc = l.setup
 	}
-	pair := l.pairs[at.pairK]
-	if d, refused := l.refusal(pair, at.pairK, now, pairThreshold); refused {
-		return nil, throttledError{d}
+	at := &attempt{l: l, sc: sc, pairK: user + "\x00" + src}
+	if sc == l.login {
+		at.ipK = src
 	}
-	var b *bucket
-	if user != "" {
-		at.ipK = "s\x00" + src
-		if !l.room(l.ips, at.ipK) {
-			return nil, full
-		}
-		ipe := l.ips[at.ipK]
-		if d, refused := l.refusal(ipe, at.ipK, now, ipThreshold); refused {
-			return nil, throttledError{d}
-		}
-		b = l.users[user]
-		if b == nil {
-			if len(l.users) >= l.maxKeys {
-				return nil, full
+	pair, ipe := sc.pairs[at.pairK], sc.ips[at.ipK]
+	b := l.buckets(sc, user, now)
+	if pair != nil || ipe != nil { // dirty
+		for _, x := range []struct {
+			e         *limEntry
+			k         string
+			threshold int
+		}{{pair, at.pairK, pairThreshold}, {ipe, at.ipK, ipThreshold}} {
+			if x.e == nil {
+				continue
 			}
-			b = &bucket{tokens: userBurst, at: now}
-		}
-		b.refill(now)
-		if b.tokens < 1 {
-			wait := time.Duration((1 - b.tokens) / userRate * float64(time.Minute))
-			dirty := (pair != nil && pair.fails > 0) || (ipe != nil && ipe.fails > 0)
-			if dirty || wait > limiterMaxDelay || l.delayed >= limiterMaxDelayed {
-				return nil, throttledError{wait}
+			if x.e.locked(now) {
+				return nil, throttledError{x.e.lockedUntil.Sub(now)}
 			}
-			at.delay, at.delayed = wait, true
-			l.delayed++
+			if sc.inflight[x.k] >= max(1, x.threshold-x.e.fails) {
+				return nil, throttledError{time.Second}
+			}
 		}
-		b.tokens-- // every attempt is charged
-		l.users[user] = b
+		b.dirty.refill(now)
+		if b.dirty.tokens < 1 {
+			return nil, throttledError{b.dirty.due()}
+		}
+		b.dirty.tokens--
+		if pair != nil {
+			sc.inflight[at.pairK]++
+			at.trackPair = true
+		}
+		if ipe != nil {
+			sc.inflight[at.ipK]++
+			at.trackIP = true
+		}
+		return at, nil
 	}
-	l.inflight[at.pairK]++
-	if at.ipK != "" {
-		l.inflight[at.ipK]++
+	b.clean.refill(now)
+	if b.clean.tokens < 1 {
+		wait := b.clean.due()
+		if wait > limiterMaxDelay || l.delayed >= limiterMaxDelayed {
+			return nil, throttledError{wait}
+		}
+		at.delay, at.delayed = wait, true
+		l.delayed++
 	}
+	b.clean.tokens--
 	return at, nil
 }
 
@@ -256,8 +287,8 @@ func (at *attempt) recheck() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	for _, e := range []*limEntry{l.pairs[at.pairK], l.ips[at.ipK]} {
-		if e != nil && now.Before(e.lockedUntil) {
+	for _, e := range []*limEntry{at.sc.pairs[at.pairK], at.sc.ips[at.ipK]} {
+		if e.locked(now) {
 			return throttledError{e.lockedUntil.Sub(now)}
 		}
 	}
@@ -272,6 +303,39 @@ func (at *attempt) done(ok bool) { at.finish(true, ok) }
 // was never checked).
 func (at *attempt) cancel() { at.finish(false, false) }
 
+// record adds a failure for k in m, evicting the least recently used entry
+// not in backoff when m is full; when every entry is in backoff the
+// failure is dropped (existing backoffs are never lost).
+func (l *limiter) record(sc *scope, m map[string]*limEntry, k string, threshold int, now time.Time) {
+	e := m[k]
+	if e == nil {
+		if len(m) >= l.maxKeys {
+			var oldK string
+			var old *limEntry
+			for kk, v := range m {
+				if !v.locked(now) && sc.inflight[kk] == 0 && (old == nil || v.last.Before(old.last)) {
+					oldK, old = kk, v
+				}
+			}
+			if old == nil {
+				return
+			}
+			delete(m, oldK)
+		}
+		e = &limEntry{}
+		m[k] = e
+	}
+	e.fails++
+	e.last = now
+	if e.fails >= threshold {
+		d := limiterBase << min(e.fails-threshold, 10)
+		if d > limiterMax || d <= 0 {
+			d = limiterMax
+		}
+		e.lockedUntil = now.Add(d)
+	}
+}
+
 func (at *attempt) finish(checked, ok bool) {
 	at.undelay()
 	l := at.l
@@ -281,43 +345,31 @@ func (at *attempt) finish(checked, ok bool) {
 		return
 	}
 	at.closed = true
-	now := l.now()
+	sc := at.sc
 	for _, x := range []struct {
-		m         map[string]*limEntry
-		k         string
-		threshold int
-	}{{l.pairs, at.pairK, pairThreshold}, {l.ips, at.ipK, ipThreshold}} {
-		if x.k == "" {
-			continue
-		}
-		if n := l.inflight[x.k]; n > 1 {
-			l.inflight[x.k] = n - 1
-		} else {
-			delete(l.inflight, x.k)
-		}
-		switch {
-		case !checked:
-		case ok:
-			delete(x.m, x.k)
-		default:
-			e := x.m[x.k]
-			if e == nil {
-				if len(x.m) >= l.maxKeys {
-					continue // cannot happen: begin checked for room
-				}
-				e = &limEntry{}
-				x.m[x.k] = e
-			}
-			e.fails++
-			e.last = now
-			if e.fails >= x.threshold {
-				d := limiterBase << min(e.fails-x.threshold, 10)
-				if d > limiterMax || d <= 0 {
-					d = limiterMax
-				}
-				e.lockedUntil = now.Add(d)
+		k       string
+		tracked bool
+	}{{at.pairK, at.trackPair}, {at.ipK, at.trackIP}} {
+		if n, ok := sc.inflight[x.k]; x.tracked && ok {
+			if n > 1 {
+				sc.inflight[x.k] = n - 1
+			} else {
+				delete(sc.inflight, x.k)
 			}
 		}
+	}
+	if !checked {
+		return
+	}
+	now := l.now()
+	if ok {
+		delete(sc.pairs, at.pairK)
+		delete(sc.ips, at.ipK)
+		return
+	}
+	l.record(sc, sc.pairs, at.pairK, pairThreshold, now)
+	if at.ipK != "" {
+		l.record(sc, sc.ips, at.ipK, ipThreshold, now)
 	}
 }
 

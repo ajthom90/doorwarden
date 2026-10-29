@@ -194,12 +194,14 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   all. Logout and a password change end sessions server side. Login is
   throttled per (user name, client address): after 5 failures that pair
   waits 30s, doubling up to 15 minutes; one address failing for 20 user
-  names is backed off the same way (IPv6 addresses count per /64). Across
-  all addresses the administrator's name gets about 30 attempts a minute
-  (every other name shares one such budget). When it runs out, addresses
-  that failed recently are refused, and others wait a few seconds or are
-  told to retry shortly; the budget refills every minute, so failures from
-  elsewhere can delay the administrator but never lock them out. Set `web.cookie_insecure: true` only when the UI is served over plain
+  names is backed off the same way (IPv6 addresses count per /64).
+  Addresses with recent failures share a budget of about 30 attempts a
+  minute per user name. Addresses without failures draw from a separate,
+  small budget that failing addresses can never use up: at worst such a
+  login waits up to 5 seconds or is asked to retry a few seconds later, so
+  failures from elsewhere can never lock the administrator out. Setup has
+  its own separate limits.
+  Set `web.cookie_insecure: true` only when the UI is served over plain
   HTTP on a trusted LAN.
 - **Behind Traefik: set `web.trusted_proxies`.** Login throttling, audit and
   log lines use the client address. Without `web.trusted_proxies` that is

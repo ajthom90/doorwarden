@@ -15,7 +15,18 @@ import (
 
 func ipa(s string) netip.Addr { return netip.MustParseAddr(s) }
 
-func failN(t *testing.T, l *limiter, user, ip string, n int) {
+type fakeNow struct{ t time.Time }
+
+func (f *fakeNow) now() time.Time      { return f.t }
+func (f *fakeNow) add(d time.Duration) { f.t = f.t.Add(d) }
+func newFakeNow() *fakeNow             { return &fakeNow{time.Unix(1_800_000_000, 0)} }
+func lockedEntry(now time.Time) *limEntry {
+	return &limEntry{fails: pairThreshold, lockedUntil: now.Add(10 * time.Minute), last: now}
+}
+
+// failN makes n failed attempts, advancing the clock past any clean-bucket
+// delay so the attempts themselves are never the thing refused.
+func failN(t *testing.T, l *limiter, clk *fakeNow, user, ip string, n int) {
 	t.Helper()
 	for i := range n {
 		at, err := l.begin(user, ipa(ip))
@@ -23,49 +34,54 @@ func failN(t *testing.T, l *limiter, user, ip string, n int) {
 			t.Fatalf("attempt %d refused: %v", i, err)
 		}
 		at.done(false)
+		clk.add(limiterMaxDelay)
 	}
 }
 
 // Failures are tracked per (user, address): five lock that pair with a
-// doubling backoff; the same user from another address is not affected.
+// doubling backoff; the same user from another address is not affected,
+// and a success clears the pair.
 func TestLimiterPairBackoff(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
-	failN(t, l, "admin", "198.51.100.1", pairThreshold)
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	failN(t, l, clk, "admin", "198.51.100.1", pairThreshold)
 	_, err := l.begin("admin", ipa("198.51.100.1"))
 	var te throttledError
 	if !errors.As(err, &te) || te.retry <= 0 {
 		t.Fatalf("pair not locked: %v", err)
 	}
-	if at, err := l.begin("admin", ipa("198.51.100.2")); err != nil {
+	at, err := l.begin("admin", ipa("198.51.100.2"))
+	if err != nil {
 		t.Fatalf("other address refused: %v", err)
-	} else {
-		at.done(true)
 	}
-	now = now.Add(te.retry + time.Second)
-	failN(t, l, "admin", "198.51.100.1", 1)
+	at.done(true)
+	clk.add(te.retry + time.Second)
+	failN(t, l, clk, "admin", "198.51.100.1", 1)
 	_, err = l.begin("admin", ipa("198.51.100.1"))
 	var te2 throttledError
-	if !errors.As(err, &te2) || te2.retry <= te.retry {
+	if !errors.As(err, &te2) || te2.retry <= te.retry-limiterMaxDelay {
 		t.Fatalf("backoff did not grow: %v then %v", te.retry, te2.retry)
 	}
-	now = now.Add(te2.retry + time.Second)
-	at, err := l.begin("admin", ipa("198.51.100.1"))
+	clk.add(te2.retry + time.Second)
+	at, err = l.begin("admin", ipa("198.51.100.1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	at.done(true)
-	failN(t, l, "admin", "198.51.100.1", pairThreshold-1) // reset by the success
+	if len(l.login.pairs) != 0 {
+		t.Fatal("success left failure state")
+	}
 }
 
-// Attempts are reserved before the password check: concurrent attempts
-// from one pair cannot overrun the threshold, and a cancelled reservation
-// is not a failure.
+// A dirty pair's attempts are reserved before the password check:
+// concurrent attempts cannot overrun the threshold, and a cancelled
+// reservation is not a failure.
 func TestLimiterReservesBeforeVerify(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	failN(t, l, clk, "admin", "198.51.100.1", 1)
 	var held []*attempt
-	for range pairThreshold {
+	for range pairThreshold - 1 {
 		at, err := l.begin("admin", ipa("198.51.100.1"))
 		if err != nil {
 			t.Fatalf("reservation %d refused: %v", len(held), err)
@@ -86,117 +102,170 @@ func TestLimiterReservesBeforeVerify(t *testing.T) {
 	if _, err := l.begin("admin", ipa("198.51.100.1")); err == nil {
 		t.Fatal("not locked after the reserved failures completed")
 	}
+	if len(l.login.inflight) != 0 {
+		t.Fatalf("inflight leaked: %v", l.login.inflight)
+	}
 }
 
-// Every attempt is charged a token from the user's bucket. With it empty,
-// an address with recent failures is refused, and a clean one is delayed
-// until its token is due (at most limiterMaxDelay) or refused: no attempt
-// ever runs uncharged. Refill lets a clean address in again.
-func TestLimiterBucketAlwaysCharged(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
+// Point 1: dirty attempts cannot drain the clean bucket. After a flood of
+// 10k dirty attempts from many addresses, a clean address gets in within
+// limiterMaxDelay. Clean attempts are always charged: over the clean
+// waiter cap or beyond the max delay they get a transient refusal, and
+// refill lets them in again.
+func TestLimiterCleanSurvivesDirtyFlood(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	for i := range 200 {
+		failN(t, l, clk, "admin", fmt.Sprintf("203.0.113.%d", i), 1)
+	}
+	clk.add(time.Minute) // clean bucket refills; failures stay recent
 	ran := 0
-	for i := range 300 {
+	for i := range 10_000 {
 		at, err := l.begin("admin", ipa(fmt.Sprintf("203.0.113.%d", i%200)))
 		if err != nil {
 			continue
 		}
-		if at.delay > limiterMaxDelay {
-			t.Fatalf("delay %v", at.delay)
+		if at.delay != 0 {
+			t.Fatal("dirty attempt was given a clean delay")
 		}
 		ran++
 		at.done(false)
 	}
-	// The burst plus the clean attempts whose token was due within the
-	// maximum delay.
-	if limit := userBurst + int(limiterMaxDelay.Minutes()*userRate) + 1; ran > limit {
-		t.Fatalf("%d attempts ran, the bucket allows %d", ran, limit)
+	if ran > dirtyBurst {
+		t.Fatalf("%d dirty attempts ran, the dirty bucket allows %d", ran, dirtyBurst)
 	}
-	if _, err := l.begin("admin", ipa("198.51.100.77")); err == nil {
-		t.Fatal("clean address ran uncharged with the bucket empty")
-	}
-	now = now.Add(time.Minute)
 	at, err := l.begin("admin", ipa("198.51.100.77"))
 	if err != nil || at.delay > limiterMaxDelay {
-		t.Fatalf("clean address after refill: %v %+v", err, at)
+		t.Fatalf("clean address after a dirty flood: %v %+v", err, at)
 	}
 	at.done(true)
-}
 
-// A table full of failure state never drops it: a new source is refused
-// (fail closed) until pruning frees room. Entries exist only for recorded
-// failures.
-func TestLimiterTableFullFailsClosed(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
-	l.maxKeys = 20
-	for i := range 20 { // setup scope: no bucket to run dry
-		failN(t, l, "", fmt.Sprintf("198.51.100.%d", i), pairThreshold)
-	}
-	if len(l.pairs) != 20 {
-		t.Fatalf("pairs = %d", len(l.pairs))
-	}
-	if _, err := l.begin(unknownUser, ipa("203.0.113.1")); err == nil {
-		t.Fatal("full table of locked entries accepted a new source")
-	}
-	if _, err := l.begin("", ipa("203.0.113.2")); err == nil || len(l.pairs) != 20 {
-		t.Fatalf("state dropped or new source accepted: %v %d", err, len(l.pairs))
-	}
-	// A success creates nothing.
-	l2 := newLimiter(func() time.Time { return now })
-	at, _ := l2.begin("admin", ipa("198.51.100.1"))
-	at.done(true)
-	if len(l2.pairs)+len(l2.ips)+len(l2.inflight) != 0 {
-		t.Fatalf("entries without failures: %d %d %d", len(l2.pairs), len(l2.ips), len(l2.inflight))
-	}
-	// Idle entries are pruned after limiterForget: room again.
-	now = now.Add(limiterMax + limiterForget + 2*time.Minute)
-	at, err := l.begin(unknownUser, ipa("203.0.113.1"))
-	if err != nil {
-		t.Fatalf("not pruned: %v", err)
-	}
-	at.cancel()
-	if len(l.pairs) != 0 {
-		t.Fatalf("pairs after prune = %d", len(l.pairs))
-	}
-}
-
-// Spraying 100k random user names keeps every table bounded: names other
-// than the administrator's share one bucket.
-func TestLimiterNameSprayBounded(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
-	l.maxKeys = 500
-	adm := store.Admin{Username: "admin"}
-	for i := range 100_000 {
-		name := fmt.Sprintf("u%x", rand.Uint64())
-		ip := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
-		if at, err := l.begin(limitUser(name, adm, true), ip); err == nil {
-			at.done(false)
+	// Clean attempts that never complete: the bucket runs dry, the next
+	// one is delayed, then refused (transiently).
+	l2 := newLimiter(clk.now)
+	var got []error
+	for i := range cleanBurst + 3 {
+		at, err := l2.begin("admin", ipa(fmt.Sprintf("198.51.100.%d", i)))
+		got = append(got, err)
+		if err == nil && i == cleanBurst && at.delay == 0 {
+			t.Fatal("clean attempt past the burst not delayed")
 		}
-		now = now.Add(50 * time.Millisecond)
 	}
-	if len(l.users) > 2 || len(l.pairs) > l.maxKeys || len(l.ips) > l.maxKeys || len(l.inflight) != 0 {
-		t.Fatalf("tables grew: users=%d pairs=%d ips=%d inflight=%d", len(l.users), len(l.pairs), len(l.ips), len(l.inflight))
+	if got[cleanBurst] != nil || got[cleanBurst+2] == nil {
+		t.Fatalf("clean refusals = %v", got)
 	}
-	if got := limitUser("ADMIN", adm, true); got != "admin" {
-		t.Fatalf("admin bucket = %q", got)
-	}
-	if limitUser("bad name!", adm, true) != unknownUser || limitUser("admin", adm, false) != unknownUser {
-		t.Fatal("invalid or unknown names must share the unknown bucket")
+	clk.add(time.Minute)
+	if _, err := l2.begin("admin", ipa("198.51.100.99")); err != nil {
+		t.Fatalf("clean bucket did not refill: %v", err)
 	}
 }
 
-// IPv6 sources are aggregated to their /64: one host cannot mint keys.
-func TestLimiterIPv6Aggregation(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
-	for i := range pairThreshold {
-		at, err := l.begin("admin", ipa(fmt.Sprintf("2001:db8:0:1::%x", i+1)))
+// The clean waiter cap refuses (429) rather than letting attempts through.
+func TestLimiterCleanWaiterCap(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	l.delayed = limiterMaxDelayed
+	for i := range cleanBurst {
+		at, err := l.begin("admin", ipa(fmt.Sprintf("198.51.100.%d", i)))
 		if err != nil {
 			t.Fatal(err)
 		}
-		at.done(false)
+		at.cancel()
+	}
+	if _, err := l.begin("admin", ipa("198.51.100.200")); err == nil {
+		t.Fatal("waiter cap full but the attempt ran")
+	}
+}
+
+// Point 2: a full table evicts the least recently used entry not in
+// backoff; when every entry is in backoff the new failure is dropped
+// (existing backoffs are kept) and clean sources still get in.
+func TestLimiterTablePressure(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	l.maxKeys = 20
+	now := clk.now()
+	for i := range 20 {
+		l.login.pairs[fmt.Sprintf("admin\x00198.51.100.%d", i)] = lockedEntry(now)
+	}
+	failN(t, l, clk, "admin", "203.0.113.1", 1)
+	if len(l.login.pairs) != 20 {
+		t.Fatalf("pairs = %d", len(l.login.pairs))
+	}
+	if _, ok := l.login.pairs["admin\x00203.0.113.1"]; ok {
+		t.Fatal("a locked entry was evicted")
+	}
+	at, err := l.begin("admin", ipa("203.0.113.2"))
+	if err != nil {
+		t.Fatalf("clean source refused under table pressure: %v", err)
+	}
+	at.done(true)
+	// One entry whose backoff ended is evictable (the oldest such).
+	old := l.login.pairs["admin\x00198.51.100.3"]
+	old.lockedUntil, old.last = now.Add(-time.Second), now.Add(-time.Minute)
+	failN(t, l, clk, "admin", "203.0.113.3", 1)
+	if _, ok := l.login.pairs["admin\x00198.51.100.3"]; ok {
+		t.Fatal("expired entry not evicted")
+	}
+	if _, ok := l.login.pairs["admin\x00203.0.113.3"]; !ok || len(l.login.pairs) != 20 {
+		t.Fatal("new failure not recorded after eviction")
+	}
+	// Idle entries are pruned.
+	clk.add(limiterMax + limiterForget + 2*time.Minute)
+	at, err = l.begin("admin", ipa("192.0.2.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at.cancel()
+	if len(l.login.pairs) != 0 {
+		t.Fatalf("pairs after prune = %d", len(l.login.pairs))
+	}
+}
+
+// Point 3: setup has its own tables and buckets; login pressure does not
+// reach it and vice versa. Creating the administrator clears everything.
+func TestLimiterSetupSeparate(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	l.maxKeys = 5
+	now := clk.now()
+	for i := range 5 {
+		l.login.pairs[fmt.Sprintf("admin\x00198.51.100.%d", i)] = lockedEntry(now)
+		l.login.ips[fmt.Sprintf("198.51.100.%d", i)] = lockedEntry(now)
+	}
+	for range cleanBurst {
+		if at, err := l.begin("admin", ipa("203.0.113.50")); err == nil {
+			at.cancel()
+		}
+	}
+	failN(t, l, clk, "", "198.51.100.1", 1) // setup from a login-locked source
+	if _, ok := l.setup.pairs["\x00198.51.100.1"]; !ok {
+		t.Fatal("setup failure not recorded in its own table")
+	}
+	if len(l.login.pairs) != 5 {
+		t.Fatal("setup touched the login table")
+	}
+	failN(t, l, clk, "", "198.51.100.1", pairThreshold-1)
+	if _, err := l.begin("", ipa("198.51.100.1")); err == nil {
+		t.Fatal("setup source not backed off")
+	}
+	if at, err := l.begin("", ipa("198.51.100.2")); err != nil {
+		t.Fatalf("other setup source refused: %v", err)
+	} else {
+		at.cancel()
+	}
+	l.resetAll()
+	if len(l.login.pairs)+len(l.setup.pairs)+len(l.login.ips) != 0 {
+		t.Fatal("resetAll kept state")
+	}
+}
+
+// Point 4: IPv6 sources are aggregated to their /64, IPv4 to /32.
+func TestLimiterSourceAggregation(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	for i := range pairThreshold {
+		failN(t, l, clk, "admin", fmt.Sprintf("2001:db8:0:1::%x", i+1), 1)
 	}
 	if _, err := l.begin("admin", ipa("2001:db8:0:1:ffff::9")); err == nil {
 		t.Fatal("another address in the same /64 not locked")
@@ -206,18 +275,45 @@ func TestLimiterIPv6Aggregation(t *testing.T) {
 		t.Fatalf("another /64 locked: %v", err)
 	}
 	at.cancel()
-	if sourceKey(ipa("::ffff:192.0.2.1")) != "192.0.2.1" {
-		t.Fatal("v4-mapped address not unmapped")
+	if sourceKey(ipa("::ffff:192.0.2.1")) != "192.0.2.1" || sourceKey(ipa("192.0.2.1")) == sourceKey(ipa("192.0.2.2")) {
+		t.Fatal("IPv4 must be per /32 (and v4-mapped unmapped)")
+	}
+}
+
+// Point 5: spraying 100k random user names keeps every table bounded:
+// names other than the administrator's share one bucket.
+func TestLimiterNameSprayBounded(t *testing.T) {
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
+	l.maxKeys = 500
+	adm := store.Admin{Username: "admin"}
+	for i := range 100_000 {
+		name := fmt.Sprintf("u%x", rand.Uint64())
+		ip := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
+		if at, err := l.begin(limitUser(name, adm, true), ip); err == nil {
+			at.done(false)
+		}
+		clk.add(50 * time.Millisecond)
+	}
+	sc := l.login
+	if len(sc.users) > 2 || len(sc.pairs) > l.maxKeys || len(sc.ips) > l.maxKeys || len(sc.inflight) != 0 {
+		t.Fatalf("tables grew: users=%d pairs=%d ips=%d inflight=%d", len(sc.users), len(sc.pairs), len(sc.ips), len(sc.inflight))
+	}
+	if got := limitUser("ADMIN", adm, true); got != "admin" {
+		t.Fatalf("admin bucket = %q", got)
+	}
+	if limitUser("bad name!", adm, true) != unknownUser || limitUser("admin", adm, false) != unknownUser {
+		t.Fatal("invalid or unknown names must share the unknown bucket")
 	}
 }
 
 // A new credential generation (password change, `doorwarden admin unlock`
 // or reset-password) clears all throttle state.
 func TestLimiterGenerationReset(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	l := newLimiter(func() time.Time { return now })
+	clk := newFakeNow()
+	l := newLimiter(clk.now)
 	l.observeGeneration(0)
-	failN(t, l, "admin", "198.51.100.1", pairThreshold)
+	failN(t, l, clk, "admin", "198.51.100.1", pairThreshold)
 	if _, err := l.begin("admin", ipa("198.51.100.1")); err == nil {
 		t.Fatal("not locked")
 	}
@@ -299,6 +395,7 @@ func TestProxyClientFailuresIsolated(t *testing.T) {
 // addresses never block the right token from another.
 func TestSetupThrottlePerAddressOnly(t *testing.T) {
 	e := newTestEnv(t)
+	e.srv.auth.sleep = func(context.Context, time.Duration) {}
 	for i := range 50 {
 		c := e.anon()
 		c.remote = fmt.Sprintf("203.0.113.%d:1", i)
@@ -312,7 +409,10 @@ func TestSetupThrottlePerAddressOnly(t *testing.T) {
 	if w := bad.do("POST", "/api/v1/auth/setup", map[string]string{"username": "admin", "password": testPassword, "token": testToken}); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("setup address not throttled: %d", w.Code)
 	}
-	e.setupAdmin() // from a clean address
+	// The wrong tokens drained the clean setup bucket; it refills, and
+	// then setup from a clean address goes through.
+	e.advance(time.Minute)
+	e.setupAdmin()
 }
 
 // `doorwarden admin unlock` (store.ResetCredentials) takes effect on the
