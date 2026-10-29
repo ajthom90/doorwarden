@@ -292,10 +292,9 @@ func TestDefaultZone(t *testing.T) {
 	}
 }
 
-// More than one zone with a docker or truenas source enabled needs
-// settings.default_zone (the host discovered backends use is that zone's
-// target_ip); static-only configs do not.
-func TestDefaultZoneRequiredForMultiZoneDiscovery(t *testing.T) {
+// Several zones with discovery and no default_zone is valid: zone-less
+// discovered services become per-service errors at runtime instead.
+func TestDefaultZoneNotRequiredForMultiZoneDiscovery(t *testing.T) {
 	two := `
 zones:
   - name: example.test
@@ -312,8 +311,9 @@ providers:
 		wantErr     bool
 	}{
 		{"static only", "", false},
-		{"docker", "sources:\n  docker: {host: unix:///var/run/docker.sock}\n", true},
-		{"truenas", "sources:\n  truenas: {url: https://192.0.2.20, api_key: k}\n", true},
+		{"docker", "sources:\n  docker: {host: unix:///var/run/docker.sock}\n", false},
+		{"truenas", "sources:\n  truenas: {url: https://192.0.2.20, api_key: k}\n", false},
+		{"unknown default", "settings: {default_zone: nope.test}\n", true},
 		{"docker with default", "sources:\n  docker: {host: unix:///var/run/docker.sock}\nsettings: {default_zone: lan.test}\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

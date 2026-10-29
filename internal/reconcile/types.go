@@ -132,6 +132,12 @@ const (
 	// CauseRename: a hostname loser renamed away from its persisted
 	// hostname. Decided on current labels; the executor trusts the plan.
 	CauseRename RemovalCause = "rename"
+	// CauseQuarantine: an approved service's content changed (approve
+	// mode) and it is not served until re-approved. The route row is kept
+	// but marked quarantined (not rendered), so the key stays the
+	// hostname's incumbent; the service is present, so its DNS records
+	// and certificates stay. Applied as planned.
+	CauseQuarantine RemovalCause = "quarantine"
 )
 
 // KnownService is what the caller remembers about a service that was
@@ -139,6 +145,8 @@ const (
 type KnownService struct {
 	Key, Source, Zone, Hostname string
 	RemovedAfter                *time.Time
+	// Quarantined: the route is kept but not rendered (CauseQuarantine).
+	Quarantined bool
 }
 
 // Observed is the world as last seen by the caller.
@@ -156,6 +164,12 @@ type Observed struct {
 	LastKnown map[string]model.Backend
 	// Known maps a service key to a previously published service.
 	Known map[string]KnownService
+	// Quarantined holds the keys the approval gate reports quarantined
+	// (approve mode: a Pending service whose stored approval no longer
+	// matches its content). Such a service is not served (RouteRemove with
+	// CauseQuarantine) but keeps its hostname as an incumbent and its DNS
+	// records and certificates until it is re-approved.
+	Quarantined map[string]bool
 	// OwnedMissing holds OwnedRowKey of every Owned row whose normalized
 	// name+type is absent from a SUCCESSFUL listing of its provider/zone.
 	// Rows of a pair that was not listed are never in it (unknown).

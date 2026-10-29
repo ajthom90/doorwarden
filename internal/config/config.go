@@ -194,8 +194,9 @@ func parse(raw []byte, path string, env func(string) (string, bool)) (*Config, e
 	var c Config
 	if err := dec.Decode(&c); err != nil && err != io.EOF {
 		// The decoder quotes (a prefix of) the offending scalar, which may
-		// be a substituted env value.
-		return nil, fmt.Errorf("parse config %s: %w", path, ScrubEnvValues(err, raw, env))
+		// be or contain a substituted env value: describeDecodeError never
+		// quotes a scalar, and the scrub stays as defence in depth.
+		return nil, fmt.Errorf("parse config %s: %w", path, ScrubEnvValues(describeDecodeError(err, out, &root), raw, env))
 	}
 	c.applyDefaults()
 	return &c, nil

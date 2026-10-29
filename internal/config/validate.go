@@ -107,11 +107,6 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 			add("%s %q must be auto, approve or off", a.name, a.v)
 		}
 	}
-	discovery := (c.Sources.Docker != nil && c.Sources.Docker.Approval != "off") ||
-		(c.Sources.TrueNAS != nil && c.Sources.TrueNAS.Approval != "off")
-	if discovery && len(c.Zones) > 1 && normZoneName(c.Settings.DefaultZone) == "" {
-		add("settings.default_zone is required with more than one zone when the docker or truenas source is enabled: discovered services use the default zone (and its target_ip) unless labelled with doorwarden.zone")
-	}
 	if dz := normZoneName(c.Settings.DefaultZone); dz != "" {
 		found := false
 		for _, z := range c.Zones {

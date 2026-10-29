@@ -13,8 +13,8 @@
 // without trailing dots (the dns/store FQDN convention). A service without a
 // zone (e.g. TrueNAS apps) uses settings.default_zone when set; otherwise,
 // when exactly one zone is configured, that zone; otherwise it is Invalid
-// ("service has no zone and no default_zone is set while N zones are
-// configured"). It never falls back to "the first configured zone".
+// ("no zone: set doorwarden.zone or settings.default_zone (N zones are
+// configured)"). It never falls back to "the first configured zone".
 //
 // Invalid: a hostname error (unknown zone, including a zone removed from the
 // config; a name with no DNS-valid characters; no zone and no default), a
@@ -34,6 +34,20 @@
 // higher-ranked winner gives it a Conflict and removes its stored row. When nobody takes the name
 // over (e.g. its Known zone was removed from the config) only Invalid is
 // emitted and nothing is removed.
+//
+// Quarantine: a Pending service in Observed.Quarantined (approve mode: its
+// stored approval no longer matches its content, e.g. the source reports
+// another backend port) is not served. On the first such cycle its route
+// is withdrawn with RouteRemove{Cause: CauseQuarantine}, which keeps the row
+// but marks it quarantined (the renderer skips it), together with an
+// Invalid ("backend changed; re-approve to resume") carrying
+// AlertQuarantined; later cycles repeat the Invalid without the alert. It
+// claims, as an incumbent, only the hostname of its persisted route (the one
+// it was approved and served under), so a same-rank squatter there gets only
+// a Conflict; a hostname its unapproved labels declare is never claimed, and
+// a quarantined service without a route claims nothing. Being present, its
+// DNS records and certificates are kept.
+// Re-approval makes it Published: its RouteWrite clears the mark.
 //
 // Middlewares fail closed: a service with an undefined middleware is Invalid
 // and so never routable, and it can never evict a working neighbor. A route

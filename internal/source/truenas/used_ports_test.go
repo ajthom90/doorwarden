@@ -64,3 +64,33 @@ func TestPortalLessErrorHasNoBackend(t *testing.T) {
 		t.Fatalf("%+v", svc)
 	}
 }
+
+// The rejection message names portals and port numbers only: a portal URL's
+// userinfo, path and query (tokens) never reach logs or the activity.
+func TestRejectedPortalErrorHasNoURL(t *testing.T) {
+	used := `[{"container_port":"80","protocol":"tcp","host_ports":[{"host_port":"30001","host_ip":"0.0.0.0"}]}]`
+	portal := `{"Web UI":"http://admin:hunter2pass@0.0.0.0:22/login?token=SECRETTOKEN123"}`
+	svc, s := list1(t, appsJSON(appWithPorts("a", portal, used)), nil)
+	if svc.State != model.StateError {
+		t.Fatalf("%+v", svc)
+	}
+	w := strings.Join(s.Warnings(), "\n")
+	for _, bad := range []string{"hunter2", "admin:", "SECRETTOKEN", "token=", "login", "http://"} {
+		if strings.Contains(w, bad) {
+			t.Fatalf("warning leaks %q: %s", bad, w)
+		}
+	}
+	if !strings.Contains(w, "Web UI") || !strings.Contains(w, "22") {
+		t.Fatalf("warning lacks the portal name/port: %s", w)
+	}
+}
+
+// An unparsable portal is not judged: with no parsable portal the
+// published-ports lookup still applies.
+func TestUnparsablePortalFallsBackToPortLookup(t *testing.T) {
+	used := `[{"container_port":"80","protocol":"tcp","host_ports":[{"host_port":"30001","host_ip":"0.0.0.0"}]}]`
+	svc, _ := list1(t, appsJSON(appWithPorts("a", `{"Web UI":"::not a url::"}`, used)), fakeLookup{ports: map[string][]int{"a": {30001}}})
+	if svc.State != model.StateDiscovered || svc.Backend.Port != 30001 {
+		t.Fatalf("%+v", svc)
+	}
+}

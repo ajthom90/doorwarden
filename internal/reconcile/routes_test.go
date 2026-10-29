@@ -269,6 +269,8 @@ type e2e struct {
 	ex  *MultiExecutor
 	// winners is Plan's hostname winners of the last cycle.
 	winners map[string]claimant
+	// quarantined is Observed.Quarantined for every cycle.
+	quarantined map[string]bool
 	// crashWindow disables the one-row-per-hostname check at the end of a
 	// cycle (for tests that deliberately leave a crash-window or source
 	// outage state); the renderer-agrees-with-Plan check still runs.
@@ -304,7 +306,7 @@ func (e *e2e) cycle(desired []model.Service, unavailable ...string) []Action {
 	for _, u := range unavailable {
 		un[u] = true
 	}
-	obs := Observed{Known: known, LastKnown: lk, Unavailable: un}
+	obs := Observed{Known: known, LastKnown: lk, Unavailable: un, Quarantined: e.quarantined}
 	acts, winners := planWithWinners(desired, obs, e.cfg, e.now)
 	if !reflect.DeepEqual(acts, Plan(desired, obs, e.cfg, e.now)) {
 		e.t.Fatal("planWithWinners differs from Plan")
@@ -497,6 +499,7 @@ func (f failingStore) UpsertRoute(context.Context, store.Route) error           
 func (f failingStore) DeleteRoute(context.Context, string) error                 { return f.err }
 func (f failingStore) SetRouteRemoval(context.Context, string, *time.Time) error { return f.err }
 func (f failingStore) ListRoutes(context.Context) ([]store.Route, error)         { return nil, f.err }
+func (f failingStore) QuarantineRoute(context.Context, string) error             { return f.err }
 func (f failingStore) DeleteRouteIfDue(context.Context, string, time.Time) (bool, error) {
 	return false, f.err
 }

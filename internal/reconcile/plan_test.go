@@ -41,9 +41,9 @@ func TestPlanDefaultZone(t *testing.T) {
 		wantHost string // "" => Invalid
 		msg      string
 	}{
-		{"no zones", nil, "", "", "no default_zone is set while 0 zones"},
+		{"no zones", nil, "", "", "no zone: set doorwarden.zone or settings.default_zone (0 zones"},
 		{"one zone implicit", one, "", "app.example.test", ""},
-		{"two zones no default", two, "", "", "no default_zone is set while 2 zones"},
+		{"two zones no default", two, "", "", "no zone: set doorwarden.zone or settings.default_zone (2 zones"},
 		{"two zones default second", two, "Other.Test.", "app.other.test", ""},
 		{"one zone explicit default", one, "example.test", "app.example.test", ""},
 		{"default not configured", two, "nope.test", "", "unknown zone"},

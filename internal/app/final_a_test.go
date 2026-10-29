@@ -329,7 +329,7 @@ func TestGateResolveErrorMarksSourceUnavailable(t *testing.T) {
 // The server's startup error (and whatever it logs) carries no fragment of
 // an env value that failed decoding or validation.
 func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
-	const secret = "S3cretEnvValue-0123456789"
+	const secret = "Qz7WkPjR9vLmTnXb4HsY2GdF"
 	env := func(k string) (string, bool) {
 		if k == "SECRET" {
 			return secret, true
@@ -338,6 +338,7 @@ func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
 	}
 	for name, extra := range map[string]string{
 		"decode":   "static:\n  - name: app\n    host: 192.0.2.5\n    port: ${SECRET}\n",
+		"mixed":    "static:\n  - name: app\n    host: 192.0.2.5\n    port: x${SECRET}\n",
 		"validate": "",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -355,11 +356,50 @@ func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
 			if err == nil {
 				t.Fatal("no error")
 			}
-			for n := 3; n <= len(secret); n++ {
-				if strings.Contains(err.Error(), secret[:n]) || strings.Contains(logBuf.String(), secret[:n]) {
-					t.Fatalf("prefix %q leaked: err=%v log=%s", secret[:n], err, logBuf.String())
+			for i := 0; i+3 <= len(secret); i++ {
+				if f := secret[i : i+3]; strings.Contains(err.Error(), f) || strings.Contains(logBuf.String(), f) {
+					t.Fatalf("fragment %q leaked: err=%v log=%s", f, err, logBuf.String())
 				}
 			}
 		})
+	}
+}
+
+// The held-invalid dedupe key is the service key plus a hash of the
+// reason's sorted problems: word order (map iteration) does not change it;
+// a different problem does.
+func TestHeldInvalidDedupeKeyStable(t *testing.T) {
+	a := invalidDedupeKey("docker:app", "labels invalid (bad port; bad scheme)")
+	b := invalidDedupeKey("docker:app", "labels invalid (bad scheme; bad port)")
+	c := invalidDedupeKey("docker:app", "labels invalid (bad zone)")
+	if a != b || a == c || !strings.HasPrefix(a, "invalid/docker:app/") || strings.Contains(a, "scheme") {
+		t.Fatalf("%q %q %q", a, b, c)
+	}
+}
+
+// Several zones and no default_zone with discovery on: one start-up
+// warning; none with a default, one zone, or static only. The truenas
+// source still builds (its apps are per-service "no zone" errors).
+func TestDefaultZoneWarning(t *testing.T) {
+	two := []config.Zone{{Name: "a.test", TargetIP: "192.0.2.1"}, {Name: "b.test", TargetIP: "192.0.2.2"}}
+	tn := &config.TrueNASSource{URL: "https://192.0.2.20", APIKey: "k"}
+	c := &config.Config{Zones: two}
+	c.Sources.TrueNAS = tn
+	if w := defaultZoneWarning(c); !strings.Contains(w, "settings.default_zone") {
+		t.Fatalf("warning = %q", w)
+	}
+	specs := BuildSources(c, nil)
+	for _, sp := range specs {
+		if sp.Name == "truenas" && (sp.Err != nil || sp.Source == nil) {
+			t.Fatalf("truenas source not built: %v", sp.Err)
+		}
+	}
+	c.Settings.DefaultZone = "b.test"
+	if w := defaultZoneWarning(c); w != "" {
+		t.Fatalf("warning with a default: %q", w)
+	}
+	c = &config.Config{Zones: two}
+	if w := defaultZoneWarning(c); w != "" {
+		t.Fatalf("warning without discovery: %q", w)
 	}
 }

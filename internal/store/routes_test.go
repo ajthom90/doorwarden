@@ -197,7 +197,7 @@ func TestRoutesMigrationAppliesOnDBAt0002(t *testing.T) {
 		t.Fatal(err)
 	}
 	// roll the database back to the 0002 state
-	if _, err := s.db.Exec(`DROP TABLE routes; DELETE FROM schema_migrations WHERE version = '0003_routes.sql'`); err != nil {
+	if _, err := s.db.Exec(`DROP TABLE routes; DELETE FROM schema_migrations WHERE version IN ('0003_routes.sql', '0005_route_quarantine.sql')`); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -326,5 +326,31 @@ func TestDeleteRouteIfDue(t *testing.T) {
 	}
 	if del(at.Add(time.Hour)) {
 		t.Fatal("deleted twice")
+	}
+}
+
+// QuarantineRoute marks a route quarantined (kept, not rendered); the next
+// UpsertRoute (a Published RouteWrite) clears it, even with the same content.
+func TestQuarantineRoute(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	if err := s.QuarantineRoute(ctx, "docker:a"); !errors.Is(err, ErrRouteNotFound) {
+		t.Fatalf("absent: %v", err)
+	}
+	r := sampleRoute("docker:a", "a.example.test", 80)
+	if err := s.UpsertRoute(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QuarantineRoute(ctx, "docker:a"); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, _ := s.GetRoute(ctx, "docker:a"); !ok || !got.Quarantined || got.Port != 80 {
+		t.Fatalf("%+v %v", got, ok)
+	}
+	if err := s.UpsertRoute(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.GetRoute(ctx, "docker:a"); got.Quarantined {
+		t.Fatal("upsert kept the quarantine")
 	}
 }
