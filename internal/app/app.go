@@ -184,7 +184,15 @@ type App struct {
 	ovMu sync.Mutex // serializes SetServiceOverride
 
 	closeOnce sync.Once
+	// ordersWait drains background ACME orders at Close (Manager.Wait;
+	// replaced in tests), bounded by drainTimeout.
+	ordersWait   func(context.Context) error
+	drainTimeout time.Duration
 }
+
+// DefaultDrainTimeout bounds how long Close waits for background ACME
+// orders to store their results.
+const DefaultDrainTimeout = 30 * time.Second
 
 // New builds the App: the approval gate, the executors and the runner. It
 // fails loudly when a zone's DNS provider is missing (NewDNSExecutor).
@@ -197,12 +205,16 @@ func New(o Options) (*App, error) {
 		notifier: o.Notifier, met: o.Metrics, now: o.Now, log: o.Log,
 		srcTO: o.SourceTimeout, dnsTO: o.DNSTimeout, renewTO: o.RenewEvery, stat: o.StatFile,
 		liveInit: o.LiveInit, beforeRenew: o.BeforeRenew,
-		trigger:  make(chan struct{}, 1),
-		seenPrev: map[string]bool{}, seenCur: map[string]bool{},
+		trigger:      make(chan struct{}, 1),
+		drainTimeout: DefaultDrainTimeout,
+		seenPrev:     map[string]bool{}, seenCur: map[string]bool{},
 		aliases: map[string]map[string]bool{}, lastLogged: map[string]string{},
 	}
 	if a.now == nil {
 		a.now = time.Now
+	}
+	if a.mgr != nil {
+		a.ordersWait = a.mgr.Wait
 	}
 	if a.log == nil {
 		a.log = slog.Default()
@@ -341,12 +353,23 @@ func (a *App) Services() []model.Service {
 // Gate returns the approval gate (the API approves through it).
 func (a *App) Gate() *approval.Gate { return a.gate }
 
-// Close releases the sources (truenas.Source.Close and any other io.Closer)
-// and drains the notifier (when it has Close(ctx)) within ctx. It does not
-// close the store. Safe to call more than once.
+// Close first waits (at most drainTimeout, and within ctx) for background
+// ACME orders, which outlive their callers and write the store and notify;
+// then it releases the sources (truenas.Source.Close and any other
+// io.Closer) and drains the notifier (when it has Close(ctx)) within ctx.
+// It does not close the store: the caller closes it after Close returns
+// (stop the loop and the HTTP server, and close the API so its async jobs
+// are cancelled, before calling Close). Safe to call more than once.
 func (a *App) Close(ctx context.Context) error {
 	var errs []error
 	a.closeOnce.Do(func() {
+		if a.ordersWait != nil {
+			wctx, cancel := context.WithTimeout(ctx, a.drainTimeout)
+			if err := a.ordersWait(wctx); err != nil {
+				a.log.Warn("shutdown: a certificate order is still running; its result may not be stored", "error", err)
+			}
+			cancel()
+		}
 		for _, s := range a.sources {
 			if s.Source == nil {
 				continue

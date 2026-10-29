@@ -51,3 +51,32 @@ func TestDryRunRefusesSideEffects(t *testing.T) {
 		t.Fatalf("skip: %d", w.Code)
 	}
 }
+
+// Server.Close waits for a running async job (a renewal) before returning,
+// so the caller can drain ACME and close the store afterwards; it is safe
+// to call twice.
+func TestServerCloseWaitsForAsyncJobs(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	if err := e.st.UpsertCert(context.Background(), storeCert("example.test")); err != nil {
+		t.Fatal(err)
+	}
+	e.ctl.renewWait = make(chan struct{})
+	if w := c.do("POST", "/api/v1/certs/example.test/renew", nil); w.Code != http.StatusAccepted {
+		t.Fatalf("renew: %d %s", w.Code, w.Body)
+	}
+	done := make(chan struct{})
+	go func() { e.srv.Close(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("Close returned while a renewal was running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(e.ctl.renewWait)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return")
+	}
+	e.srv.Close()
+}

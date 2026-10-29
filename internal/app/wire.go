@@ -187,6 +187,7 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 	appRef.Store(a)
 
 	var srv *http.Server
+	var api *web.Server
 	srvErr := make(chan error, 1)
 	if f.Listen != "" {
 		ln, err := net.Listen("tcp", f.Listen)
@@ -194,7 +195,7 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 			_ = a.Close(context.Background())
 			return fmt.Errorf("listen %s: %w", f.Listen, err)
 		}
-		api, err := web.NewServer(ctx, web.Options{
+		api, err = web.NewServer(ctx, web.Options{
 			Store: st, Control: a, Config: cfg, ConfigPath: f.Config,
 			ValidateConfig: func(raw []byte) error { return validateConfigBytes(raw, env, box != nil) },
 			Health:         a.HealthHandler(), Metrics: a.MetricsHandler(), Log: log,
@@ -231,10 +232,19 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 		runErr = err
 	}
 	log.Info("doorwarden shutting down")
-	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Shutdown order: the loop is stopped; stop HTTP, then cancel the API's
+	// async jobs (api.Close waits for them), then Close drains background
+	// ACME orders (bounded) and closes the sources and the notifier; the
+	// deferred st.Close runs last.
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second+DefaultDrainTimeout)
 	defer cancel()
 	if srv != nil {
-		_ = srv.Shutdown(sctx)
+		hctx, hcancel := context.WithTimeout(sctx, 10*time.Second)
+		_ = srv.Shutdown(hctx)
+		hcancel()
+	}
+	if api != nil {
+		api.Close()
 	}
 	if err := a.Close(sctx); err != nil {
 		log.Warn("shutdown", "error", err)

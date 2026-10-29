@@ -185,9 +185,10 @@ type Server struct {
 	handler  http.Handler
 	testTO   time.Duration
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 
 	mu       sync.Mutex
 	lastTest map[string]time.Time
@@ -275,9 +276,11 @@ func (s *Server) Events() *Broker { return s.events }
 
 // Close stops background work (renewals) and waits for it.
 func (s *Server) Close() {
-	s.cancel()
-	s.wg.Wait()
-	s.events.Close()
+	s.closeOnce.Do(func() {
+		s.cancel()
+		s.wg.Wait()
+		s.events.Close()
+	})
 }
 
 // ---- middleware and helpers

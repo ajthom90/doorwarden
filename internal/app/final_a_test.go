@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ajthom90/doorwarden/internal/approval"
 	"github.com/ajthom90/doorwarden/internal/model"
@@ -177,5 +179,55 @@ func TestDryRunRefusesCertActions(t *testing.T) {
 	}
 	if err := a.RenewCert(ctx, "example.test"); errors.Is(err, ErrDryRun) {
 		t.Fatal("refused outside dry run")
+	}
+}
+
+// Close drains background ACME orders (bounded) before it closes the
+// sources and the notifier, so the caller can close the store afterwards.
+func TestCloseWaitsForACMEOrdersBeforeClosingSources(t *testing.T) {
+	e := newEnv(t, testYAML)
+	a := e.app()
+	release := make(chan struct{})
+	var sourcesClosedEarly atomic.Bool
+	a.ordersWait = func(ctx context.Context) error {
+		select {
+		case <-release:
+			sourcesClosedEarly.Store(e.src.closed.Load() != 0)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.Close(context.Background()) }()
+	select {
+	case <-done:
+		t.Fatal("Close returned while an order was running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if e.src.closed.Load() != 0 {
+		t.Fatal("sources closed before the orders drained")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return")
+	}
+	if sourcesClosedEarly.Load() || e.src.closed.Load() != 1 {
+		t.Fatalf("closed early=%v count=%d", sourcesClosedEarly.Load(), e.src.closed.Load())
+	}
+}
+
+// The drain is bounded: a stuck order does not block shutdown forever.
+func TestCloseDrainIsBounded(t *testing.T) {
+	e := newEnv(t, testYAML)
+	a := e.app()
+	a.drainTimeout = 50 * time.Millisecond
+	a.ordersWait = func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	start := time.Now()
+	_ = a.Close(context.Background())
+	if time.Since(start) > 2*time.Second || e.src.closed.Load() != 1 {
+		t.Fatalf("took %v, sources closed %d", time.Since(start), e.src.closed.Load())
 	}
 }
