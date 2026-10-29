@@ -21,6 +21,13 @@ entryPoints:
           to: websecure
           scheme: https
           permanent: true
+          # Lowest priority, so the exact-host HTTP-01 challenge router that
+          # Doorwarden renders (doorwarden-acme-http01.yml, only when a zone
+          # uses certificate.challenge http-01) wins for
+          # /.well-known/acme-challenge/ requests. Traefik's default is
+          # MaxInt-1, above any router priority a provider can set. Every
+          # other request on :80 is still redirected to HTTPS.
+          priority: 1
   websecure:
     address: ":443"
   # Internal-only entry point for the container healthcheck. Not published.
