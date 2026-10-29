@@ -3,6 +3,7 @@ package traefik
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -310,5 +311,52 @@ func TestWriteTargetSwappedAfterLstat(t *testing.T) {
 	}
 	if fi, err := os.Lstat(p); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("target = %v, %v", fi, err)
+	}
+}
+
+// A FIFO named like an owned file never blocks the stale-file cleanup.
+func TestWriteStaleCleanupSkipsFIFO(t *testing.T) {
+	dir := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(dir, "doorwarden-stale.yml"), 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- Write(dir, files("http: {}\n", "tls: {}\n")) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write blocked on a FIFO")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "doorwarden-stale.yml")); err != nil {
+		t.Fatal("FIFO removed (not ours)")
+	}
+}
+
+// ownedFile on a path swapped to a FIFO after the Lstat does not block.
+func TestOwnedFileSwappedToFIFO(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "doorwarden-x.yml")
+	if err := os.WriteFile(p, []byte(Header+"x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afterLstat = func(target string) {
+		if target == p {
+			os.Remove(p)
+			syscall.Mkfifo(p, 0o600)
+		}
+	}
+	t.Cleanup(func() { afterLstat = func(string) {} })
+	done := make(chan bool, 1)
+	go func() { ok, _ := ownedFile(p); done <- ok }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("FIFO reported as owned")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ownedFile blocked on a swapped FIFO")
 	}
 }

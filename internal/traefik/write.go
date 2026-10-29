@@ -111,9 +111,12 @@ func WriteMode(dir string, files Files, mode os.FileMode) error {
 }
 
 // ownedFile reports whether p is a regular file (not a symlink) starting
-// with Header.
+// with Header. It opens p without following a symlink and non-blocking, and
+// confirms by fstat that it is still the regular file Lstat saw, so a FIFO
+// or device swapped in can never block the cleanup.
 func ownedFile(p string) (bool, error) {
 	fi, err := os.Lstat(p)
+	afterLstat(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -123,11 +126,18 @@ func ownedFile(p string) (bool, error) {
 	if !fi.Mode().IsRegular() {
 		return false, nil
 	}
-	f, err := os.Open(p)
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
 		return false, err
 	}
 	defer f.Close()
+	cur, err := f.Stat()
+	if err != nil || !cur.Mode().IsRegular() || !os.SameFile(fi, cur) {
+		return false, nil
+	}
 	buf := make([]byte, len(Header))
 	if _, err := io.ReadFull(f, buf); err != nil {
 		return false, nil // shorter than the header: not ours
