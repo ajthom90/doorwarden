@@ -11,9 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -255,12 +253,21 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 // LoadConfig loads the config and runs config.Validate with the DNS
 // registry's capabilities; any problem fails.
 func LoadConfig(path string, env func(string) (string, bool)) (*config.Config, error) {
+	if env == nil {
+		env = os.LookupEnv
+	}
 	cfg, err := config.Load(path, env)
 	if err != nil {
 		return nil, err
 	}
 	if errs := cfg.Validate(dns.ConfigCaps()); len(errs) > 0 {
-		return nil, fmt.Errorf("invalid config %s: %w", path, errors.Join(errs...))
+		// Validation messages quote field values, which may be substituted
+		// env values: scrub them like config.Load does its decode errors.
+		err := errors.Join(errs...)
+		if raw, rerr := os.ReadFile(path); rerr == nil {
+			err = config.ScrubEnvValues(err, raw, env)
+		}
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
 	return cfg, nil
 }
@@ -279,10 +286,10 @@ func LoadConfig(path string, env func(string) (string, bool)) (*config.Config, e
 func validateConfigBytes(raw []byte, env func(string) (string, bool), haveMasterKey bool) error {
 	cfg, err := config.Parse(raw, placeholderEnv(env))
 	if err != nil {
-		return scrubEnvValues(err, raw, env)
+		return config.ScrubEnvValues(err, raw, env)
 	}
 	if errs := cfg.Validate(dns.ConfigCaps()); len(errs) > 0 {
-		return scrubEnvValues(errors.Join(errs...), raw, env)
+		return config.ScrubEnvValues(errors.Join(errs...), raw, env)
 	}
 	if !haveMasterKey && needsMasterKey(cfg) {
 		return errors.New("the config uses secret: references or ACME issuers, which need DOORWARDEN_MASTER_KEY (not set)")
@@ -293,8 +300,6 @@ func validateConfigBytes(raw []byte, env func(string) (string, bool), haveMaster
 // envPlaceholder is what every set variable expands to when a client's
 // config document is validated.
 const envPlaceholder = "doorwarden-env-placeholder"
-
-var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
 
 // placeholderEnv reports env's variables as set (or empty) without their
 // values.
@@ -309,18 +314,6 @@ func placeholderEnv(env func(string) (string, bool)) func(string) (string, bool)
 		}
 		return envPlaceholder, true
 	}
-}
-
-// scrubEnvValues replaces the values of the variables raw references in
-// err's text.
-func scrubEnvValues(err error, raw []byte, env func(string) (string, bool)) error {
-	msg := err.Error()
-	for _, m := range envRefRe.FindAllSubmatch(raw, -1) {
-		if v, ok := env(string(m[1])); ok && len(v) >= 3 {
-			msg = strings.ReplaceAll(msg, v, "[redacted]")
-		}
-	}
-	return errors.New(msg)
 }
 
 func hasIssuer(cfg *config.Config) bool {

@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -320,5 +323,43 @@ func TestGateResolveErrorMarksSourceUnavailable(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no activity about the gate error: %+v", act)
+	}
+}
+
+// The server's startup error (and whatever it logs) carries no fragment of
+// an env value that failed decoding or validation.
+func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
+	const secret = "S3cretEnvValue-0123456789"
+	env := func(k string) (string, bool) {
+		if k == "SECRET" {
+			return secret, true
+		}
+		return "", false
+	}
+	for name, extra := range map[string]string{
+		"decode":   "static:\n  - name: app\n    host: 192.0.2.5\n    port: ${SECRET}\n",
+		"validate": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			yml := testYAML + extra
+			if extra == "" { // a validation error quoting the value
+				yml = strings.Replace(testYAML, "settings: {grace_period: 1h, poll_interval: 1h}",
+					"settings: {grace_period: 1h, poll_interval: 1h, default_zone: \"${SECRET}\"}", 1)
+			}
+			path, _, _ := writeConfig(t, yml)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var logBuf bytes.Buffer
+			err := RunWith(ctx, Flags{Config: path, DB: filepath.Join(t.TempDir(), "dw.db")}, env,
+				slog.New(slog.NewTextHandler(&logBuf, nil)))
+			if err == nil {
+				t.Fatal("no error")
+			}
+			for n := 3; n <= len(secret); n++ {
+				if strings.Contains(err.Error(), secret[:n]) || strings.Contains(logBuf.String(), secret[:n]) {
+					t.Fatalf("prefix %q leaked: err=%v log=%s", secret[:n], err, logBuf.String())
+				}
+			}
+		})
 	}
 }
