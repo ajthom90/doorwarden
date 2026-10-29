@@ -161,5 +161,6 @@ Put your own Traefik configuration in other files.
 ## Resource notes
 
 The binary includes the whole lego catalog of DNS challenge providers, so it is
-large: about 66 MiB for linux/amd64 (stripped), and the image about 90 MB. A
-build tag that leaves out unused challenge providers is not available yet.
+large: about 66 MiB for linux/amd64 (stripped), and the image about 90 MB. An
+`acme_minimal` build tag that would leave out unused challenge providers is
+planned but deferred; it does not exist in this release.

@@ -204,6 +204,10 @@ documented APIs), not against the real product:
 - the socket proxy's group setup on a real TrueNAS or Linux Docker socket
   (verified only under Docker Desktop).
 
+The binary is about 66 MiB (linux/amd64, stripped) because it includes lego's
+full DNS provider catalog; a smaller `acme_minimal` build is deferred
+([docs/operations.md](docs/operations.md#resource-notes)).
+
 The `fake` DNS provider type is compiled in for tests and the UI demo; it keeps
 records in memory only and is not for real zones. Reports from real setups,
 working or not, are very welcome: open an issue.
