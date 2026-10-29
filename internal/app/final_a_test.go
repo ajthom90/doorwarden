@@ -329,7 +329,7 @@ func TestGateResolveErrorMarksSourceUnavailable(t *testing.T) {
 // The server's startup error (and whatever it logs) carries no fragment of
 // an env value that failed decoding or validation.
 func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
-	const secret = "S3cretEnvValue-0123456789"
+	const secret = "Qz7WkPjR9vLmTnXb4HsY2GdF"
 	env := func(k string) (string, bool) {
 		if k == "SECRET" {
 			return secret, true
@@ -338,6 +338,7 @@ func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
 	}
 	for name, extra := range map[string]string{
 		"decode":   "static:\n  - name: app\n    host: 192.0.2.5\n    port: ${SECRET}\n",
+		"mixed":    "static:\n  - name: app\n    host: 192.0.2.5\n    port: x${SECRET}\n",
 		"validate": "",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -355,9 +356,9 @@ func TestStartupConfigErrorHasNoEnvValueFragment(t *testing.T) {
 			if err == nil {
 				t.Fatal("no error")
 			}
-			for n := 3; n <= len(secret); n++ {
-				if strings.Contains(err.Error(), secret[:n]) || strings.Contains(logBuf.String(), secret[:n]) {
-					t.Fatalf("prefix %q leaked: err=%v log=%s", secret[:n], err, logBuf.String())
+			for i := 0; i+3 <= len(secret); i++ {
+				if f := secret[i : i+3]; strings.Contains(err.Error(), f) || strings.Contains(logBuf.String(), f) {
+					t.Fatalf("fragment %q leaked: err=%v log=%s", f, err, logBuf.String())
 				}
 			}
 		})

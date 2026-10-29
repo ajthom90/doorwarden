@@ -1,10 +1,13 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -98,15 +101,49 @@ func walkNode(n *yaml.Node, env func(string) (string, bool), missing *[]string, 
 var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
 
 // backtickRe matches the backtick-quoted scalars YAML decode errors quote
-// (yaml.v3 cuts values longer than 10 bytes to 7 bytes plus "...").
-var backtickRe = regexp.MustCompile("`[^`]*`")
+// (yaml.v3 cuts values longer than 10 bytes to 7 bytes plus "...");
+// dquoteRe a Go- or JSON-quoted string (%q).
+var (
+	backtickRe = regexp.MustCompile("`[^`]*`")
+	dquoteRe   = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+)
+
+// envValueForms returns v and its escaped spellings (the inside of %q,
+// %+q and JSON strings, with and without HTML escaping).
+func envValueForms(v string) []string {
+	forms := []string{v, inner(strconv.Quote(v)), inner(strconv.QuoteToASCII(v))}
+	if b, err := json.Marshal(v); err == nil {
+		forms = append(forms, inner(string(b)))
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(v) == nil {
+		forms = append(forms, inner(strings.TrimSpace(buf.String())))
+	}
+	return forms
+}
+
+func inner(q string) string { return q[1 : len(q)-1] }
+
+// sharesFragment reports whether s contains any 3-byte piece of v.
+func sharesFragment(s, v string) bool {
+	for i := 0; i+3 <= len(v); i++ {
+		if strings.Contains(s, v[i:i+3]) {
+			return true
+		}
+	}
+	return false
+}
 
 // ScrubEnvValues returns err with the values of every environment variable
-// raw references (${VAR}) removed from its text: each value of at least 3
-// bytes is replaced wherever it appears, and a backtick-quoted fragment
-// (how YAML errors quote a scalar, possibly truncated) of at least 3 bytes
-// that is part of such a value is replaced too. Load/Parse errors and the
-// web config validation use it, so no error (or the log line printing it)
+// raw references (${VAR}) removed from its text, as defence in depth behind
+// errors that never quote a value (parse elides decoded scalars): each
+// value of at least 3 bytes is replaced wherever it appears, raw or escaped
+// as by %q, %+q or JSON, and every quoted token (`...`, possibly truncated
+// by YAML, or "..." in Go or JSON quoting) carrying any 3-byte fragment of
+// such a value is replaced whole. Load/Parse errors and the startup and web
+// config validation use it, so no error (or the log line printing it)
 // carries a fragment of a substituted value. nil stays nil.
 func ScrubEnvValues(err error, raw []byte, env func(string) (string, bool)) error {
 	if err == nil {
@@ -115,7 +152,7 @@ func ScrubEnvValues(err error, raw []byte, env func(string) (string, bool)) erro
 	var vals []string
 	for _, m := range envRefRe.FindAllSubmatch(raw, -1) {
 		if v, ok := env(string(m[1])); ok && len(v) >= 3 {
-			vals = append(vals, v)
+			vals = append(vals, envValueForms(v)...)
 		}
 	}
 	if len(vals) == 0 {
@@ -124,17 +161,31 @@ func ScrubEnvValues(err error, raw []byte, env func(string) (string, bool)) erro
 	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
 	msg := err.Error()
 	for _, v := range vals {
-		msg = strings.ReplaceAll(msg, v, "[redacted]")
+		if len(v) >= 3 {
+			msg = strings.ReplaceAll(msg, v, "[redacted]")
+		}
+	}
+	leaks := func(content string) bool {
+		for _, v := range vals {
+			if sharesFragment(content, v) {
+				return true
+			}
+		}
+		return false
 	}
 	msg = backtickRe.ReplaceAllStringFunc(msg, func(q string) string {
-		in := strings.TrimSuffix(strings.TrimSpace(strings.Trim(q, "`")), "...")
-		if len(in) < 3 {
-			return q
+		if leaks(strings.TrimSuffix(inner(q), "...")) {
+			return "`[redacted]`"
 		}
-		for _, v := range vals {
-			if strings.Contains(v, in) {
-				return "`[redacted]`"
-			}
+		return q
+	})
+	msg = dquoteRe.ReplaceAllStringFunc(msg, func(q string) string {
+		content := inner(q)
+		if u, err := strconv.Unquote(q); err == nil {
+			content += "\x00" + u
+		}
+		if leaks(content) {
+			return `"[redacted]"`
 		}
 		return q
 	})
