@@ -17,10 +17,11 @@ package web
 //     middleware basicAuth users.
 // A sensitive scalar is shown as-is only when it is a reference: a
 // "secret:" ref or exactly one ${VAR} placeholder without a default.
-// Everything else becomes Masked. PUT replaces each Masked scalar with the
-// value at the same path in the current file (sequence entries by index);
-// a Masked scalar where the file has none, or in a non-sensitive field, is
-// an error.
+// Everything else becomes Masked, and comments are dropped. PUT replaces
+// each Masked scalar with the stored value of the same field (see
+// MergeMasked: list entries by identity, refused across a destination
+// change); a Masked scalar where the file has none, or in a non-sensitive
+// field, is an error.
 
 import (
 	"bytes"
@@ -41,7 +42,7 @@ const Masked = "<masked>"
 
 var (
 	refPlaceholder = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*\}$`)
-	secretKeyRe    = regexp.MustCompile(`(?i)(pass(word|wd)?|secret|token|api_?key|access_?key|private|hmac|credential|users)`)
+	secretKeyRe    = regexp.MustCompile(`(?i)(pass(word|wd)?|secret|token|key|private|hmac|credential|users|authorization|cookie)`)
 	backtickRe     = regexp.MustCompile("`[^`]*`")
 	dquoteRe       = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
 	squoteRe       = regexp.MustCompile(`'[^']*'`)
@@ -176,12 +177,22 @@ func setMasked(n *yaml.Node) {
 	n.LineComment, n.HeadComment, n.FootComment = "", "", ""
 }
 
-// MaskConfig returns raw with every sensitive value masked.
+// stripComments removes every comment (they may quote secrets).
+func stripComments(n *yaml.Node) {
+	n.HeadComment, n.LineComment, n.FootComment = "", "", ""
+	for _, c := range n.Content {
+		stripComments(c)
+	}
+}
+
+// MaskConfig returns raw with every sensitive value masked and all
+// comments removed.
 func MaskConfig(raw []byte) ([]byte, error) {
 	root, err := parseDoc(raw)
 	if err != nil {
 		return nil, err
 	}
+	stripComments(root)
 	err = walkDoc(root, nil, false, "", func(n *yaml.Node, _ docPath, sens bool) error {
 		if sens && !(n.Tag == "!!str" || n.ShortTag() == "!!str") {
 			setMasked(n) // numbers/bools under secret keys too
@@ -198,44 +209,238 @@ func MaskConfig(raw []byte) ([]byte, error) {
 	return encodeDoc(root)
 }
 
-func lookup(n *yaml.Node, path docPath) *yaml.Node {
-	if n.Kind == yaml.DocumentNode {
-		if len(n.Content) == 0 {
-			return nil
-		}
-		n = n.Content[0]
-	}
-	for _, el := range path {
-		switch n.Kind {
-		case yaml.MappingNode:
-			var next *yaml.Node
-			for i := 0; i+1 < len(n.Content); i += 2 {
-				if n.Content[i].Value == el {
-					next = n.Content[i+1]
-				}
-			}
-			if next == nil {
-				return nil
-			}
-			n = next
-		case yaml.SequenceNode:
-			if !strings.HasPrefix(el, "[") {
-				return nil
-			}
-			i, err := strconv.Atoi(strings.Trim(el, "[]"))
-			if err != nil || i < 0 || i >= len(n.Content) {
-				return nil
-			}
-			n = n.Content[i]
-		default:
-			return nil
-		}
-	}
-	return n
+// destKeys name where a secret is sent. A masked secret is only kept when
+// every destination field in its mapping and the mappings above it is
+// unchanged from the stored file.
+var destKeys = map[string]bool{
+	"url": true, "uri": true, "host": true, "hostname": true, "server": true, "servers": true,
+	"endpoint": true, "address": true, "base_url": true, "api_url": true, "nameserver": true,
+	"type": true, "port": true,
 }
 
-// MergeMasked returns newRaw with every Masked scalar replaced by the value
-// at the same path in oldRaw.
+// identityKeys identify a list entry (matched by these, not by index).
+var identityKeys = []string{"name", "id", "url", "host", "server", "endpoint", "address", "topic", "username"}
+
+func mapGet(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return n.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func scalarVal(n *yaml.Node) (string, bool) {
+	if n == nil || n.Kind != yaml.ScalarNode {
+		return "", false
+	}
+	return n.Value, true
+}
+
+// destChanged reports whether a destination field differs between the new
+// mapping n and the stored mapping o. A masked destination counts as
+// unchanged (it is itself kept from o).
+func destChanged(n, o *yaml.Node) bool {
+	if o == nil || o.Kind != yaml.MappingNode {
+		return true
+	}
+	for k := range destKeys {
+		nv, o2 := mapGet(n, k), mapGet(o, k)
+		if nv == nil && o2 == nil {
+			continue
+		}
+		if nv == nil || o2 == nil {
+			return true
+		}
+		if v, ok := scalarVal(nv); ok && v == Masked {
+			continue
+		}
+		a, err1 := encodeDoc(&yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{plain(nv)}})
+		b, err2 := encodeDoc(&yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{plain(o2)}})
+		if err1 != nil || err2 != nil || !bytes.Equal(a, b) {
+			return true
+		}
+	}
+	return false
+}
+
+// plain copies n without styles or comments (for comparison).
+func plain(n *yaml.Node) *yaml.Node {
+	c := &yaml.Node{Kind: n.Kind, Tag: n.ShortTag(), Value: n.Value}
+	for _, x := range n.Content {
+		c.Content = append(c.Content, plain(x))
+	}
+	return c
+}
+
+// identity is the entry's identity: its identity fields that are not
+// masked in the new entry (keys; nil: every identity key), with their
+// values ("" + false when absent).
+func identity(n *yaml.Node, keys []string) map[string]string {
+	if keys == nil {
+		keys = identityKeys
+	}
+	id := map[string]string{}
+	for _, k := range keys {
+		if v, ok := scalarVal(mapGet(n, k)); ok && v != Masked {
+			id[k] = v
+		}
+	}
+	return id
+}
+
+func sameIdentity(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// plainFieldsEqual reports whether every scalar that is not masked in n is
+// equal in o at the same key (one mapping level).
+func plainFieldsEqual(n, o *yaml.Node) bool {
+	if n.Kind != yaml.MappingNode || o.Kind != yaml.MappingNode || len(n.Content) != len(o.Content) {
+		return false
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		v, ok := scalarVal(n.Content[i+1])
+		if !ok || v == Masked {
+			continue
+		}
+		if ov, ok := scalarVal(mapGet(o, n.Content[i].Value)); !ok || ov != v {
+			return false
+		}
+	}
+	return true
+}
+
+// matchEntry finds the stored entry for new sequence entry i: by identity
+// when the entries are mappings with one; a unique identity match wins,
+// several are disambiguated only by the same index with equal plain
+// fields. Scalar entries match by index only while the list keeps its
+// length. nil: no (unambiguous) match.
+func matchEntry(ns, os *yaml.Node, i int) *yaml.Node {
+	if os == nil || os.Kind != yaml.SequenceNode {
+		return nil
+	}
+	n := ns.Content[i]
+	if n.Kind != yaml.MappingNode {
+		if len(ns.Content) == len(os.Content) {
+			return os.Content[i]
+		}
+		return nil
+	}
+	// Compare only the identity fields the new entry states in clear: a
+	// masked one is itself kept from the matched entry.
+	keys := []string{} // non-nil: an empty set compares nothing
+	for _, k := range identityKeys {
+		if v, ok := scalarVal(mapGet(n, k)); !ok || v != Masked {
+			keys = append(keys, k)
+		}
+	}
+	id := identity(n, keys)
+	var cands []int
+	for j, o := range os.Content {
+		if o.Kind == yaml.MappingNode && sameIdentity(id, identity(o, keys)) {
+			cands = append(cands, j)
+		}
+	}
+	if len(cands) == 1 && len(id) > 0 {
+		return os.Content[cands[0]]
+	}
+	for _, j := range cands {
+		if j == i && plainFieldsEqual(n, os.Content[j]) {
+			return os.Content[j]
+		}
+	}
+	return nil
+}
+
+type merger struct{}
+
+// merge walks the new node n alongside its stored counterpart o (nil when
+// none). changed: a destination above has changed.
+func (m merger) merge(n, o *yaml.Node, path docPath, sens bool, ptype string, changed bool) error {
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for i, c := range n.Content {
+			var oc *yaml.Node
+			if o != nil && i < len(o.Content) {
+				oc = o.Content[i]
+			}
+			if err := m.merge(c, oc, path, sens, ptype, changed); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		if o != nil && o.Kind != yaml.MappingNode {
+			o = nil
+		}
+		if len(path) == 2 && path[0] == "providers" {
+			if v, ok := scalarVal(mapGet(n, "type")); ok {
+				ptype = v
+			}
+		}
+		changed = changed || destChanged(n, o)
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k := n.Content[i].Value
+			p := path.with(k)
+			if err := m.merge(n.Content[i+1], mapGet(o, k), p, sens || sensitiveField(p, ptype), ptype, changed); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for i, c := range n.Content {
+			oc := matchEntry(n, o, i)
+			// No stored counterpart: anything masked below must be
+			// re-entered.
+			if err := m.merge(c, oc, path.with("["+strconv.Itoa(i)+"]"), sens, ptype, changed || oc == nil); err != nil {
+				return err
+			}
+		}
+	case yaml.ScalarNode:
+		if n.Value == Masked {
+			if !sens {
+				return fmt.Errorf("%s: %s is only allowed in secret fields", path, Masked)
+			}
+			if o == nil || o.Kind != yaml.ScalarNode || o.Value == Masked {
+				return fmt.Errorf("%s: %s has no current value to keep; re-enter the secret", path, Masked)
+			}
+			if changed {
+				return fmt.Errorf("%s: its destination or entry changed; re-enter the secret", path)
+			}
+			n.Value, n.Tag, n.Style = o.Value, o.Tag, o.Style
+			return nil
+		}
+		// ${VAR} is expanded at load time; in a plain field the result
+		// would be echoed by the API. Only secret fields may gain one.
+		if !sens && strings.Contains(n.Value, "${") {
+			if ov, ok := scalarVal(o); !ok || ov != n.Value {
+				return fmt.Errorf("%s: ${...} environment references are only allowed in secret fields", path)
+			}
+		}
+	case yaml.AliasNode:
+		return fmt.Errorf("config: YAML aliases are not supported (at %s)", path)
+	}
+	return nil
+}
+
+// MergeMasked returns newRaw with every Masked scalar replaced by the
+// stored value of the same field in oldRaw. Mappings match by key, list
+// entries by identity (identityKeys), never by bare position. A masked
+// value is refused ("re-enter the secret") when it has no stored
+// counterpart, when a destination field (destKeys) in its mapping or any
+// mapping above it changed, or when its list entry cannot be matched
+// unambiguously. A new or changed ${VAR} reference in a field that is not
+// secret is refused too.
 func MergeMasked(newRaw, oldRaw []byte) ([]byte, error) {
 	nr, err := parseDoc(newRaw)
 	if err != nil {
@@ -245,21 +450,7 @@ func MergeMasked(newRaw, oldRaw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("the current config file is not valid YAML")
 	}
-	err = walkDoc(nr, nil, false, "", func(n *yaml.Node, path docPath, sens bool) error {
-		if n.Value != Masked {
-			return nil
-		}
-		if !sens {
-			return fmt.Errorf("%s: %s is only allowed in secret fields", path, Masked)
-		}
-		old := lookup(or, path)
-		if old == nil || old.Kind != yaml.ScalarNode || old.Value == Masked {
-			return fmt.Errorf("%s: %s has no current value to keep; enter the value", path, Masked)
-		}
-		n.Value, n.Tag, n.Style = old.Value, old.Tag, old.Style
-		return nil
-	})
-	if err != nil {
+	if err := (merger{}).merge(nr, or, nil, false, "", false); err != nil {
 		return nil, err
 	}
 	return encodeDoc(nr)

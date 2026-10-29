@@ -241,7 +241,13 @@ trusted-header proxy) and the event stream `/api/v1/events`.
 `GET /api/v1/config` returns the config file with every secret replaced by
 `<masked>` (`secret:` references and plain `${VAR}` placeholders are shown,
 since they are not secrets). `PUT /api/v1/config` takes the edited document;
-a `<masked>` value keeps the current one. The document is validated like at
+a `<masked>` value keeps the current one, but only for the same entry
+(list entries are matched by `name`/`id`/`url`/`host`-style identity fields,
+not position) and only while its destination (`url`, `host`, `server`,
+`endpoint`, `type`, `port`, ...) is unchanged; otherwise the PUT is refused
+and the secret must be re-entered. Comments are stripped from the returned
+document. `${VAR}` references are accepted only in secret fields (an
+unchanged existing one elsewhere is kept). The document is validated like at
 start-up and written atomically (mode 0600), so the config file must be
 writable by the container (it cannot be a read-only mount for this). Changes
 take effect at the next restart: the running reconciler, DNS providers and

@@ -101,3 +101,149 @@ func TestScrubConfigError(t *testing.T) {
 		t.Fatalf("scrub: %s", got)
 	}
 }
+
+func mergeErr(t *testing.T, newDoc, oldDoc string) error {
+	t.Helper()
+	_, err := MergeMasked([]byte(newDoc), []byte(oldDoc))
+	return err
+}
+
+// E1: a masked secret never follows a destination change: changing the
+// url/host/server/type next to (or above) it, or moving it to a list
+// entry with a different identity, requires re-entering it.
+func TestMergeMaskedDestinationChange(t *testing.T) {
+	old := `notifications:
+  ntfy:
+    - {server: "https://ntfy.example.test", topic: t1, token: s3cr3t-ntfy}
+  smtp:
+    - {host: mail.example.test, username: u, password: s3cr3t-smtp, from: a@example.test, to: [b@example.test]}
+sources:
+  truenas: {url: "https://192.0.2.20", api_key: s3cr3t-truenas}
+providers:
+  cf: {type: cloudflare, api_token: s3cr3t-cf}
+`
+	cases := map[string]string{
+		"smtp host": strings.Replace(old, "password: s3cr3t-smtp", "password: '<masked>'", 1),
+		"ntfy server": strings.Replace(strings.Replace(old, "token: s3cr3t-ntfy", "token: '<masked>'", 1),
+			"https://ntfy.example.test", "https://evil.example.test", 1),
+		"truenas url": strings.Replace(strings.Replace(old, "api_key: s3cr3t-truenas", "api_key: '<masked>'", 1),
+			"https://192.0.2.20", "https://198.51.100.66", 1),
+		"provider type": strings.Replace(strings.Replace(old, "api_token: s3cr3t-cf", "api_token: '<masked>'", 1),
+			"type: cloudflare", "type: pihole", 1),
+	}
+	cases["smtp host"] = strings.Replace(cases["smtp host"], "host: mail.example.test", "host: mail.evil.example.test", 1)
+	for name, doc := range cases {
+		err := mergeErr(t, doc, old)
+		if err == nil || !strings.Contains(err.Error(), "re-enter") {
+			t.Errorf("%s: masked secret carried across a destination change: %v", name, err)
+		}
+	}
+	// Unchanged destination: kept.
+	same := strings.Replace(old, "password: s3cr3t-smtp", "password: '<masked>'", 1)
+	out, err := MergeMasked([]byte(same), []byte(old))
+	if err != nil || !strings.Contains(string(out), "s3cr3t-smtp") {
+		t.Fatalf("unchanged destination: %v\n%s", err, out)
+	}
+}
+
+// List entries are matched by identity, not index: reordering keeps each
+// secret with its own entry; inserting an entry before another does not
+// hand it the other's secret; ambiguous identities are refused.
+func TestMergeMaskedListIdentity(t *testing.T) {
+	old := `notifications:
+  ntfy:
+    - {server: "https://a.example.test", topic: ta, token: s3cr3t-a}
+    - {server: "https://b.example.test", topic: tb, token: s3cr3t-b}
+`
+	swapped := `notifications:
+  ntfy:
+    - {server: "https://b.example.test", topic: tb, token: '<masked>'}
+    - {server: "https://a.example.test", topic: ta, token: '<masked>'}
+`
+	out, err := MergeMasked([]byte(swapped), []byte(old))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Index(s, "s3cr3t-b") > strings.Index(s, "s3cr3t-a") {
+		t.Fatalf("reorder moved secrets between entries:\n%s", s)
+	}
+	inserted := `notifications:
+  ntfy:
+    - {server: "https://evil.example.test", topic: ta, token: '<masked>'}
+    - {server: "https://a.example.test", topic: ta, token: '<masked>'}
+    - {server: "https://b.example.test", topic: tb, token: '<masked>'}
+`
+	if err := mergeErr(t, inserted, old); err == nil || !strings.Contains(err.Error(), "re-enter") {
+		t.Fatalf("inserted entry inherited a secret: %v", err)
+	}
+	ambOld := `notifications:
+  ntfy:
+    - {server: "https://a.example.test", topic: t, token: s3cr3t-1}
+    - {server: "https://a.example.test", topic: t, token: s3cr3t-2, priority: 3}
+`
+	ambNew := `notifications:
+  ntfy:
+    - {server: "https://a.example.test", topic: t, token: '<masked>', priority: 3}
+    - {server: "https://a.example.test", topic: t, token: '<masked>'}
+`
+	if err := mergeErr(t, ambNew, ambOld); err == nil || !strings.Contains(err.Error(), "re-enter") {
+		t.Fatalf("ambiguous identity accepted: %v", err)
+	}
+	// Scalar lists of secrets (basicAuth users) only keep values when
+	// the list keeps its length.
+	uOld := "middlewares:\n  a:\n    basicAuth:\n      users: [\"u1:s3cr3t-1\", \"u2:s3cr3t-2\"]\n"
+	uNew := "middlewares:\n  a:\n    basicAuth:\n      users: ['<masked>']\n"
+	if err := mergeErr(t, uNew, uOld); err == nil {
+		t.Fatal("shrunk secret list kept a value by index")
+	}
+}
+
+// E2: ${VAR} is accepted only in secret-bearing fields; a new or changed
+// ${VAR} in a free-text field (it would be echoed via the API) is refused,
+// while one already in the stored file may stay.
+func TestMergeRejectsEnvRefInPlainFields(t *testing.T) {
+	old := "zones:\n  - name: example.test\n    target_ip: 192.0.2.10\nproviders:\n  cf: {type: cloudflare, api_token: \"${CF_TOKEN}\", zone_id: \"${ZID}\"}\n"
+	for _, doc := range []string{
+		"zones:\n  - name: \"${HOME}\"\n    target_ip: 192.0.2.10\nproviders:\n  cf: {type: cloudflare, api_token: \"${CF_TOKEN}\", zone_id: \"${ZID}\"}\n",
+		old + "settings: {default_zone: \"${OTHER}\"}\n",
+		"zones:\n  - name: example.test\n    target_ip: \"x${AWS_SECRET}\"\nproviders:\n  cf: {type: cloudflare, api_token: \"${CF_TOKEN}\", zone_id: \"${ZID}\"}\n",
+	} {
+		if err := mergeErr(t, doc, old); err == nil || !strings.Contains(err.Error(), "${") {
+			t.Errorf("env reference in a plain field accepted: %v\n%s", err, doc)
+		}
+	}
+	// Unchanged plain-field reference and a new secret-field reference.
+	ok := strings.Replace(old, "${CF_TOKEN}", "${CF_TOKEN_2}", 1)
+	if err := mergeErr(t, ok, old); err != nil {
+		t.Fatalf("secret-field reference refused: %v", err)
+	}
+}
+
+// E3: credential-bearing header maps anywhere (middleware headers) are
+// masked, and comments never reach GET output.
+func TestMaskHeadersAndComments(t *testing.T) {
+	doc := `# admin note: the token is s3cr3t-comment
+middlewares:
+  h:
+    headers:
+      customRequestHeaders:
+        Authorization: "Bearer s3cr3t-auth"
+        Cookie: "sid=s3cr3t-cookie"
+        X-Api-Key: s3cr3t-key
+        X-Custom-Credential: s3cr3t-cred
+        X-Plain: visible-value # trailing s3cr3t-line
+settings: {default_zone: example.test} # s3cr3t-foot
+`
+	out, err := MaskConfig([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "s3cr3t") || strings.Contains(s, "#") {
+		t.Fatalf("leak:\n%s", s)
+	}
+	if !strings.Contains(s, "visible-value") {
+		t.Fatalf("plain header masked:\n%s", s)
+	}
+}
