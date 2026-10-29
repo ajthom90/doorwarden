@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -409,6 +410,34 @@ func TestConformance(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, nil)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
+		ApexForeign: func(context.Context, string) (func() error, error) {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			z := b.zone("ZEXAMPLE")
+			want := map[string]set{}
+			for _, s := range []set{
+				{name: "example.test.", typ: "NS", ttl: 172800, vals: []string{"ns1.example.test."}},
+				{name: "example.test.", typ: "SOA", ttl: 900, vals: []string{"ns1.example.test. hostmaster.example.test. 1 7200 900 1209600 86400"}},
+				{name: "example.test.", typ: "MX", ttl: 300, vals: []string{"10 mail.example.test."}},
+				{name: "example.test.", typ: "TXT", ttl: 300, vals: []string{`"v=spf1 -all"`}},
+			} {
+				c := s
+				z.sets[s.name+"|"+s.typ] = &c
+				want[s.name+"|"+s.typ] = s
+			}
+			return func() error {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				for k, w := range want {
+					g := z.sets[k]
+					if g == nil || g.ttl != w.ttl || !slices.Equal(g.vals, w.vals) {
+						return fmt.Errorf("foreign apex rrset %s changed or removed: %+v", k, g)
+					}
+				}
+				return nil
+			}, nil
+		},
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			b.seed("ZEXAMPLE", name, values...)
 			return nil

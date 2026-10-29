@@ -33,10 +33,13 @@ itself from `init()`.
 
    ```go
    dnstest.RunWith(t, func(*testing.T) dns.Provider { return p },
-       dnstest.Options{Zone: "example.test", OtherZone: "other.test"})
+       dnstest.Options{Zone: "example.test", OtherZone: "other.test", Apex: true})
    ```
 
-   `RunWith` requires `Zone`. Also test: error mapping (401/403, 404 zone,
+   `RunWith` requires `Zone`. Set `Apex` (and `ApexForeign`, seeding NS/MX/TXT
+   records at the zone apex in your fake backend) so the suite checks that an
+   A record at the zone name itself is created, updated and deleted without
+   touching the records next to it; never set it against a real zone. Also test: error mapping (401/403, 404 zone,
    429), that a recognisable fake secret never appears in any error string,
    context cancellation, and the capabilities your instance reports.
 

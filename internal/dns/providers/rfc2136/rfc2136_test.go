@@ -3,6 +3,7 @@ package rfc2136_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -287,6 +288,38 @@ func TestConformance(t *testing.T) {
 	f := startServer(t)
 	p := newProvider(t, f, nil)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
+		ApexForeign: func(context.Context, string) (func() error, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			var seeded []string
+			for _, s := range []string{
+				"example.test. 3600 IN NS ns1.example.test.",
+				"example.test. 300 IN MX 10 mail.example.test.",
+				`example.test. 300 IN TXT "v=spf1 -all"`,
+			} {
+				rr, err := mdns.NewRR(s)
+				if err != nil {
+					return nil, err
+				}
+				f.zones["example.test."] = append(f.zones["example.test."], rr)
+				seeded = append(seeded, rr.String())
+			}
+			return func() error {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				for _, w := range seeded {
+					found := false
+					for _, rr := range f.zones["example.test."] {
+						found = found || rr.String() == w
+					}
+					if !found {
+						return fmt.Errorf("foreign apex record %q changed or removed", w)
+					}
+				}
+				return nil
+			}, nil
+		},
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			f.mu.Lock()
 			defer f.mu.Unlock()

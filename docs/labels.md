@@ -13,6 +13,13 @@ The host name is `<slug>.<zone>`, where the slug is the name (or its rename)
 lowercased, with every run of characters other than `a-z0-9` replaced by one
 `-`, trimmed of `-` and cut to 63 characters. `My App_2` becomes `my-app-2`.
 
+The one exception is a static entry with `apex: true`: its host name is the
+zone name itself (`example.test`), it cannot be renamed, and each zone has at
+most one (see [configuration.md](configuration.md#apex-entries)). There is no
+Docker label or TrueNAS equivalent; a container or app is always published
+below the zone. An apex entry outranks a Docker or TrueNAS service claiming
+the same name like any static entry.
+
 When two services claim the same host name, see
 [Host name conflicts](#host-name-conflicts).
 

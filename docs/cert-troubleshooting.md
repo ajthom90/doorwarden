@@ -18,11 +18,44 @@ A zone gets certificates only when it has `certificate.issuer`; see
 The wildcard covers one level only: `app.example.test`, not
 `a.app.example.test`.
 
-HTTP-01 needs `acme.http01_listen` and a Traefik route for
-`/.well-known/acme-challenge/` of each host to that address, which you add
-yourself (Doorwarden does not generate it), and the hosts must be reachable
-from the internet on port 80. DNS-01 needs a challenge provider for a public
-zone ([providers.md](providers.md#acme-dns-01-challenge-providers)).
+HTTP-01 needs `acme.http01_listen` and the hosts must be reachable from the
+internet on port 80 (see [HTTP-01](#http-01)). DNS-01 needs a challenge
+provider for a public zone
+([providers.md](providers.md#acme-dns-01-challenge-providers)).
+
+## HTTP-01
+
+The CA fetches `http://<host>/.well-known/acme-challenge/<token>` from the
+public internet, on port 80, for every name of the certificate (`http-01`
+cannot issue wildcards). The path must reach Doorwarden's challenge server:
+
+1. **Port 80 reachable from the internet.** Public DNS for the host points at
+   your public address, and your router forwards TCP 80 (as well as 443) to
+   Traefik's host. A host whose DNS Doorwarden does not manage
+   (`records.mode: off`) needs those records added at your DNS host.
+2. **Traefik's `web` entry point** must let the challenge router win over its
+   HTTP-to-HTTPS redirection: `priority: 1` on
+   `entryPoints.web.http.redirections.entryPoint` (the shipped
+   `traefik.yml` has it; see
+   [deploy.md](deploy.md#http-01-challenge-route)). Without it the CA gets a
+   redirect to HTTPS and validation fails.
+3. **The challenge router.** Doorwarden writes `doorwarden-acme-http01.yml`
+   in Traefik's dynamic directory: a router on `traefik.http_entry_point`
+   (default `web`) matching exactly the routed host names of http-01 zones
+   and the path `/.well-known/acme-challenge/`, forwarding with the Host
+   header to `acme.http01_backend` (default
+   `http://doorwarden:<port of http01_listen>`). Check that the file lists
+   your host and that Traefik loaded it (Traefik's log, or
+   `curl -i http://<host>/.well-known/acme-challenge/test` from outside:
+   while no order runs, Traefik's `502 Bad Gateway` (the challenge server is
+   not listening) means the request was routed to Doorwarden; a `301`/`308`
+   to `https://` means the redirection still wins).
+4. **The challenge server** listens only on `acme.http01_listen` and only
+   during an order.
+
+Only names that are routes are ordered; a host without a route (an apex with
+no `apex: true` entry, for example) gets neither a certificate nor a
+challenge route.
 
 ## From staging to production
 
@@ -96,7 +129,7 @@ Certificates page shows why a certificate is waiting and until when
 | `certificate.dns_provider ... is not a supported ACME DNS provider` | the entry's `type` must be a lego provider code; `unifi`, `pihole` and `adguard` are record-only |
 | DNS-01 times out / `NXDOMAIN` for `_acme-challenge` | the challenge provider writes to a zone the public internet does not see (a split-horizon or LAN-only server), the token lacks edit rights, or propagation is slow: raise `acme.dns_propagation_timeout`, or set `acme.resolvers` to public resolvers |
 | `unauthorized` / `incorrect TXT record` | another TXT value at `_acme-challenge` (an old NPM or certbot record); delete stale records |
-| HTTP-01 `connection refused` / 404 | port 80 is not reachable from the internet, or the `/.well-known/acme-challenge/` route to `acme.http01_listen` is missing |
+| HTTP-01 `connection refused` / 404 / redirect | port 80 is not reachable from the internet, the `web` redirection lacks `priority: 1`, or `acme.http01_backend` is wrong; see [HTTP-01](#http-01) |
 | `rateLimited` from the CA | wait for the time shown; meanwhile use the staging issuer to debug |
 | Browser says the certificate is not trusted | the issuer is still on staging; [switch to production](#from-staging-to-production) |
 | Traefik serves its own default certificate | no certificate covers the name yet (look at the Certificates page and the plan), or several zones and no `settings.default_zone` for clients without SNI |

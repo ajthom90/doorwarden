@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,6 +184,30 @@ func TestConformance(t *testing.T) {
 	b := newBackend(t)
 	p := newProvider(t, b, nil)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
+		ApexForeign: func(context.Context, string) (func() error, error) {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			seeded := []map[string]any{
+				{"type": "MX_RECORD", "id": "dddddddd-0000-4000-8000-000000000001", "enabled": true, "domain": "example.test", "mailServerDomain": "mail.example.test", "priority": 10},
+				{"type": "TXT_RECORD", "id": "dddddddd-0000-4000-8000-000000000002", "enabled": true, "domain": "example.test", "text": "v=spf1 -all"},
+			}
+			b.pols = append(b.pols, seeded...)
+			return func() error {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				for _, w := range seeded {
+					found := false
+					for _, p := range b.pols {
+						found = found || reflect.DeepEqual(p, w)
+					}
+					if !found {
+						return fmt.Errorf("foreign apex policy %v changed or removed", w["id"])
+					}
+				}
+				return nil
+			}, nil
+		},
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			b.mu.Lock()
 			defer b.mu.Unlock()

@@ -137,7 +137,15 @@ type Options struct {
 	// because the store could not be read, which would mark every
 	// certificate unwanted).
 	BeforeRenew func(ctx context.Context) error
+	// ChallengeSettle is how long a cycle waits after writing the HTTP-01
+	// challenge route for names about to be ordered, before ordering
+	// them, so Traefik (providersThrottleDuration, 2s by default) has
+	// loaded it (default DefaultChallengeSettle; negative: no wait).
+	ChallengeSettle time.Duration
 }
+
+// DefaultChallengeSettle is the default Options.ChallengeSettle.
+const DefaultChallengeSettle = 3 * time.Second
 
 // App is the control plane.
 type App struct {
@@ -158,6 +166,12 @@ type App struct {
 	gate   *approval.Gate
 	runner *reconcile.Runner
 	probe  *web.CachedProbe
+
+	// HTTP-01 challenge route (challenge.go).
+	challengeSettle time.Duration
+	chMu            sync.Mutex
+	challengeHosts  map[string]bool // hosts in the last written challenge file
+	cycleQuar       map[string]bool // this cycle's quarantine verdict (cycleMu)
 
 	liveInit    func(context.Context) error
 	liveInitOK  bool // guarded by cycleMu
@@ -204,7 +218,7 @@ func New(o Options) (*App, error) {
 		cfg: o.Config, st: o.Store, sources: o.Sources, providers: o.Providers, mgr: o.ACME,
 		notifier: o.Notifier, met: o.Metrics, now: o.Now, log: o.Log,
 		srcTO: o.SourceTimeout, dnsTO: o.DNSTimeout, renewTO: o.RenewEvery, stat: o.StatFile,
-		liveInit: o.LiveInit, beforeRenew: o.BeforeRenew,
+		liveInit: o.LiveInit, beforeRenew: o.BeforeRenew, challengeSettle: o.ChallengeSettle,
 		trigger:      make(chan struct{}, 1),
 		drainTimeout: DefaultDrainTimeout,
 		seenPrev:     map[string]bool{}, seenCur: map[string]bool{},
@@ -230,6 +244,9 @@ func New(o Options) (*App, error) {
 	}
 	if a.stat == nil {
 		a.stat = statFile
+	}
+	if a.challengeSettle == 0 {
+		a.challengeSettle = DefaultChallengeSettle
 	}
 	// Every provider call is counted in doorwarden_dns_operations_total
 	// (listings, record writes and deletes alike).
@@ -259,7 +276,7 @@ func New(o Options) (*App, error) {
 	}
 	reconcile.RegisterDNSExecutor(multi, de)
 	if a.mgr != nil {
-		multi.Handle(reconcile.CertEnsure, acme.NewCertExecutor(a.mgr).OnResult(func(r acme.Result) { a.countRenewal(r) }))
+		multi.Handle(reconcile.CertEnsure, a.challengeFirst(acme.NewCertExecutor(a.mgr).OnResult(func(r acme.Result) { a.countRenewal(r) })))
 	}
 	a.runner = &reconcile.Runner{Exec: multi, Config: a.cfg, DryRun: a.cycleDry.Load}
 

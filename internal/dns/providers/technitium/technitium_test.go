@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -170,6 +171,32 @@ func TestConformanceToken(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, nil)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
+		ApexForeign: func(_ context.Context, zone string) (func() error, error) {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			seeded := []rec{
+				{name: zone, typ: "NS", val: "ns1." + zone, ttl: 3600},
+				{name: zone, typ: "SOA", val: "ns1." + zone, ttl: 900},
+				{name: zone, typ: "MX", val: "mail." + zone, ttl: 300},
+				{name: zone, typ: "TXT", val: "v=spf1 -all", ttl: 300},
+			}
+			b.zones[zone] = append(b.zones[zone], seeded...)
+			return func() error {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				for _, w := range seeded {
+					found := false
+					for _, r := range b.zones[zone] {
+						found = found || r == w
+					}
+					if !found {
+						return fmt.Errorf("foreign apex record %s %s changed or removed", w.typ, w.val)
+					}
+				}
+				return nil
+			}, nil
+		},
 		SeedMultiValue: func(_ context.Context, zone, name string, values ...string) error {
 			b.mu.Lock()
 			defer b.mu.Unlock()

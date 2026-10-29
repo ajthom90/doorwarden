@@ -111,6 +111,9 @@ func (s StaticService) Problems() []string {
 	if host != "" && !model.ValidHost(host) {
 		add("host %q must be a bare hostname or IP (no scheme, path, whitespace or :port)", host)
 	}
+	if s.Apex && strings.TrimSpace(s.Rename) != "" {
+		add("apex and rename are mutually exclusive (an apex entry's hostname is the zone name)")
+	}
 	if s.SkipVerify && (s.Scheme == "http" || upScheme == "http") {
 		add("skip_verify requires https but scheme/upstream is http")
 	}

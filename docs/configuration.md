@@ -183,13 +183,15 @@ web:
 
 ## zones
 
-A list. Every service is published as `<name>.<zone>` in exactly one zone.
+A list. Every service is published as `<name>.<zone>` in exactly one zone
+(a static entry with `apex: true` as the zone name itself, see
+[static](#static)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | required | DNS zone, e.g. `example.test` |
 | `target_ip` | IP | required | address DNS records point at (where Traefik listens). It is also the backend host for Docker and TrueNAS services (their published ports are on that host) |
-| `records.mode` | `wildcard` \| `per-host` \| `off` | unset (same as `off`) | `wildcard`: one `*.<zone>` A record; `per-host`: one A record per published host; `off`: Doorwarden manages no records in this zone |
+| `records.mode` | `wildcard` \| `per-host` \| `off` | unset (same as `off`) | `wildcard`: one `*.<zone>` A record (plus an A record at the zone name for an `apex` entry, which the wildcard does not cover); `per-host`: one A record per published host; `off`: Doorwarden manages no records in this zone |
 | `records.provider` | provider name | required unless mode is `off` | entry under `providers`. `wildcard` needs a provider that supports wildcard A records |
 | `certificate.issuer` | issuer name | unset | entry under `issuers`. Unset: Doorwarden issues no certificates for the zone |
 | `certificate.strategy` | `wildcard` \| `per-host` \| `san` | `wildcard` | `wildcard`: `<zone>` + `*.<zone>`; `per-host`: one certificate per host; `san`: one certificate listing every host |
@@ -283,7 +285,7 @@ routes to it ([deploy.md](deploy.md#first-run)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | required | service name; the host name is `<slug(name)>.<zone>` |
+| `name` | string | required | service name; the host name is `<slug(name)>.<zone>` (the zone name with `apex: true`) |
 | `id` | `[A-Za-z0-9._-]+` | slug of `name` | stable key (`static:<id>`); set it to rename without losing state |
 | `host` | host name or IP | one of `host`/`upstream` | backend host (no scheme, path or port) |
 | `upstream` | `scheme://host[:port]` | one of `host`/`upstream` | backend as a URL; no path, query, user info or fragment. Overrides `host`, and its scheme and port must agree with `scheme`/`port` when those are set |
@@ -294,7 +296,68 @@ routes to it ([deploy.md](deploy.md#first-run)).
 | `websockets` | bool | false | informational; Traefik proxies websockets without extra configuration |
 | `middlewares` | list of references | none | see [labels.md](labels.md#middlewares) |
 | `rename` | DNS label | unset | publish under this name instead of `name` |
+| `apex` | bool | false | publish at the zone name itself (`example.test`) instead of `<slug(name)>.<zone>`; see below |
 | `skip` | bool | false | do not publish this entry |
+
+### Apex entries
+
+`apex: true` publishes the entry at the zone apex: the host name is the
+zone's name (`example.test`), not `<slug(name)>.<zone>`. `name` is still
+required (it is the entry's id and display name). Limits:
+
+- static entries only (there is no Docker label or TrueNAS equivalent);
+- at most one apex entry per zone, and `apex` cannot be combined with
+  `rename` (the UI refuses to rename an apex service as well);
+- the zone name must be a valid host name with at least two labels
+  (lowercase letters, digits and hyphens; an IDN zone in its `xn--` form);
+- `www` is an ordinary entry (`name: www`);
+- a zone nested in another (`home.example.test` next to `example.test`) has
+  its own apex: an apex entry in the nested zone publishes
+  `home.example.test`, never the parent's apex.
+
+DNS: with `records.mode: per-host` the A record is created at the zone name.
+Records Doorwarden does not own at the apex (NS, SOA, MX, TXT and others)
+are never changed; a foreign A or CNAME record at the apex is reported as a
+conflict, not overwritten. With `records.mode: wildcard` the `*.<zone>`
+record does not cover the zone name, so the apex entry gets its own A
+record. Certificates: the `wildcard` strategy already covers the zone name;
+`per-host` and `san` add it like any other host; `http-01` can issue it.
+
+#### Example: a domain whose DNS is hosted elsewhere
+
+The zone's DNS stays at its current host (records are added there by hand,
+pointing the apex and `www` at your public address); Doorwarden routes both
+and issues their certificates by HTTP-01:
+
+```yaml
+zones:
+  - name: example.test
+    target_ip: 192.0.2.10
+    records: {mode: "off"}          # DNS is managed elsewhere
+    certificate:
+      issuer: letsencrypt
+      strategy: per-host
+      challenge: http-01
+issuers:
+  letsencrypt: {directory: production, email: admin@example.test}
+acme:
+  http01_listen: ":8089"            # Traefik reaches it as http://doorwarden:8089
+static:
+  - name: site
+    apex: true                      # https://example.test
+    zone: example.test
+    host: 192.0.2.20
+    port: 8080
+  - name: www                       # https://www.example.test
+    zone: example.test
+    host: 192.0.2.20
+    port: 8080
+```
+
+Port 80 must reach Traefik from the internet, and Traefik's `web` entry
+point redirection needs `priority: 1` (see
+[deploy.md](deploy.md#http-01-challenge-route)). Doorwarden then renders the
+challenge route for `example.test` and `www.example.test`.
 
 ## settings
 
@@ -341,6 +404,7 @@ with, so a typo never removes authentication that was in place.
 |---|---|---|---|
 | `dynamic_dir` | absolute path | `/etc/traefik/dynamic` | directory Doorwarden writes Traefik's file-provider files into; it must exist at start-up |
 | `entry_point` | `[A-Za-z0-9_-]+` | `websecure` | Traefik entry point of every router |
+| `http_entry_point` | `[A-Za-z0-9_-]+` | `web` | Traefik's plain-HTTP entry point, used only by the HTTP-01 challenge router (see `acme.http01_listen`); must differ from `entry_point` |
 | `cert_path_prefix` | absolute path | `/certs` | where Traefik sees `acme.certs_dir` (the same directory mounted into the Traefik container) |
 | `external_middlewares` | list of `name@provider` | none | middlewares defined outside Doorwarden (e.g. in another Traefik provider) that services may reference |
 | `tls_min_version` | `VersionTLS12` \| `VersionTLS13` | `VersionTLS12` | rendered as `tls.options.default.minVersion` |
@@ -356,7 +420,8 @@ the dynamic directory; see [deploy.md](deploy.md#certificates-in-traefik).
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `certs_dir` | absolute path | `/data/certs` | certificate files: `<certs_dir>/<id>/v<N>/fullchain.pem` and `privkey.pem` |
-| `http01_listen` | `host:port` | unset (HTTP-01 off) | address of the HTTP-01 challenge server. Doorwarden does not render a Traefik route for it: you must route `/.well-known/acme-challenge/` of each host to this address yourself |
+| `http01_listen` | `host:port` | unset (HTTP-01 off) | address of the HTTP-01 challenge server. When a zone uses `certificate.challenge: http-01`, Doorwarden renders a Traefik router on `traefik.http_entry_point` for `/.well-known/acme-challenge/` of exactly the hosts that need an http-01 certificate, forwarding to `http01_backend` (see [deploy.md](deploy.md#http-01-challenge-route)) |
+| `http01_backend` | `http(s)://host[:port]` | `http://doorwarden:<port of http01_listen>` | URL at which Traefik reaches the challenge server; no user info, path, query or fragment. Requires `http01_listen` |
 | `dns_propagation_timeout` | duration | the provider's own | how long to wait for a DNS-01 TXT record to propagate |
 | `resolvers` | list of `host[:port]` | system resolvers | resolvers used for the propagation check |
 | `issue_timeout` | duration | `5m` | upper bound of one issuance as seen by the reconcile loop |

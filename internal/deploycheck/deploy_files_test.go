@@ -190,7 +190,8 @@ func TestTraefikStatic(t *testing.T) {
 		t.Error("web address")
 	}
 	redir := sub(t, web, "http", "redirections", "entryPoint")
-	if redir["to"] != "websecure" || redir["permanent"] != true || redir["scheme"] != "https" {
+	// priority 1: below Doorwarden's HTTP-01 challenge router.
+	if redir["to"] != "websecure" || redir["permanent"] != true || redir["scheme"] != "https" || redir["priority"] != 1 {
 		t.Errorf("redirect %v", redir)
 	}
 	if sub(t, c, "entryPoints", "websecure")["address"] != ":443" {

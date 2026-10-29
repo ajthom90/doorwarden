@@ -35,6 +35,11 @@ func (c *Config) validateTraefik() []error {
 	if ep := t.EntryPoint; ep != "" && !validEntryPoint(ep) {
 		add("traefik.entry_point %q must be [A-Za-z0-9_-]+", ep)
 	}
+	if ep := t.HTTPEntryPoint; ep != "" && !validEntryPoint(ep) {
+		add("traefik.http_entry_point %q must be [A-Za-z0-9_-]+", ep)
+	} else if ep != "" && ep == t.EntryPoint {
+		add("traefik.http_entry_point must differ from traefik.entry_point (%q): the challenge router serves plain HTTP on port 80", ep)
+	}
 	for _, e := range t.ExternalMiddlewares {
 		if err := model.ValidateExternalMiddleware(e); err != nil {
 			add("traefik.external_middlewares: %v", err)

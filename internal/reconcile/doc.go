@@ -220,8 +220,12 @@
 // at least one routed service. Routed includes a Stopped/Error service that
 // gets a RouteWrite with its last-known backend, so a zone whose only services
 // are stopped still gets the wildcard DNSEnsure and the wildcard/san
-// CertEnsure (both no-ops when they already exist). "per-host": one record per
-// Published hostname. The record is A (or AAAA for an IPv6 target_ip) with
+// CertEnsure (both no-ops when they already exist); "*.zone" does not cover
+// the zone name itself, so a Published apex service (model.Options.Apex,
+// hostname == zone) also gets its own record, owned by its key exactly like
+// a per-host record. "per-host": one record per Published hostname, the
+// apex included (a foreign NS, SOA, MX or TXT at the apex never blocks it;
+// a foreign A/AAAA of the same type or a CNAME is a Conflict). The record is A (or AAAA for an IPv6 target_ip) with
 // value target_ip; an unparsable target_ip yields a Skip and no DNS action
 // (routes and certs proceed). An owned row for the same (provider, zone, name,
 // type) with an equal value means nothing to do (unless the listing shows it

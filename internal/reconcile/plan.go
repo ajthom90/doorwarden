@@ -26,6 +26,14 @@ type zoneInfo struct {
 	recType, value                         string // desired record; recType "" if target_ip is unusable
 }
 
+// wantsHostRecord reports whether a routed hostname of the zone gets its own
+// record: every hostname in per-host mode, and in wildcard mode the zone
+// apex, which "*.zone" does not cover (RFC 4592: a wildcard never matches
+// the name it sits under).
+func (z *zoneInfo) wantsHostRecord(host string) bool {
+	return z.mode == "per-host" || (z.mode == "wildcard" && host == z.name)
+}
+
 // entry is one unique desired service with its resolved hostname.
 type entry struct {
 	svc        model.Service
@@ -459,7 +467,7 @@ func (p *planner) planService(e entry) bool {
 				Reason: "published service has no valid backend (" + backendProblem(s.Backend) + ") and no last-known backend"})
 			return false
 		}
-		if z.mode == "per-host" {
+		if z.wantsHostRecord(e.host) {
 			p.ensureRecord(z, e.host, s.Key, &s)
 		}
 		if z.issuer != "" && z.strategy == "per-host" && !p.covered(e.host) {

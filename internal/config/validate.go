@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ajthom90/doorwarden/internal/acme/legonames"
+	"github.com/ajthom90/doorwarden/internal/model"
 )
 
 // Capabilities describes what a DNS provider type can do. A later task adapts
@@ -120,7 +121,17 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 		}
 	}
 	seen := map[string]int{}
+	apexOf := map[string]int{} // resolved zone -> first apex entry
 	for i, st := range c.Static {
+		if st.Apex {
+			if zn, msg := c.staticApexZone(st); msg != "" {
+				add("static[%d] %s: %s", i, st.Name, msg)
+			} else if j, dup := apexOf[zn]; dup {
+				add("static[%d] %s: zone %s already has an apex entry (static[%d])", i, st.Name, zn, j)
+			} else {
+				apexOf[zn] = i
+			}
+		}
 		for _, p := range st.Problems() {
 			add("static[%d] %s: %s", i, st.Name, p)
 		}
@@ -138,6 +149,33 @@ func (c *Config) Validate(caps func(providerType string) (Capabilities, bool)) [
 	errs = append(errs, c.validateACME()...)
 	errs = append(errs, c.Web.validate()...)
 	return errs
+}
+
+// staticApexZone resolves the zone of an apex entry (zone, else
+// settings.default_zone, else the only zone) and checks that it is
+// configured and usable as a host name. msg is non-empty on a problem.
+func (c *Config) staticApexZone(st StaticService) (zone, msg string) {
+	zone = normZoneName(st.Zone)
+	if zone == "" {
+		zone = normZoneName(c.Settings.DefaultZone)
+	}
+	if zone == "" && len(c.Zones) == 1 {
+		zone = normZoneName(c.Zones[0].Name)
+	}
+	if zone == "" {
+		return "", "apex needs a zone: set zone (or settings.default_zone)"
+	}
+	found := false
+	for _, z := range c.Zones {
+		found = found || normZoneName(z.Name) == zone
+	}
+	if !found {
+		return "", fmt.Sprintf("apex zone %q is not a configured zone", zone)
+	}
+	if !model.ValidLDHName(zone) {
+		return "", fmt.Sprintf("zone %q is not a valid host name for an apex entry (letters, digits and hyphens, at least two labels; punycode for internationalized names)", zone)
+	}
+	return zone, ""
 }
 
 // recordOnlyTypes are DNS record providers (records.provider) that cannot

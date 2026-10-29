@@ -94,7 +94,9 @@ func (a *App) RunOnce(ctx context.Context) CycleResult {
 		return res
 	}
 
+	a.cycleQuar = quarantined
 	acts, applyErr := a.runner.Reconcile(ctx, desired, obs, now)
+	a.cycleQuar = nil
 	res.Actions = acts
 	a.setPlan(acts, dry, now)
 	if applyErr != nil {

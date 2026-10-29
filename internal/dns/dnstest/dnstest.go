@@ -34,6 +34,16 @@ type Options struct {
 	// error to wrap dns.ErrUnconfirmed AND the returned Record to describe what
 	// was written, so a caller can record ownership.
 	Unconfirmed func(t *testing.T) dns.Provider
+	// Apex runs the ZoneApex subtest: an A record whose Name is the zone
+	// itself is created, listed, updated and deleted. It writes the zone's
+	// apex A record, so it is opt-in: set it for fake backends only, never
+	// against a real zone.
+	Apex bool
+	// ApexForeign, when set (with Apex), seeds records Doorwarden does not
+	// own at the zone apex (NS, SOA, MX, TXT, whatever the backend holds)
+	// out of band before ZoneApex runs, and returns a check that they are
+	// still intact afterwards.
+	ApexForeign func(ctx context.Context, zone string) (intact func() error, err error)
 }
 
 // Run executes the suite with default zones example.test and other.test.
@@ -340,6 +350,50 @@ func RunWith(t *testing.T, factory func(t *testing.T) dns.Provider, o Options) {
 		create(t, p, o.OtherZone, other)
 		if _, ok := find(list(t, p, zone), other.Name, "A"); ok {
 			t.Fatal("record of another zone returned")
+		}
+	})
+
+	t.Run("ZoneApex", func(t *testing.T) {
+		if !o.Apex {
+			t.Skip("Options.Apex not set (it writes the zone apex A record)")
+		}
+		p := factory(t)
+		intact := func() error { return nil }
+		if o.ApexForeign != nil {
+			var err error
+			if intact, err = o.ApexForeign(ctx(t), zone); err != nil {
+				t.Fatalf("seeding foreign apex records: %v", err)
+			}
+		}
+		rec := dns.Record{Name: zone, Type: "A", Value: "192.0.2.40", TTL: 300}
+		got := create(t, p, zone, rec)
+		if got.Name != zone || got.Value != rec.Value {
+			t.Fatalf("created = %+v", got)
+		}
+		if r, ok := find(list(t, p, zone), zone, "A"); !ok || r.Value != rec.Value {
+			t.Fatalf("apex A not listed: %+v", list(t, p, zone))
+		}
+		create(t, p, zone, rec) // idempotent
+		upd := got
+		upd.Value = "192.0.2.41"
+		if _, err := p.UpdateRecord(ctx(t), zone, upd); err != nil {
+			t.Fatalf("UpdateRecord(apex): %v", err)
+		}
+		if r, ok := find(list(t, p, zone), zone, "A"); !ok || r.Value != "192.0.2.41" {
+			t.Fatalf("apex A not updated: %+v", list(t, p, zone))
+		}
+		if err := intact(); err != nil {
+			t.Fatalf("after create/update: %v", err)
+		}
+		upd.ID = got.ID
+		if err := p.DeleteRecord(ctx(t), zone, upd); err != nil {
+			t.Fatalf("DeleteRecord(apex): %v", err)
+		}
+		if _, ok := find(list(t, p, zone), zone, "A"); ok {
+			t.Fatal("apex A still listed after delete")
+		}
+		if err := intact(); err != nil {
+			t.Fatalf("after delete: %v", err)
 		}
 	})
 }

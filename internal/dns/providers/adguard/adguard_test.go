@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -136,6 +137,25 @@ func TestConformance(t *testing.T) {
 	b := &backend{}
 	p := newProvider(t, b, password)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
+		ApexForeign: func(context.Context, string) (func() error, error) {
+			// AdGuard rewrites hold only A/AAAA/CNAME answers: a foreign
+			// AAAA at the apex must survive the apex A's lifecycle.
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			w := rw{Domain: "example.test", Answer: "2001:db8::1"}
+			b.rws = append(b.rws, w)
+			return func() error {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				for _, r := range b.rws {
+					if r.Domain == w.Domain && r.Answer == w.Answer {
+						return nil
+					}
+				}
+				return fmt.Errorf("foreign apex AAAA rewrite removed")
+			}, nil
+		},
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			b.mu.Lock()
 			defer b.mu.Unlock()

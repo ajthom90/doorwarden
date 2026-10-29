@@ -140,6 +140,9 @@ type Options struct {
 	// or with a name no certificate matches are rejected instead of getting
 	// the default certificate. Off by default.
 	SNIStrict bool
+	// Challenge, when set, renders the HTTP-01 challenge router into
+	// ChallengeFile (see challenge.go). nil: no such file.
+	Challenge *Challenge
 }
 
 // Problem reports something not rendered.
@@ -454,6 +457,12 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 		}
 	}
 
+	cb, cprobs, err := buildChallenge(opts.Challenge, ep)
+	if err != nil {
+		return nil, nil, err
+	}
+	probs = append(probs, cprobs...)
+
 	sortProblems(probs)
 
 	rb, err := marshal(routesDoc{HTTP: conf})
@@ -464,7 +473,11 @@ func Render(routes []store.Route, mw MiddlewareDefs, certs []TLSCert, opts Optio
 	if err != nil {
 		return nil, nil, err
 	}
-	return Files{RoutesFile: rb, TLSFile: tb}, probs, nil
+	files := Files{RoutesFile: rb, TLSFile: tb}
+	if cb != nil {
+		files[ChallengeFile] = cb
+	}
+	return files, probs, nil
 }
 
 // sortProblems orders problems deterministically.

@@ -118,3 +118,11 @@ func TestRepeatedListDoesNotAccumulateWarnings(t *testing.T) {
 		}
 	}
 }
+
+func TestApexMapped(t *testing.T) {
+	out, _ := list(t, config.StaticService{Name: "site", Host: "192.0.2.10", Zone: "example.test", Apex: true},
+		config.StaticService{Name: "www", Host: "192.0.2.10", Zone: "example.test"})
+	if !out[0].Options.Apex || out[1].Options.Apex {
+		t.Fatalf("%+v", out)
+	}
+}

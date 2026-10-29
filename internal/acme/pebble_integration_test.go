@@ -358,3 +358,32 @@ func TestPebbleEAB(t *testing.T) {
 		t.Fatalf("want EAB required error, got %v", err)
 	}
 }
+
+// An imported per-host certificate for a zone apex and its www (as Nginx
+// Proxy Manager stores one), due, in an http-01 zone of a non-staging
+// issuer: Renew adopts it by an http-01 order for exactly its names.
+func TestPebbleImportedApexAdoptedByHTTP01(t *testing.T) {
+	e := pebbleHarness(t, []config.Zone{pzone("imp.example.test", "per-host", "http-01")}, false)
+	e.m.wanted = func(zone string) []string {
+		if zone == "imp.example.test" {
+			return []string{"imp.example.test", "www.imp.example.test"}
+		}
+		return nil
+	}
+	chain, key := e.ca.ca.leaf(t, []string{"imp.example.test", "www.imp.example.test"}, time.Now().Add(10*24*time.Hour))
+	ir, err := e.m.ImportPEM(ictx(t), "imp.example.test", chain, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := e.m.Renew(ictx(t))
+	if len(res) != 1 || res[0].Err != nil || res[0].CertID != ir.Bundle.ID {
+		t.Fatalf("%+v", res)
+	}
+	c := leafOf(t, e.harness, ir.Bundle.ID)
+	if !sameNames(c, "imp.example.test", "www.imp.example.test") {
+		t.Fatalf("names %v", c.DNSNames)
+	}
+	if r := e.row(t, ir.Bundle.ID); !r.Managed || r.Status != StatusValid {
+		t.Fatalf("row %+v", r)
+	}
+}

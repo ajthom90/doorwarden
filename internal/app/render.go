@@ -19,6 +19,12 @@ import (
 // quarantined even if storing the flag failed, so a failed write cannot
 // leave a quarantined service served.
 func (a *App) render(ctx context.Context, now time.Time, quarantined map[string]bool) error {
+	return a.renderWith(ctx, now, quarantined, nil)
+}
+
+// renderWith is render with extra HTTP-01 challenge hosts (names about to
+// be ordered whose routes are not persisted yet, see challengeFirst).
+func (a *App) renderWith(ctx context.Context, now time.Time, quarantined map[string]bool, extraChallenge []string) error {
 	routes, err := a.st.ListRoutes(ctx)
 	if err != nil {
 		return fmt.Errorf("traefik render: reading routes: %w", err)
@@ -54,6 +60,7 @@ func (a *App) render(ctx context.Context, now time.Time, quarantined map[string]
 				d.ID, strings.Join(missing, ", ")))
 		}
 	}
+	opts.Challenge = traefikwire.Challenge(a.cfg, routes, extraChallenge)
 	files, rprobs, err := traefik.Render(routes, traefik.MiddlewareDefs(a.cfg.MiddlewareDefs()), certs, opts)
 	if err != nil {
 		return fmt.Errorf("traefik render: %w", err)
@@ -75,6 +82,7 @@ func (a *App) render(ctx context.Context, now time.Time, quarantined map[string]
 	if err := traefik.WriteMode(a.cfg.Traefik.DynamicDir, files, mode); err != nil {
 		return fmt.Errorf("traefik write: %w", err)
 	}
+	a.setChallengeHosts(opts.Challenge)
 	a.certExpiryMetrics(rows)
 	return nil
 }

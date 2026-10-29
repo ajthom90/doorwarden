@@ -117,8 +117,14 @@ func NewGate(st Store) *Gate { return &Gate{st: st, snap: map[string]string{}} }
 // the value a UI must echo back to Approve for the service it displayed.
 func Fingerprint(s model.Service) string {
 	mw := append([]string{}, s.Options.Middlewares...) // order matters
-	b, _ := json.Marshal([]any{"v2", s.Key, s.Name, s.Options.Rename, s.Zone,
-		s.Backend.Scheme, s.Backend.Host, s.Backend.Port, s.Backend.SkipVerify, s.Options.Websockets, mw})
+	parts := []any{"v2", s.Key, s.Name, s.Options.Rename, s.Zone,
+		s.Backend.Scheme, s.Backend.Host, s.Backend.Port, s.Backend.SkipVerify, s.Options.Websockets, mw}
+	if s.Options.Apex {
+		// Appended only when set, so every fingerprint stored before apex
+		// support (Apex false) is unchanged.
+		parts = append(parts, "apex")
+	}
+	b, _ := json.Marshal(parts)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

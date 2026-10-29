@@ -72,6 +72,9 @@ func ApplyUI(svc Service, o UIOverrides) Service { return Apply(svc, o.Overrides
 // lowercase DNS label giving a valid hostname, the resulting backend must
 // pass ValidateBackend, and skip_verify is only for https backends.
 func (o UIOverrides) Validate(svc Service, zones []string, defaultZone string) error {
+	if o.Rename != nil && svc.Options.Apex {
+		return &OverrideError{Msg: "an apex service cannot be renamed: its hostname is the zone name"}
+	}
 	if o.Rename != nil {
 		r := *o.Rename
 		if sl, err := Slug(r); err != nil || sl != r {
