@@ -78,6 +78,26 @@ var ErrUnknownService = errors.New("unknown service")
 // ErrNotFound is returned by Control for an unknown provider or cert.
 var ErrNotFound = errors.New("not found")
 
+// ErrDryRun is returned by Control actions refused while dry run is on
+// (certificate renewal, the production switch): they would contact the CA
+// and write certificates. Handlers answer 409 with dryRunMsg.
+var ErrDryRun = errors.New("dry run is on")
+
+// refuseInDryRun answers 409 and returns true while dry run is on (or 500
+// if its state cannot be read): what is the refused action, for the message.
+func (s *Server) refuseInDryRun(w http.ResponseWriter, r *http.Request, what string) bool {
+	dry, err := s.ctl.DryRun(r.Context())
+	if err != nil {
+		s.internal(w, "dry run state", err)
+		return true
+	}
+	if dry {
+		writeErr(w, http.StatusConflict, "dry run is on: "+what+" is refused because it would change real state; turn dry run off first")
+		return true
+	}
+	return false
+}
+
 // ServiceInfo is one service as the API shows it.
 type ServiceInfo struct {
 	Key         string            `json:"key"`
@@ -831,6 +851,9 @@ func (s *Server) handleConflictAction(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "only A and AAAA records can be adopted; remove the "+t+" record at the provider instead")
 			return
 		}
+		if s.refuseInDryRun(w, r, "adopting a DNS record (it writes an ownership row)") {
+			return
+		}
 		err := s.st.AddOwnedRecord(r.Context(), store.DNSRecord{Provider: x.Provider, Zone: normZone(x.Zone), Name: x.Record.Name,
 			Type: t, Value: x.Record.Value, ProviderRecordID: x.Record.ID, OwnerKey: x.Owner, CreatedAt: s.now()})
 		if errors.Is(err, store.ErrOwnerConflict) {
@@ -970,6 +993,9 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "unknown certificate")
 		return
 	}
+	if s.refuseInDryRun(w, r, "renewing a certificate") {
+		return
+	}
 	actor := principalFrom(r.Context()).Actor()
 	if !s.runAsync("cert/"+id, actor, "renewal of certificate "+id, func(ctx context.Context) error { return s.ctl.RenewCert(ctx, id) }) {
 		writeErr(w, http.StatusConflict, "a renewal of this certificate is already running")
@@ -997,6 +1023,9 @@ func (s *Server) handleSwitchProduction(w http.ResponseWriter, r *http.Request) 
 	}
 	if !req.Confirm {
 		writeErr(w, http.StatusBadRequest, "set confirm: true: every staging certificate of the issuer is re-issued from production")
+		return
+	}
+	if s.refuseInDryRun(w, r, "switching an issuer to production") {
 		return
 	}
 	actor := principalFrom(r.Context()).Actor()

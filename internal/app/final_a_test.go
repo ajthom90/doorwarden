@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -153,5 +154,28 @@ func TestTrueNASPortalPortChangeNeedsApproval(t *testing.T) {
 		if x.Kind == reconcile.RouteWrite && x.Key == "truenas:app" && x.Backend.Port == 30002 {
 			t.Fatalf("unapproved port routed: %+v", x)
 		}
+	}
+}
+
+// Dry run refuses the certificate actions that would talk to the CA and
+// write certificates (checked before anything else).
+func TestDryRunRefusesCertActions(t *testing.T) {
+	e := newEnv(t, testYAML)
+	a := e.app()
+	ctx := context.Background()
+	if err := a.SetDryRun(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RenewCert(ctx, "example.test"); !errors.Is(err, ErrDryRun) {
+		t.Fatalf("RenewCert in dry run: %v", err)
+	}
+	if err := a.SwitchProduction(ctx, "le"); !errors.Is(err, ErrDryRun) {
+		t.Fatalf("SwitchProduction in dry run: %v", err)
+	}
+	if err := a.SetDryRun(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RenewCert(ctx, "example.test"); errors.Is(err, ErrDryRun) {
+		t.Fatal("refused outside dry run")
 	}
 }

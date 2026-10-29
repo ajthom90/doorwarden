@@ -275,8 +275,28 @@ func (a *App) TestProvider(ctx context.Context, name string) error {
 
 var errNoACME = errors.New("no zone has a certificate issuer")
 
+// ErrDryRun: RenewCert and SwitchProduction are refused while dry run is on
+// (they would contact the CA and write certificates).
+var ErrDryRun = web.ErrDryRun
+
+// refuseDry returns ErrDryRun while dry run is on; a store error reading
+// the toggle refuses too (fail safe).
+func (a *App) refuseDry(ctx context.Context) error {
+	dry, err := a.DryRun(ctx)
+	if err != nil {
+		return fmt.Errorf("read dry-run state: %w", err)
+	}
+	if dry {
+		return ErrDryRun
+	}
+	return nil
+}
+
 // RenewCert implements web.Control.
 func (a *App) RenewCert(ctx context.Context, id string) error {
+	if err := a.refuseDry(ctx); err != nil {
+		return err
+	}
 	if a.mgr == nil {
 		return errNoACME
 	}
@@ -295,6 +315,9 @@ func (a *App) RenewCert(ctx context.Context, id string) error {
 
 // SwitchProduction implements web.Control.
 func (a *App) SwitchProduction(ctx context.Context, issuer string) error {
+	if err := a.refuseDry(ctx); err != nil {
+		return err
+	}
 	if a.mgr == nil {
 		return errNoACME
 	}
