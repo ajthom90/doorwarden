@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -479,5 +481,97 @@ func TestConfigPutErrorsEchoNoValues(t *testing.T) {
 	}
 	if strings.Contains(e.activity(), "s3cr3t") || strings.Contains(e.logBuf.String(), "s3cr3t") {
 		t.Fatal("secret in activity or log")
+	}
+}
+
+// A client that never reads cannot pin the stream: every write has a
+// finite deadline, so once the socket buffers fill the handler gives up
+// and unsubscribes.
+func TestEventsStalledReader(t *testing.T) {
+	old := sseWriteTimeout
+	sseWriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { sseWriteTimeout = old })
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	ts := httptest.NewServer(e.h)
+	t.Cleanup(ts.Close)
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET /api/v1/events HTTP/1.1\r\nHost: dw.example.test\r\nCookie: %s=%s\r\n\r\n", c.cookie.Name, c.cookie.Value)
+	deadline := time.Now().Add(5 * time.Second)
+	for e.srv.events.clientCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	big := strings.Repeat("x", 256<<10)
+	for e.srv.events.clientCount() != 0 && time.Now().Before(deadline) {
+		e.srv.Events().Publish("cycle", big)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := e.srv.events.clientCount(); n != 0 {
+		t.Fatalf("stalled stream still subscribed (%d)", n)
+	}
+}
+
+// One principal may hold at most maxSSEPerPrincipal streams.
+func TestEventsPerPrincipalCap(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	ts := httptest.NewServer(e.h)
+	t.Cleanup(ts.Close)
+	open := func() *http.Response {
+		req, _ := http.NewRequest("GET", ts.URL+"/api/v1/events", nil)
+		req.AddCookie(c.cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+	for i := range maxSSEPerPrincipal {
+		if r := open(); r.StatusCode != 200 {
+			t.Fatalf("stream %d: %d", i, r.StatusCode)
+		}
+	}
+	if r := open(); r.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("stream over the per-principal cap: %d", r.StatusCode)
+	}
+}
+
+// A trusted-header stream is re-validated at every heartbeat: it ends once
+// it has lasted sseHeaderMaxAge (forward auth gets to re-check on
+// reconnect).
+func TestEventsHeaderStreamExpires(t *testing.T) {
+	old := sseHeartbeat
+	sseHeartbeat = 20 * time.Millisecond
+	t.Cleanup(func() { sseHeartbeat = old })
+	e := newTestEnv(t)
+	e.setupAdmin()
+	r := httptest.NewRequest("GET", "http://dw.example.test/api/v1/events", nil)
+	r.RemoteAddr = "192.0.2.100:1234"
+	r.Header.Set("X-Auth-User", "alice")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.h.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for e.srv.events.clientCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("header stream ended early")
+	default:
+	}
+	e.advance(sseHeaderMaxAge + time.Second)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("header stream outlived sseHeaderMaxAge")
 	}
 }

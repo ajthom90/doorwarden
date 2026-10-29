@@ -3,10 +3,15 @@ package web
 // SSE: GET /api/v1/events streams server-sent events to authenticated
 // clients. Events carry identifiers and short messages only (never
 // secrets): "cycle" after a reconcile cycle, "activity" for audit entries.
-// The server's WriteTimeout is lifted for the stream (per-response write
-// deadline cleared); a heartbeat comment goes out every heartbeat interval
-// and re-checks the session, closing the stream once it is logged out or
-// expired. Clients are capped (maxSSEClients); slow clients drop events.
+// The server's WriteTimeout would end the stream, so instead every write
+// and flush gets its own fresh deadline (sseWriteTimeout): a client that
+// stops reading is dropped once the socket buffers fill, rather than
+// pinning the handler. A heartbeat comment goes out every heartbeat
+// interval and re-validates the principal: a session must still exist and
+// be unexpired; a trusted-header stream ends after sseHeaderMaxAge so the
+// forward-auth proxy re-checks on reconnect. Clients are capped in all
+// (maxSSEClients) and per principal (maxSSEPerPrincipal); slow clients
+// drop events.
 
 import (
 	"encoding/json"
@@ -17,11 +22,16 @@ import (
 )
 
 const (
-	maxSSEClients = 32
-	sseBuffer     = 32
+	maxSSEClients      = 32
+	maxSSEPerPrincipal = 4
+	sseBuffer          = 32
+	sseHeaderMaxAge    = time.Hour
 )
 
-var sseHeartbeat = 25 * time.Second
+var (
+	sseHeartbeat    = 25 * time.Second
+	sseWriteTimeout = 10 * time.Second
+)
 
 type sseEvent struct {
 	name string
@@ -31,14 +41,15 @@ type sseEvent struct {
 // Broker fans events out to SSE clients.
 type Broker struct {
 	mu      sync.Mutex
-	clients map[chan sseEvent]struct{}
+	clients map[chan sseEvent]string // -> principal key
+	per     map[string]int
 	closed  bool
 	done    chan struct{}
 }
 
 // NewBroker returns an empty broker.
 func NewBroker() *Broker {
-	return &Broker{clients: map[chan sseEvent]struct{}{}, done: make(chan struct{})}
+	return &Broker{clients: map[chan sseEvent]string{}, per: map[string]int{}, done: make(chan struct{})}
 }
 
 // Publish sends an event to every client (dropped for clients that are
@@ -58,20 +69,31 @@ func (b *Broker) Publish(name string, v any) {
 	}
 }
 
-func (b *Broker) subscribe() (chan sseEvent, bool) {
+// subscribe adds a client for principal key; status is the refusal code
+// (503 when full overall, 429 when the principal has its maximum).
+func (b *Broker) subscribe(key string) (chan sseEvent, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed || len(b.clients) >= maxSSEClients {
-		return nil, false
+		return nil, http.StatusServiceUnavailable
+	}
+	if b.per[key] >= maxSSEPerPrincipal {
+		return nil, http.StatusTooManyRequests
 	}
 	c := make(chan sseEvent, sseBuffer)
-	b.clients[c] = struct{}{}
-	return c, true
+	b.clients[c] = key
+	b.per[key]++
+	return c, 0
 }
 
 func (b *Broker) unsubscribe(c chan sseEvent) {
 	b.mu.Lock()
-	delete(b.clients, c)
+	if key, ok := b.clients[c]; ok {
+		delete(b.clients, c)
+		if b.per[key]--; b.per[key] <= 0 {
+			delete(b.per, key)
+		}
+	}
 	b.mu.Unlock()
 }
 
@@ -94,23 +116,31 @@ func (b *Broker) clientCount() int {
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	p := principalFrom(r.Context())
 	rc := http.NewResponseController(w)
-	c, ok := s.events.subscribe()
-	if !ok {
-		writeErr(w, http.StatusServiceUnavailable, "too many event streams")
+	c, refused := s.events.subscribe(p.Actor())
+	if refused != 0 {
+		writeErr(w, refused, "too many event streams")
 		return
 	}
 	defer s.events.unsubscribe(c)
-	_ = rc.SetWriteDeadline(time.Time{})
+	started := s.now()
+	// The request has no body; the server's read timeout must not end
+	// the stream.
 	_ = rc.SetReadDeadline(time.Time{})
+	// send writes one chunk with a fresh, finite write deadline.
+	send := func(format string, a ...any) bool {
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+		if _, err := fmt.Fprintf(w, format, a...); err != nil {
+			return false
+		}
+		return rc.Flush() == nil
+	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-store")
 	h.Set("X-Accel-Buffering", "no")
+	_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
 	w.WriteHeader(http.StatusOK)
-	if _, err := fmt.Fprint(w, ": doorwarden events\n\n"); err != nil {
-		return
-	}
-	if rc.Flush() != nil {
+	if !send(": doorwarden events\n\n") {
 		return
 	}
 	t := time.NewTicker(sseHeartbeat)
@@ -122,14 +152,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-s.events.done:
 			return
 		case <-t.C:
-			if !s.auth.stillValid(r.Context(), p) {
+			if !s.auth.stillValid(r.Context(), p, started) {
 				return
 			}
-			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil || rc.Flush() != nil {
+			if !send(": ping\n\n") {
 				return
 			}
 		case e := <-c:
-			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.name, e.data); err != nil || rc.Flush() != nil {
+			if !send("event: %s\ndata: %s\n\n", e.name, e.data) {
 				return
 			}
 		}

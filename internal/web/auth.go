@@ -384,10 +384,17 @@ func (a *auth) session(ctx context.Context, h string) (*Principal, error) {
 	return &Principal{User: s.Username, Role: RoleAdmin, Method: "session", CSRF: s.CSRF, sessionHash: h}, nil
 }
 
-// stillValid re-checks p (long-lived SSE streams).
-func (a *auth) stillValid(ctx context.Context, p *Principal) bool {
+// stillValid re-checks p for a long-lived SSE stream opened at since. A
+// session must still exist (logout and password change delete it, and a
+// newer credential generation hides it) and be unexpired. A header
+// principal cannot be re-asked of the proxy mid-stream, so its stream ends
+// after sseHeaderMaxAge, and at once if trusted-header auth is off.
+func (a *auth) stillValid(ctx context.Context, p *Principal, since time.Time) bool {
+	if p.Method == "header" {
+		return a.header != "" && len(a.proxies) > 0 && a.now().Sub(since) < sseHeaderMaxAge
+	}
 	if p.Method != "session" {
-		return true
+		return false
 	}
 	s, ok, err := a.st.GetSession(ctx, p.sessionHash)
 	if err != nil || !ok {
