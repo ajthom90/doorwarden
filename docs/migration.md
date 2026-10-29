@@ -61,9 +61,10 @@ directory while it is stopped and point `--db` at that copy.
 
 The image is distroless (no shell), so run the subcommand directly, mounting
 NPM's data volume read-only. `--config` reads the Doorwarden config to know
-your zones, and the config's `${VAR}` placeholders must resolve: pass the same
-variables with `-env-file` (lines of `KEY=VALUE`, such as `deploy/.env`; lands
-with the final-fix wave):
+your zones. Pass the variables its `${VAR}` placeholders use with
+`-env-file` (Docker env-file format: `KEY=VALUE` lines, `#` comments, values
+taken literally, such as `deploy/.env`; variables in the process environment
+win over the file):
 
 ```
 docker run --rm \
@@ -78,7 +79,14 @@ docker run --rm \
 
 `<npm-data>` is the host directory of NPM's `/data` volume (the one holding
 `database.sqlite`), `<dataset>` the directory with Doorwarden's `config/`.
-Without `--discovered`, leave that flag out.
+Without `--discovered`, leave that flag out. Only the zones are used, so
+variables set nowhere expand to an empty value and are listed in a `note:` on
+standard error; an unquoted `${VAR}` in a number, boolean or duration field
+must still be set.
+
+The snapshot copy refuses a database (or `-wal`/`-shm` file) that is a
+symbolic link or a special file, and copies at most 1 GiB per file and 2 GiB
+in total.
 
 Add `--yaml` for the paste-ready entries. Hosts with an access list, hosts
 disabled in NPM and hosts with custom nginx config are never emitted as live
@@ -121,31 +129,51 @@ add them to the config.
 ### Import NPM's certificates
 
 NPM keeps its Let's Encrypt certificates (including wildcard ones) under
-`live/npm-<N>/` of its `letsencrypt` volume. Importing them lets Doorwarden
-serve valid production certificates from the cutover on, without new orders;
-it renews them itself when they come due. Run it with Doorwarden stopped, as
-the Doorwarden user, with its data and certificate directories mounted (lands
-with the final-fix wave):
+`live/npm-<N>/` of its `letsencrypt` volume (mounted at `/etc/letsencrypt` in
+the NPM container). Importing them lets Doorwarden serve NPM's production
+certificates from the cutover on, without new orders.
 
 ```
-docker run --rm --user 65532:65532 \
+doorwarden certs import-npm -npm-dir PATH [-config PATH] [-env-file PATH]
+    [-db PATH] [-certs-dir PATH] [-dry-run] [-allow-owner-mismatch]
+```
+
+Run it as the database owner (UID 65532), with Doorwarden's config, data and
+certificate directories and NPM's `letsencrypt` directory (read-only) mounted.
+It works while the server runs; the server picks the certificates up in its
+next cycle. The master key must be set (it may be omitted with `-dry-run`);
+here docker's own `--env-file` passes the same variables the app uses:
+
+```
+docker run --rm --user 65532:65532 --env-file <dataset>/.env \
     -v <npm-letsencrypt>:/npm-le:ro \
     -v <dataset>/config:/config:ro \
     -v <dataset>/data:/data \
     -v <dataset>/certs:/data/certs \
     ghcr.io/ajthom90/doorwarden:<tag> \
-    certs import-npm -npm-dir /npm-le/live -dry-run
+    certs import-npm -npm-dir /npm-le -dry-run
 ```
 
-Mount the whole `letsencrypt` volume, not only `live/`: the files in `live/`
-are links into `archive/`. `-npm-dir` is either that `live/` directory (every
-`npm-*` directory in it is imported) or one `npm-<N>` directory. Each
-certificate is assigned to the configured zone that contains all its names.
-`-dry-run` lists what would be imported; run it again without `-dry-run` to
-import. `-db` (default `$DOORWARDEN_DB`, then `/data/doorwarden.db`) and
-`-certs-dir` (default `/data/certs`) select where it writes. NPM's files are
-only read. A staging issuer never replaces an imported production
-certificate.
+Then run it again without `-dry-run`.
+
+- `-npm-dir` is NPM's `letsencrypt` directory, its `live/`, or one
+  `live/npm-<N>`. Mount the whole `letsencrypt` volume: the files in `live/`
+  are links into `archive/`. NPM's files are only read.
+- Each certificate is assigned to the configured zone that contains all its
+  names; one outside every zone fails, the others are still imported, and
+  the exit status is 1.
+- `-config` defaults to `$DOORWARDEN_CONFIG`, then `/config/doorwarden.yaml`
+  (it is needed for the zones); `-db` to `$DOORWARDEN_DB`, then
+  `/data/doorwarden.db`; `-certs-dir` to the config's `acme.certs_dir`. An
+  `acme.certs_dir` that uses an unset variable is refused unless `-certs-dir`
+  is given.
+- `-dry-run` reads the real database read-only, writes nothing and reports
+  the same decisions as a real run.
+- Re-running is safe: certificates Doorwarden has adopted since, or for which
+  a newer version is stored, are skipped (exit status 0).
+- Imported certificates are served as they are. A production issuer takes
+  them over when they come due for renewal; a staging issuer never replaces
+  them, so switch to production before they expire.
 
 ## 4. Dry run, staging issuer, verify on the alternate port
 

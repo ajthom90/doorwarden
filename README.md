@@ -152,7 +152,9 @@ Proxy Manager is a staged cutover on alternate ports with an instant rollback:
 
 - **Nothing is published by accident.** Docker containers must opt in; TrueNAS
   apps wait for approval; static entries are written by you. Dry run shows the
-  plan before anything changes.
+  plan before anything changes. An approved service whose backend or
+  middlewares change at the source is quarantined (not served) until it is
+  approved again, and a newcomer cannot take over a published host name.
 - **Doorwarden only touches DNS records it created** (or that you adopt).
   Existing records are reported as conflicts. Removal waits for
   `settings.grace_period` (24h); a source outage never counts as removal; the
@@ -208,9 +210,7 @@ The binary is about 66 MiB (linux/amd64, stripped) because it includes lego's
 full DNS provider catalog; a smaller `acme_minimal` build is deferred
 ([docs/operations.md](docs/operations.md#resource-notes)).
 
-The `fake` DNS provider type is compiled in for tests and the UI demo; it keeps
-records in memory only and is not for real zones. Reports from real setups,
-working or not, are very welcome: open an issue.
+Reports from real setups, working or not, are very welcome: open an issue.
 
 ## Documentation
 

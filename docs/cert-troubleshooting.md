@@ -37,7 +37,7 @@ rate limits.
 2. Switch: on the Certificates page choose **Switch to production...**, or call
    `POST /api/v1/certs/switch-production` with
    `{"issuer": "letsencrypt", "confirm": true}` (an administrator session and
-   the CSRF header are needed). This records the switch for that issuer and
+   the CSRF header are needed; refused with `409` while dry run is on). This records the switch for that issuer and
    re-issues every staging certificate of it, one by one; one that fails stays
    on staging and can be retried with **Renew now**.
 3. Make it permanent: set `directory: production` on the issuer in the config.
@@ -63,8 +63,8 @@ production certificate under a staging issuer is refused.
   less than 14 days, 7 days and 1 day left (`cert.expiring`); see
   [configuration.md](configuration.md#notifications).
 - **Force renewal**: **Renew now** on the Certificates page, or
-  `POST /api/v1/certs/{id}/renew` (answers `202 Accepted`; the result appears
-  on the page and in the activity log). It skips the failure backoff, but not
+  `POST /api/v1/certs/{id}/renew` (answers `202 Accepted`, or `409` while dry
+  run is on; the result appears on the page and in the activity log). It skips the failure backoff, but not
   a rate-limit pause from the CA.
 
 ## Rate limits and backoff
@@ -123,6 +123,8 @@ Nginx Proxy Manager's certificates, wildcard ones included, can be imported
 with `doorwarden certs import-npm -npm-dir <dir>` (see
 [migration.md](migration.md#import-npms-certificates)), so a cutover needs no
 new orders. NPM's files are only read and stay your rollback path. A staging
-issuer never replaces an imported production certificate. Without importing,
+issuer never replaces an imported production certificate, so switch the
+issuer to production before imported certificates expire; a production issuer
+takes them over when they come due. Without importing,
 test with the staging issuer first to stay clear of duplicate-certificate
 limits.

@@ -31,9 +31,9 @@ rules; a `viewer` role is enough).
 | `doorwarden_reconcile_total` | counter | `result`: `ok`, `error`, `dry_run` |
 | `doorwarden_reconcile_duration_seconds` | histogram | |
 | `doorwarden_reconcile_actions_total` | counter | `kind`: planned action kind |
-| `doorwarden_dns_operations_total` | counter | `provider_type`, `op` (`ensure`, `delete`, `list`), `result` |
-| `doorwarden_cert_renewal_total` | counter | `result`: `ok`, `error` |
-| `doorwarden_cert_expiry_seconds` | gauge | `zone`: seconds until the earliest certificate expiry (negative when expired) |
+| `doorwarden_dns_operations_total` | counter | `provider_type`, `op` (`ensure`, `update`, `delete`, `list`), `result`: every call to a DNS record provider |
+| `doorwarden_cert_renewal_total` | counter | `result`: `ok`, `error`: every issuance attempt (hourly renewals, new certificates, Renew now, the production switch); deferred or skipped certificates are not counted |
+| `doorwarden_cert_expiry_seconds` | gauge | `zone`: seconds until the earliest certificate expiry (negative when expired), updated every cycle, dry run included |
 | `doorwarden_source_up` | gauge | `source`: 1 when the last listing succeeded |
 | `doorwarden_source_list_duration_seconds` | histogram | `source` |
 | `doorwarden_notifications_total` | counter | `sender`, `result` (`ok`, `error`, `dropped`) |
@@ -50,7 +50,13 @@ Doorwarden logs to standard error (`docker logs <container>`) as text lines
 with a level (`INFO`, `WARN`, `ERROR`). Credentials are never logged. Worth
 knowing:
 
+- `INFO doorwarden started ... dry_run=...` at start-up, and in a dry run also
+  `WARN DRY RUN: no DNS record, certificate, Traefik file or route is changed ...`
+  with the reason (config, the UI switch, or an unreadable switch);
 - `WARN no administrator yet: first-run setup token ...` until setup is done;
+- `WARN ... zones and no settings.default_zone ...` when several zones and
+  discovery are configured without a default zone
+  ([configuration.md](configuration.md#settings));
 - `INFO dry run: would ...` for every planned change during a dry run;
 - `WARN running in a container with web.trusted_proxies unset` (see
   [security.md](security.md#webtrusted_proxies)).
@@ -78,10 +84,10 @@ records, dry-run toggles). Alerts go to the configured
 The run is dry when the config setting or the persisted UI switch is on. A
 failure to read the switch from the database also makes a cycle dry.
 
-While dry run is on, the actions that would change something now (Renew now,
-Switch to production, Adopt a DNS record) are refused with `409 Conflict`
-(lands with the final-fix wave); turn dry run off first. Approvals, renames
-and other overrides are accepted and show up in the next plan. Remember that
+While dry run is on, the actions that would change real state now (Renew now,
+Switch to production, Adopt a DNS conflict) are refused with `409 Conflict`
+(`dry run is on: ... turn dry run off first`). Ignoring a conflict, approvals,
+renames and other overrides are accepted and show up in the next plan. Remember that
 in dry run Doorwarden writes no Traefik file, so the static route to its own
 UI does not exist yet ([deploy.md](deploy.md#first-run)).
 
@@ -133,7 +139,29 @@ without its `-wal` file.
    first start after a major upgrade.
 
 Migrations only go forward. To go back to an older version, restore the backup
-taken before the upgrade.
+taken before the upgrade. Do not just start an older binary on a newer
+database: it ignores columns it does not know. For example, a version without
+migration `0005` ignores the quarantine mark on routes
+([labels.md](labels.md#approval)) and would serve quarantined services again.
+
+Notes for upgrading to the version with quarantine and `traefik.file_mode`:
+
+- Existing approvals are migrated to the new format once, automatically, for
+  services whose content is unchanged (`migrated approval v1->v2` in the
+  activity log); no mass re-approval is needed.
+- Generated Traefik files with another mode than `traefik.file_mode` (default
+  `0600`) are rewritten once, which makes Traefik reload once.
+- With several zones, set `settings.default_zone` if you use Docker or
+  TrueNAS discovery; otherwise zone-less services become errors.
+
+## Stopping
+
+Stopping Doorwarden deletes nothing: no route, DNS record, certificate or
+file. On `SIGTERM` it stops the loop between actions, closes the UI's event
+streams, finishes HTTP requests (up to 10 seconds; background API actions such as
+Renew now are refused with `503` once shutdown has begun), and waits up to 30 seconds for certificate orders in
+progress. Give the container a stop timeout of at least 45 seconds (the
+provided compose file sets `stop_grace_period: 45s`; Docker's default is 10).
 
 ## Files Doorwarden writes for Traefik
 
@@ -153,8 +181,15 @@ Put your own Traefik configuration in other files.
   container; it is harmless and is not served. Rename one of the two to let
   both be published.
 - **A service is stuck as Pending.** Its source is in `approve` mode (the
-  default for TrueNAS) and it has not been approved, or its approved content
-  changed ([labels.md](labels.md#per-service-overrides)).
+  default for TrueNAS) and it has not been approved yet
+  ([labels.md](labels.md#approval)).
+- **`backend changed; re-approve to resume`.** The service is quarantined: its
+  source changed approved content (port, scheme, middlewares, name). It is not
+  served until you review and approve it again
+  ([labels.md](labels.md#approval)).
+- **A renamed or recreated service is a conflict with itself.** Its key
+  changed, and the old key keeps the host name until its grace period ends
+  ([labels.md](labels.md#host-name-conflicts)).
 - **`degraded: true` on `/healthz`.** A source failed its last listing or the
   last reconcile had an error; the Services page and the log say which.
 

@@ -21,10 +21,21 @@ When two services claim the same host name, see
 - **Different sources:** the higher-ranked source wins (static, then TrueNAS,
   then Docker), even against a service that already holds the name. The other
   service is reported as a conflict and gets no route.
-- **Same source:** the service that already holds the host name keeps it. A
-  newcomer from the same source that claims it (for example a second container
-  with the same `doorwarden.name`) is reported as a conflict instead of taking
-  over the route and DNS record (lands with the final-fix wave).
+- **Same source:** the service that already holds the host name (the
+  incumbent) keeps it, whatever its state: running, stopped, pending
+  approval, quarantined, invalid but still holding its route, or gone but
+  still within its grace period. A newcomer from the same source that claims
+  the name (for example a second container with the same `doorwarden.name`)
+  is reported as a conflict instead of taking over the route and DNS record.
+  Only when there is no incumbent do two newcomers tie, and then the one with
+  the lower key wins.
+
+Because the incumbent is identified by its key, a change of key looks like a
+new service: a container recreated under a new container name, or a static
+entry renamed without an `id`. The new key is a conflict until the old one's
+route is removed after `settings.grace_period` (24h by default). To avoid the
+wait, keep keys stable (give static entries an `id`, give containers a fixed
+`container_name`), or rename or unpublish one of the two in the UI.
 
 Resolve a conflict by renaming one of the services (label, static `rename`,
 or Rename in the UI).
@@ -89,8 +100,18 @@ service named after the app:
   are used.
 - An app that is not `RUNNING` is listed as stopped; its route and records are
   kept.
-- A running app without a usable portal is in the error state; publish it with
-  a static entry instead.
+- Portal ports are checked against the host ports the app actually publishes
+  (when TrueNAS reports them): portals on other ports are ignored, and if none
+  is left the app is in the error state (`no portal port is one of the app's
+  published ports: "Web UI" (port 30001)`; portals are named by name and port
+  only, never by URL).
+- A running app without a usable portal is in the error state (`no usable
+  portal ...`). Set a port for it on the Services page (Port): it then uses
+  the default zone's `target_ip` with that port, and still needs approval. Or
+  publish it with a static entry.
+- With two or more zones and no `settings.default_zone`, every running app is
+  in the error state (`no zone: set settings.default_zone`), because apps
+  cannot name a zone.
 - New apps wait for approval (`approval: approve`, the default). Approve them
   on the Services page ("Review and approve").
 
@@ -141,13 +162,39 @@ over labels. Unpublishing in the UI removes the service like a disappearance:
 route and records go after `settings.grace_period`, and publishing again
 within the grace cancels the removal.
 
-In `approve` mode an approval covers the host name, the ordered middleware
-list and the backend (scheme, host and port). When the source changes any of
-them (a new label value, a different TrueNAS portal port, a dropped auth
-middleware), the stored approval no longer applies and the service is Pending
-again until it is re-approved. An
-override an administrator sets in the UI is approved together with the change
-(lands with the final-fix wave).
+## Approval
+
+In `approve` mode (the default for TrueNAS) a new service is Pending until an
+administrator approves it ("Review and approve" on the Services page). The
+approval is bound to what was approved: the host name (name, rename, zone),
+the backend (scheme, host and port), skip-verify, websockets and the
+middleware list in order.
+
+- **UI overrides keep the approval.** Changing the port, skip-verify or the
+  name of an approved service in the UI carries its approval over to the new
+  content; the activity log records it (kind `approval`). Nothing that was not
+  approved before becomes approved.
+- **Changes from the source quarantine the service.** When the source changes
+  approved content (a new published host port, a different TrueNAS portal
+  port, a label that drops an auth middleware), the service is *quarantined*:
+  - its route stops being served at once, while its host name, DNS record and
+    certificate are kept, and a same-source newcomer cannot take the name;
+  - the Services page shows `backend changed; re-approve to resume: ...` and
+    one `service.quarantined` notification is sent;
+  - approving it again resumes serving immediately, with the new content.
+  A higher-ranked source can still take the host name, as always. A changed
+  host name reserves nothing new: the old name stays reserved, the new one is
+  not claimed until it is approved.
+- **Revoking an approval, or switching a source from `auto` to `approve`**,
+  leaves the service Pending but does not quarantine it (there is no approved
+  content to compare against): its existing route keeps serving until its
+  content changes or it is removed.
+- **Upgrades**: approvals stored by versions before the quarantine change are
+  migrated automatically, once, when the service's content is unchanged
+  (logged as `migrated approval v1->v2`). An older approval for content that
+  has changed since is treated as a change, so the service is quarantined.
+
+In `auto` mode nothing is ever quarantined.
 
 ## Middlewares
 

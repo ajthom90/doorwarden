@@ -7,7 +7,11 @@ next restart.
 
 The decoder is strict: an unknown key anywhere is an error, and YAML merge
 keys (`<<`) are refused. Every problem found by validation is reported at once
-at start-up, and Doorwarden does not start until the file is valid.
+at start-up, and Doorwarden does not start until the file is valid. Errors
+name the key path and line (for example `static[0].port (line 4): invalid
+value: a string where an integer is expected`) and never repeat the value:
+values from the environment, and quoted values derived from them, appear as
+`[redacted]` or `(value elided)`.
 
 All names in the examples are placeholders (`example.test`, `192.0.2.x`).
 
@@ -88,25 +92,32 @@ real values in an `.env` file or the app's environment settings, never in a
 committed file.
 
 Alternatively, store a credential in Doorwarden's database, sealed with the
-master key, and reference it as `secret:<name>` (lands with the final-fix
-wave). Names are 1-128 characters of `[A-Za-z0-9._-]`. `secret:` references
+master key, and reference it as `secret:<name>`. Names are 1-128 characters of `[A-Za-z0-9._-]`. `secret:` references
 work in DNS provider settings, ACME challenge provider settings and
 `sources.truenas.api_key`.
 
 ```
-docker exec -it <container> /doorwarden admin secret set <name>      # prompts without echo
-docker exec -i  <container> /doorwarden admin secret set <name> < file  # or the value on stdin
-docker exec     <container> /doorwarden admin secret list               # names only, never values
-docker exec     <container> /doorwarden admin secret delete <name>
+printf %s "$TOKEN" | docker exec -i <container> /doorwarden admin secret set <name>
+docker exec -it <container> /doorwarden admin secret set <name>   # on a terminal: prompts twice, no echo
+docker exec <container> /doorwarden admin secret list             # names only, never values
+docker exec <container> /doorwarden admin secret delete <name>
 ```
 
-The value is read from standard input or a prompt, never from the command
-line or the environment. `set` refuses to overwrite an existing secret
-without `-force`. The commands use the database from `-db` (default
-`$DOORWARDEN_DB`, then `/data/doorwarden.db`) and the master key from
-`DOORWARDEN_MASTER_KEY`, both already set in the Doorwarden container.
-Restart Doorwarden after storing a secret that the config references (the
-providers are built at start-up).
+- The value comes from standard input (one trailing newline is dropped) or
+  the prompt, never from the command line or the environment. Empty values
+  and values over 64 KiB are refused. `set` replaces an existing secret only
+  with `-force`.
+- All three take `-db` (default `$DOORWARDEN_DB`, then `/data/doorwarden.db`)
+  and, like `admin unlock`, refuse to run as a user other than the database
+  file's owner unless `-allow-owner-mismatch` is given (`docker exec` runs as
+  the container's user, which is the owner).
+- The master key comes from `DOORWARDEN_MASTER_KEY`, which `docker exec`
+  inherits from the container's `environment:`. Do **not** add
+  `-e DOORWARDEN_MASTER_KEY`: without a value it copies your shell's variable,
+  possibly empty, over the container's key. `set` refuses a master key that
+  cannot decrypt the secrets already stored.
+- Restart Doorwarden afterwards; the config references the secret as
+  `secret:<name>`.
 
 TLS private keys of issued certificates are files on disk (mode `0600`), not
 encrypted with the master key, because Traefik must read them.
@@ -174,9 +185,11 @@ A list. Every service is published as `<name>.<zone>` in exactly one zone.
 | `certificate.dns_provider` | provider name | required for `dns-01` | entry under `providers` whose `type` is an ACME DNS provider (a lego provider code, see [providers.md](providers.md#acme-dns-01-challenge-providers)). `unifi`, `pihole` and `adguard` cannot solve challenges |
 
 A service names its zone with the `doorwarden.zone` label or the static
-`zone` key. A service without one uses `settings.default_zone`, or the only
-zone when exactly one is configured; otherwise it is invalid and reported, not
-published.
+`zone` key (TrueNAS apps cannot name one). A service without one uses
+`settings.default_zone`, or the only zone when exactly one is configured;
+otherwise it is an error (`no zone: set doorwarden.zone or
+settings.default_zone`), reported and not published. Set `default_zone`
+whenever you configure several zones and use Docker or TrueNAS discovery.
 
 ## providers
 
@@ -274,7 +287,7 @@ routes to it ([deploy.md](deploy.md#first-run)).
 | `grace_period` | duration | `24h` | how long a service that disappeared from its source, or was unpublished, keeps its route and DNS records before they are removed (a stopped container or app is not removed) |
 | `poll_interval` | duration | `30s` | how often sources are listed and the plan is reconciled |
 | `renew_before` | duration | `720h` (30 days) | renew a certificate this long before it expires |
-| `default_zone` | zone name | the only zone | zone for services that name none. **Required** when more than one zone is configured and a `docker` or `truenas` source is enabled (lands with the final-fix wave) |
+| `default_zone` | zone name | the only zone | zone for services that name none. Optional; with two or more zones and no `default_zone`, Docker containers without `doorwarden.zone` and every TrueNAS app are per-service errors (`no zone: ...`), and Doorwarden logs a warning at start-up |
 
 Durations use Go syntax (`90s`, `15m`, `24h`).
 
@@ -316,7 +329,7 @@ with, so a typo never removes authentication that was in place.
 | `tls_min_version` | `VersionTLS12` \| `VersionTLS13` | `VersionTLS12` | rendered as `tls.options.default.minVersion` |
 | `sni_strict` | bool | false | reject TLS handshakes without SNI or with an unknown name |
 | `serve_expired` | bool | false | keep serving an expired certificate when nothing valid covers its names |
-| `file_mode` | `0600` \| `0640` | `0600` | permissions of the generated dynamic files, which can contain middleware secrets (lands with the final-fix wave) |
+| `file_mode` | `0600` \| `0640` | `0600` | permissions of the generated dynamic files, which can contain middleware secrets. With `0600` Traefik must run as the same UID as Doorwarden; `0640` lets it read them through a shared group. Files with another mode are rewritten with the right one on the next write |
 
 Do not define `tls.options.default` or `tls.stores.default` in another file of
 the dynamic directory; see [deploy.md](deploy.md#certificates-in-traefik).
@@ -333,8 +346,12 @@ the dynamic directory; see [deploy.md](deploy.md#certificates-in-traefik).
 
 ## notifications
 
-Alerts (certificate failures and expiry, DNS conflicts and alerts, source
-outages, reconcile errors) can be sent to webhooks, ntfy and e-mail.
+Alerts can be sent to webhooks, ntfy and e-mail. Event kinds:
+`cert.failure`, `cert.renewal_failed`, `cert.expiring`,
+`cert.adoption_blocked`, `dns.conflict`, `dns.alert`, `source.unavailable`,
+`reconcile.error`, `service.invalid` (a published service whose labels became
+invalid; it keeps its last route) and `service.quarantined` (an approved
+service whose content changed; see [labels.md](labels.md#approval)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

@@ -3,9 +3,7 @@
 Doorwarden uses DNS providers for two separate jobs:
 
 1. **Record providers** (`zones[].records.provider`) create the A/AAAA records
-   that point published host names at Traefik. Seven types are built in
-   (plus `fake`, an in-memory provider for tests and demos that keeps nothing
-   across restarts; do not use it for real zones).
+   that point published host names at Traefik. Seven types are built in.
 2. **ACME challenge providers** (`zones[].certificate.dns_provider`) publish the
    temporary `_acme-challenge` TXT records for DNS-01 certificate validation.
    These come from lego's catalog of about 190 providers and are configured
@@ -184,7 +182,8 @@ ever updates or deletes records it owns.
   the record (Doorwarden takes ownership and
   manages it from then on; only A and AAAA records can be adopted, remove a
   CNAME at the provider yourself) or *skip* the conflict (stop reporting it;
-  Doorwarden still does not write).
+  Doorwarden still does not write). Adopting is refused with `409` while dry
+  run is on; skipping is allowed.
 - **Grace-period deletion.** When a service disappears, is unpublished or is
   renamed, its record is scheduled for removal after `settings.grace_period`
   (default 24h). If it comes back within the grace period, the removal is
@@ -271,7 +270,9 @@ the files you touch are:
    `dns.Register(Type, factory, schema, staticCaps)` from `init()`. Declare
    every setting in the schema (unknown keys are rejected) and read secrets
    with `dns.ResolveField`.
-2. `internal/dns/providers/all.go`: add the blank import.
+2. `internal/dns/providers/all.go`: add the blank import (the in-memory test
+   provider in `internal/dns/providers/fake` is deliberately not imported
+   there, so the server rejects `type: fake`; tests import it directly).
 3. `internal/dns/providers/all_test.go`: add the type to the `want` list of
    `TestAllTypesRegistered` and a configuration to `leakConfigs` (the test formats every provider
    with every verb to prove no credential leaks).

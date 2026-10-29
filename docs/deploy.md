@@ -66,10 +66,12 @@ is used. Settings under `traefik:`:
 - `serve_expired` (default false): keep serving an expired certificate when
   nothing valid covers its names (clients then see an expiry error for the
   right host instead of the default certificate).
-- `file_mode` (default `0600`; `0640` also allowed; lands with the final-fix
-  wave): permissions of the generated dynamic files. They can contain
-  middleware secrets (basic-auth hashes, forward-auth settings), so keep them
-  readable only by the Traefik user.
+- `file_mode` (default `0600`; `0640` also allowed): permissions of the
+  generated dynamic files. They can contain middleware secrets (basic-auth
+  hashes, forward-auth settings). With `0600` Traefik must run as Doorwarden's
+  UID (65532 in the compose file); `0640` only if Traefik reads them through a
+  shared group. Files with a wrong mode are rewritten on the next write.
+  `traefik.dynamic_dir` must already exist; Doorwarden does not create it.
 
 Do not define `tls.options.default` or `tls.stores.default` in another file of
 Traefik's dynamic directory: Traefik keeps only one of them.
@@ -99,14 +101,18 @@ sources:
 
 `${TRUENAS_API_KEY}` reads the key from the container's environment. To keep
 it in Doorwarden's database instead (encrypted with `DOORWARDEN_MASTER_KEY`),
-store it once and reference it as `secret:<name>` (lands with the final-fix
-wave):
+store it once and reference it as `secret:<name>`:
 
 ```
-docker exec -it <project>-doorwarden-1 /doorwarden admin secret set truenas-api-key
-# prompts for the value without echo; or pipe it on stdin:
-#   docker exec -i <project>-doorwarden-1 /doorwarden admin secret set truenas-api-key < key.txt
+printf %s "$TOKEN" | docker exec -i <project>-doorwarden-1 /doorwarden admin secret set truenas-api-key
+# or, on a terminal, prompt twice without echo:
+#   docker exec -it <project>-doorwarden-1 /doorwarden admin secret set truenas-api-key
 ```
+
+The value never goes on the command line. `docker exec` inherits
+`DOORWARDEN_MASTER_KEY` from the container's `environment:`; do not add
+`-e DOORWARDEN_MASTER_KEY`, which would replace it with your shell's value
+(possibly empty). Restart Doorwarden afterwards.
 
 ```yaml
 sources:
@@ -218,9 +224,16 @@ request.
 - Start with `settings.dry_run: true`: Doorwarden reports what it would do
   and changes nothing. Dry run still lists sources and providers, plans every
   cycle and logs the plan; actions that would change something from the UI
-  (Renew now, Switch to production, Adopt a DNS record) are refused with
-  `409 Conflict` while it is on (lands with the final-fix wave). Turn dry run
-  off for them.
+  (Renew now, Switch to production, Adopt a DNS conflict) are refused with
+  `409 Conflict` while it is on. Turn dry run off for them.
+- **Stop timeout.** Shutdown can take up to about 40 seconds (HTTP, then
+  certificate orders in progress); the compose file sets
+  `stop_grace_period: 45s`. Keep it when you adapt the file. Stopping deletes
+  nothing ([operations.md](operations.md#stopping)).
+- **Several zones.** With more than one zone and Docker or TrueNAS discovery,
+  set `settings.default_zone`. Without it Doorwarden still starts (and logs a
+  warning), but every TrueNAS app and every container without
+  `doorwarden.zone` is an error (`no zone`).
 - **Reaching the UI.** Doorwarden publishes no host port, and nothing routes
   to its port 8080 until you add a route. Add a static entry for the UI to the
   config (static entries need no approval, so it is published in the first
@@ -357,11 +370,10 @@ ACME manager are not rebuilt mid-cycle or mid-order.
 
 Publish/unpublish, rename, port and skip-verify set in the UI are stored in
 the database and applied every cycle before the approval gate. In approve
-mode an approval covers the service's host name, its ordered middleware list
-and its backend (scheme, host, port): a change to any of them from the source
-(labels, the TrueNAS app) needs a new approval, while a change an
-administrator makes in the UI is approved with it (lands with the final-fix
-wave).
+mode a UI override carries the service's approval over to the changed
+content, while a change from the source (labels, the TrueNAS app) to an
+approved service quarantines it until it is approved again
+([labels.md](labels.md#approval)).
 Unpublishing removes the service like a disappearance: its route and DNS
 records are scheduled for removal after `settings.grace_period` (24h by
 default); publishing again within the grace cancels the removal.
