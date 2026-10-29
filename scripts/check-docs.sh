@@ -17,7 +17,7 @@ if [[ $# -gt 0 ]]; then
 	files=("$@")
 else
 	files=()
-	while IFS= read -r f; do files+=("$f"); done < <(git ls-files '*.md' 2>/dev/null || find . -name '*.md' -not -path './.git/*' | sed 's|^\./||')
+	while IFS= read -r f; do files+=("$f"); done < <(git ls-files --cached --others --exclude-standard '*.md' 2>/dev/null || find . -name '*.md' -not -path './.git/*' | sed 's|^\./||')
 fi
 [[ ${#files[@]} -gt 0 ]] || { echo "check-docs: no Markdown files found" >&2; exit 1; }
 
