@@ -134,9 +134,11 @@ entryPoints:
 
 Every other request on `:80` is still redirected. If you keep an older copy
 of `traefik.yml`, add `priority: 1` and restart Traefik (static
-configuration is not reloaded). This design was checked against Traefik's
-documentation (`redirections.entryPoint.priority`, router priorities), not
-against a running Traefik in Doorwarden's test suite. If Traefik runs
+configuration is not reloaded). This was checked by hand with Traefik v3.5:
+with `priority: 1` the challenge path of a listed host reaches Doorwarden
+and every other request is redirected; without it the challenge request is
+redirected too. (Doorwarden's automated tests check the rendered file, not a
+running Traefik.) If Traefik runs
 outside this compose project, set `acme.http01_backend` to the URL Traefik
 uses to reach Doorwarden's challenge port, and publish that port only to
 Traefik.
