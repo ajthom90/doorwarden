@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ajthom90/doorwarden/internal/approval"
+	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/notify"
 	"github.com/ajthom90/doorwarden/internal/reconcile"
@@ -269,5 +270,15 @@ func TestHeldInvalidNotified(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("activity: %+v", act)
+	}
+}
+
+// Each zone's target_ip is handed to discovery sources, normalized, so a
+// container labelled with a zone uses that zone's host.
+func TestZoneTargetsForSources(t *testing.T) {
+	cfg := &config.Config{Zones: []config.Zone{{Name: "Example.Test.", TargetIP: "192.0.2.10"}, {Name: "lan.test", TargetIP: "10.0.0.5"}}}
+	got := zoneTargets(cfg)
+	if len(got) != 2 || got["example.test"] != "192.0.2.10" || got["lan.test"] != "10.0.0.5" {
+		t.Fatalf("zoneTargets = %v", got)
 	}
 }

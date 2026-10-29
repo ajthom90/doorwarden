@@ -420,6 +420,18 @@ func sourceTargetIP(cfg *config.Config) string {
 	return ""
 }
 
+// zoneTargets maps each zone (normalized) to its target_ip, for sources
+// whose services can name their zone (docker's doorwarden.zone label).
+func zoneTargets(cfg *config.Config) map[string]string {
+	m := map[string]string{}
+	for _, z := range cfg.Zones {
+		if n := normZone(z.Name); n != "" && z.TargetIP != "" {
+			m[n] = z.TargetIP
+		}
+	}
+	return m
+}
+
 // BuildSources builds the static source (always) and the configured docker
 // and truenas sources. A source that fails to construct is returned with
 // its error and is Unavailable every cycle (its services stay as they are).
@@ -427,7 +439,7 @@ func BuildSources(cfg *config.Config, sec *SecretStore) []SourceSpec {
 	out := []SourceSpec{{Source: static.New(static.Config{Services: cfg.Static}), Mode: approval.ModeAuto}}
 	tip := sourceTargetIP(cfg)
 	if d := cfg.Sources.Docker; d != nil {
-		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip})
+		s, err := docker.New(docker.Config{Endpoint: d.Host, TargetIP: tip, ZoneTargets: zoneTargets(cfg)})
 		sp := SourceSpec{Name: "docker", Mode: approvalMode(d.Approval, approval.ModeAuto), Err: err}
 		if err == nil {
 			sp.Source = s
