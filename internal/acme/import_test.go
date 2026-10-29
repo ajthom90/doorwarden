@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ajthom90/doorwarden/internal/store"
 )
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
@@ -213,5 +215,74 @@ func TestNoKeyMaterialInLogsOrErrors(t *testing.T) {
 	}
 	if contains(all, "PRIVATE KEY") {
 		t.Fatal("PEM key header leaked")
+	}
+}
+
+func TestImportPEMSkipsAdoptedOrNewer(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	chain, key := h.ca.ca.leaf(t, []string{"*.example.test", "example.test"}, t0.Add(60*24*time.Hour))
+	ir, err := h.m.ImportPEM(ctx, "example.test", chain, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ir.Bundle.ID
+	for _, tc := range []struct {
+		name   string
+		mod    func(*store.Cert)
+		reason string
+	}{
+		{"adopted", func(r *store.Cert) {
+			r.Managed, r.Status = true, StatusValid
+			r.NotAfter = r.NotAfter.Add(30 * 24 * time.Hour)
+		}, "already adopted"},
+		{"status", func(r *store.Cert) { r.Status = StatusValid }, "already adopted"},
+		{"newer", func(r *store.Cert) { r.NotAfter = r.NotAfter.Add(time.Hour) }, "newer version"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := h.row(t, id)
+			r.Managed, r.Status, r.NotAfter = false, StatusImported, t0.Add(60*24*time.Hour)
+			tc.mod(&r)
+			if err := h.st.UpsertCert(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+			for _, dry := range []bool{true, false} {
+				var opts []ImportOption
+				if dry {
+					opts = append(opts, ImportDryRun())
+				}
+				got, err := h.m.ImportPEM(ctx, "example.test", chain, key, opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !got.Skipped || !strings.Contains(got.SkipReason, tc.reason) || got.DryRun != dry || got.Bundle.Key.Reveal() != "" {
+					t.Fatalf("dry=%v: %+v", dry, got)
+				}
+				after := h.row(t, id)
+				if after != r {
+					t.Fatalf("row changed: %+v -> %+v", r, after)
+				}
+				if _, err := os.Stat(filepath.Join(h.dir, id, "v2")); !os.IsNotExist(err) {
+					t.Fatalf("new version written: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestImportPEMDryRunWritesNothing(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	chain, key := h.ca.ca.leaf(t, []string{"app.example.test"}, t0.Add(60*24*time.Hour))
+	ir, err := h.m.ImportPEM(ctx, "example.test", chain, key, ImportDryRun())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ir.DryRun || ir.Skipped || ir.Bundle.Key.Reveal() != "" || ir.Bundle.Dir != "" {
+		t.Fatalf("%+v", ir)
+	}
+	if rows, _ := h.st.ListCerts(ctx); len(rows) != 0 {
+		t.Fatalf("rows %+v", rows)
+	}
+	if _, err := os.Stat(h.dir); !os.IsNotExist(err) {
+		t.Fatalf("certs dir created: %v", err)
 	}
 }
