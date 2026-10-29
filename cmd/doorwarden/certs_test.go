@@ -241,6 +241,9 @@ func TestCertsImportNPMRefusals(t *testing.T) {
 	if c, _, _ := certsRun(t, "-npm-dir", e.npm, "-config", e.cfg, "-db", filepath.Join(t.TempDir(), "nope.db")); c == 0 {
 		t.Fatal("missing database accepted")
 	}
+	if c, _, _ := certsRun(t, "-npm-dir", e.npm, "-config", e.cfg, "-db", filepath.Join(t.TempDir(), "nope.db"), "-dry-run"); c == 0 {
+		t.Fatal("dry run accepted a missing database")
+	}
 	t.Setenv("DOORWARDEN_MASTER_KEY", "")
 	if c, _, errs := certsRun(t, "-npm-dir", e.npm, "-config", e.cfg, "-db", e.db); c == 0 || !strings.Contains(errs, "DOORWARDEN_MASTER_KEY") {
 		t.Fatalf("no master key: %d %s", c, errs)
@@ -255,6 +258,18 @@ func TestCertsImportNPMRefusals(t *testing.T) {
 	dbOwner = old
 	if rows, _ := openDB(t, e.db).ListCerts(context.Background()); len(rows) != 0 {
 		t.Fatalf("refused runs wrote rows: %+v", rows)
+	}
+	// An unset ${VAR} in acme.certs_dir must not fall back to the default
+	// directory: refused unless -certs-dir is given.
+	varCfg := writeFile(t, "dw.yaml", strings.Replace(certsCfg, `"@CERTS@"`, `"${CERTS}"`, 1))
+	if c, _, errs := certsRun(t, "-npm-dir", e.npm, "-config", varCfg, "-db", e.db); c == 0 || !strings.Contains(errs, "-certs-dir") {
+		t.Fatalf("unset certs_dir variable: %d %s", c, errs)
+	}
+	if rows, _ := openDB(t, e.db).ListCerts(context.Background()); len(rows) != 0 {
+		t.Fatalf("refused run wrote rows: %+v", rows)
+	}
+	if c, out, errs := certsRun(t, "-npm-dir", filepath.Join(e.npm, "live", "npm-1"), "-config", varCfg, "-db", e.db, "-certs-dir", e.certs); c != 0 {
+		t.Fatalf("with -certs-dir: %d\n%s\n%s", c, out, errs)
 	}
 	var out bytes.Buffer
 	cliIO(t, "")

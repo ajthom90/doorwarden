@@ -90,6 +90,11 @@ func runCertsImportNPM(args []string, out io.Writer) int {
 	noteUnset(unset)
 	dir := *certsDir
 	if dir == "" {
+		// An unset ${VAR} in acme.certs_dir would silently fall back to
+		// the default directory, which the server may not use.
+		if cfg.ACME.CertsDir == "" && len(unset) > 0 {
+			return fail(fmt.Errorf("acme.certs_dir is empty and config variable(s) %s are unset; pass -certs-dir or -env-file", strings.Join(unset, ", ")))
+		}
 		dir = cfg.CertsRoot()
 	}
 	src, err := npmLiveDir(*npmDir)
@@ -100,6 +105,13 @@ func runCertsImportNPM(args []string, out io.Writer) int {
 	var st *store.Store
 	var box *secrets.Box
 	if *dry {
+		// The real run's database checks, without opening it.
+		if _, err := os.Stat(*dbPath); err != nil {
+			return fail(fmt.Errorf("database %s: %w", *dbPath, err))
+		}
+		if err := checkOwner("database", *dbPath, *allowOwner); err != nil {
+			return fail(err)
+		}
 		// Run the real import into a throwaway store and directory: every
 		// check is the same, nothing real is touched.
 		tmp, err := os.MkdirTemp("", "doorwarden-import-dry-")
