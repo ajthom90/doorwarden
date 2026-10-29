@@ -61,8 +61,8 @@ func TestWriteCreatesAndSkipsIdentical(t *testing.T) {
 		t.Fatalf("content %q", got)
 	}
 	fi, _ := os.Stat(filepath.Join(dir, RoutesFile))
-	if fi.Mode().Perm() != 0o644 {
-		t.Fatalf("mode %v", fi.Mode())
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v (middleware secrets: want 0600)", fi.Mode())
 	}
 	ageAll(t, dir)
 	if err := Write(dir, f); err != nil {
@@ -208,4 +208,107 @@ func TestWriteTargetIsDirectory(t *testing.T) {
 		t.Fatal("directory replaced")
 	}
 	assertNoTemps(t, dir)
+}
+
+// Final-review M4: rendered files may hold middleware secrets (basic-auth
+// hashes, forward-auth headers): 0600 by default, 0640 when configured; a
+// pre-existing file with other permissions is corrected even when its
+// content is unchanged (mtime kept); other modes are refused.
+func TestWriteModeAndPermissionCorrection(t *testing.T) {
+	dir := t.TempDir()
+	f := files("http: {}\n", "tls: {}\n")
+	p := filepath.Join(dir, RoutesFile)
+	if err := os.WriteFile(p, f[RoutesFile], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageAll(t, dir)
+	if err := Write(dir, f); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(p)
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("pre-existing mode not corrected: %v", fi.Mode())
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("not a regular file: %v", fi.Mode())
+	}
+	if err := WriteMode(dir, f, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{RoutesFile, TLSFile} {
+		if fi, _ := os.Stat(filepath.Join(dir, n)); fi.Mode().Perm() != 0o640 {
+			t.Fatalf("%s mode %v, want 0640", n, fi.Mode())
+		}
+	}
+	if err := WriteMode(dir, f, 0o644); err == nil {
+		t.Fatal("0644 accepted")
+	}
+}
+
+// A symlink at the target pointing outside dir, with identical content and a
+// different mode: the outside file's permissions and content are untouched
+// (no chmod by path), the link is replaced by a regular 0600 file.
+func TestWriteNeverChmodsThroughSymlink(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	f := files("http: {}\n", "tls: {}\n")
+	ext := filepath.Join(outside, "victim.yml")
+	if err := os.WriteFile(ext, f[RoutesFile], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ext, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, RoutesFile)
+	if err := os.Symlink(ext, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(dir, f); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(ext); fi.Mode().Perm() != 0o644 {
+		t.Fatalf("outside file chmodded to %v", fi.Mode())
+	}
+	fi, err := os.Lstat(p)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("target = %v, %v", fi, err)
+	}
+}
+
+// The target swapped for a symlink to an outside file between the Lstat and
+// the read (a race) is never followed: the outside file keeps its mode and
+// the target ends up a regular 0600 file.
+func TestWriteTargetSwappedAfterLstat(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	f := files("http: {}\n", "tls: {}\n")
+	ext := filepath.Join(outside, "victim.yml")
+	if err := os.WriteFile(ext, f[RoutesFile], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(ext, 0o644)
+	p := filepath.Join(dir, RoutesFile)
+	if err := os.WriteFile(p, f[RoutesFile], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(p, 0o644)
+	afterLstat = func(target string) {
+		if target == p {
+			os.Remove(p)
+			os.Symlink(ext, p)
+		}
+	}
+	t.Cleanup(func() { afterLstat = func(string) {} })
+	_ = Write(dir, f) // an error is fine; following the link is not
+	if fi, _ := os.Stat(ext); fi.Mode().Perm() != 0o644 {
+		t.Fatalf("outside file chmodded to %v", fi.Mode())
+	}
+	afterLstat = func(string) {}
+	if err := Write(dir, f); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(p); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("target = %v, %v", fi, err)
+	}
 }

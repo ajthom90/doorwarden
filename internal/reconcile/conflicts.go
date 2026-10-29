@@ -27,6 +27,12 @@ type claimant struct {
 	// against lower source ranks; within its own rank it yields to present
 	// claimants. Absent services past their grace period do not claim.
 	absent bool
+	// incumbent: the claimant's persisted route (Observed.Known) already
+	// serves this hostname. Within one source rank an incumbent keeps its
+	// hostname against every challenger, whatever its state, until its
+	// route is removed (removal grace over, or an operator change): a
+	// lexicographically smaller key of the same source cannot take it over.
+	incumbent bool
 }
 
 // loss describes why a claimant lost its hostname.
@@ -40,12 +46,18 @@ func (c claimant) rank() int { return model.SourceRank(c.key, c.source) }
 
 // outranks is source-first: a lower-trust source never takes a hostname from
 // a higher-trust one, whatever their states, even while the higher-trust one
-// is absent within its grace period. Within one source rank an absent
-// claimant (no longer in desired, route not yet removed) yields to a present
-// one; then the serving tier wins, then the smaller key.
+// is absent within its grace period. Within one source rank the incumbent
+// (the key whose persisted route serves the hostname) keeps it against
+// challengers; first-time claims and ties between incumbents (shared rows of
+// a crash window) fall through: an absent claimant (no longer in desired,
+// route not yet removed) yields to a present one; then the serving tier
+// wins, then the smaller key.
 func outranks(a, b claimant) bool {
 	if ra, rb := a.rank(), b.rank(); ra != rb {
 		return ra < rb
+	}
+	if a.incumbent != b.incumbent {
+		return a.incumbent
 	}
 	if a.absent != b.absent {
 		return b.absent // within one rank, a service that is gone yields to a present one
@@ -76,6 +88,8 @@ func resolveHostnames(cs []claimant) (winners map[string]claimant, losers map[st
 			}
 			why := ""
 			switch {
+			case w.incumbent && !l.incumbent && w.rank() == l.rank():
+				why = "; it is the incumbent (its route already serves the name), so it keeps it until its route is removed (grace period over) or an operator renames/skips one of them"
 			case w.phantom:
 				why = "; its source is unavailable, so it keeps the name"
 			case w.absent:
@@ -84,7 +98,7 @@ func resolveHostnames(cs []claimant) (winners map[string]claimant, losers map[st
 				why = "; the winner is not published/routable, fix or approve it (or remove it)"
 			}
 			losers[l.key] = loss{winner: w, reason: fmt.Sprintf(
-				"hostname %s is claimed by %s (precedence: static > truenas > docker, then serving, then key)%s", h, w.key, why)}
+				"hostname %s is claimed by %s (precedence: static > truenas > docker, then the incumbent, then serving, then key)%s", h, w.key, why)}
 		}
 	}
 	return winners, losers

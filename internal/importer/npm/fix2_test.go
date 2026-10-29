@@ -15,7 +15,7 @@ func seams(t *testing.T, cp func(src, dst string, optional bool) error) *[]time.
 	t.Helper()
 	oc, os_ := copyFileFn, sleepFn
 	var sleeps []time.Duration
-	copyFileFn = cp
+	copyFileFn = func(_ context.Context, src, dst string, optional bool, _ *int64) error { return cp(src, dst, optional) }
 	sleepFn = func(d time.Duration) { sleeps = append(sleeps, d) }
 	t.Cleanup(func() { copyFileFn, sleepFn = oc, os_ })
 	return &sleeps
@@ -39,7 +39,7 @@ func TestSnapshotRetriesWhenSourceChangesDuringCopy(t *testing.T) {
 	tmp := emptyTmp(t)
 	calls := 0 // main-file copies = attempts
 	sleeps := seams(t, func(src, dst string, optional bool) error {
-		err := copyFile(src, dst, optional)
+		err := copyFile(context.Background(), src, dst, optional, new(int64(1<<30)))
 		if src == path {
 			calls++
 			if calls < 3 { // source "checkpoints" mid-copy on attempts 1 and 2
@@ -79,7 +79,7 @@ func TestSnapshotGivesUpAfterThreeAttempts(t *testing.T) {
 	tmp := emptyTmp(t)
 	n := 0
 	seams(t, func(src, dst string, optional bool) error {
-		err := copyFile(src, dst, optional)
+		err := copyFile(context.Background(), src, dst, optional, new(int64(1<<30)))
 		if src == path {
 			n++
 			os.Chtimes(path, time.Now(), time.Now().Add(time.Duration(n)*time.Minute))
@@ -98,7 +98,7 @@ func TestSnapshotCorruptCopyRetried(t *testing.T) {
 	tmp := emptyTmp(t)
 	n := 0
 	seams(t, func(src, dst string, optional bool) error {
-		err := copyFile(src, dst, optional)
+		err := copyFile(context.Background(), src, dst, optional, new(int64(1<<30)))
 		if src == path {
 			n++
 			if n == 1 { // garble the copy only
@@ -127,7 +127,7 @@ func TestSnapshotCancelledMidCopyRemovesTempDir(t *testing.T) {
 	tmp := emptyTmp(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	seams(t, func(src, dst string, optional bool) error {
-		err := copyFile(src, dst, optional)
+		err := copyFile(context.Background(), src, dst, optional, new(int64(1<<30)))
 		cancel() // interrupt after the first file is written
 		return err
 	})

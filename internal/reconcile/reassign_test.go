@@ -170,10 +170,25 @@ func TestReassignE2EKeepsRecordContinuously(t *testing.T) {
 			has()
 			id := w.rows()[0].ProviderRecordID
 			n := len(w.fk.Calls())
+			// final-review H1: the same-rank newcomer waits out the absent
+			// incumbent's grace period (Conflict); the record stays
 			acts := w.mustCycle(t0.Add(time.Minute), newSvc)
+			if len(ofKind(forKey(acts, c.newKey), Conflict)) != 1 || len(reassigns(acts)) != 0 {
+				t.Fatalf("plan %v", sums(acts))
+			}
+			has()
+			acts = w.mustCycle(t0.Add(12*time.Hour), newSvc)
+			if len(ofKind(forKey(acts, c.newKey), Conflict)) != 1 || len(reassigns(acts)) != 0 {
+				t.Fatalf("plan %v", sums(acts))
+			}
+			has()
+			// grace over: the route is removed, the newcomer takes the
+			// hostname and the record over in the same cycle (never deleted)
+			acts = w.mustCycle(t0.Add(24*time.Hour+2*time.Minute), newSvc)
 			if got := reassigns(acts); len(got) != 1 {
 				t.Fatalf("plan %v", sums(acts))
 			}
+			assertNone(t, acts, DNSDelete)
 			has()
 			if got := w.writes(n); len(got) != 0 {
 				t.Fatalf("provider writes %v", got)
@@ -182,7 +197,7 @@ func TestReassignE2EKeepsRecordContinuously(t *testing.T) {
 			if len(rows) != 1 || rows[0].OwnerKey != c.newKey || rows[0].RemovedAfter != nil || rows[0].ProviderRecordID != id {
 				t.Fatalf("rows %+v", rows)
 			}
-			for _, off := range []time.Duration{2 * time.Minute, 25 * time.Hour, 49 * time.Hour} {
+			for _, off := range []time.Duration{25 * time.Hour, 26 * time.Hour, 49 * time.Hour} {
 				acts := w.mustCycle(t0.Add(off), newSvc)
 				assertOrphans(t, acts)
 				assertNone(t, acts, DNSReassign)

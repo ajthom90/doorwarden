@@ -199,8 +199,13 @@ func TestErrorStateHasNoBackend(t *testing.T) {
 	srv := fake(t, []ctr{
 		container("amb", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8080), port(443, 8443)}, nil),
 		container("bad", "running", lbl("doorwarden.enable", "true", "doorwarden.port", "x"), []map[string]any{port(80, 8080)}, nil),
+		container("nopub", "running", lbl("doorwarden.enable", "true", "doorwarden.port", "80"), []map[string]any{port(80, 0)}, nil),
 	})
-	for _, g := range list(t, newSrc(t, srv, Config{TargetIP: "192.0.2.10"})) {
+	got := list(t, newSrc(t, srv, Config{TargetIP: "192.0.2.10"}))
+	if len(got) != 3 {
+		t.Fatalf("got %+v", got)
+	}
+	for _, g := range got {
 		if g.State != model.StateError || g.Backend.Host != "" || g.Backend.Port != 0 {
 			t.Fatalf("got %+v", g)
 		}
@@ -361,5 +366,24 @@ func TestNameAndEndpointParsing(t *testing.T) {
 		if _, err := New(Config{Endpoint: bad}); err == nil {
 			t.Errorf("%q: want error", bad)
 		}
+	}
+}
+
+// A container labelled with a zone uses that zone's target_ip for its
+// published port; unlabelled (or an unknown zone) uses the default.
+func TestZoneLabelUsesThatZonesTargetIP(t *testing.T) {
+	srv := fake(t, []ctr{
+		container("lan", "running", lbl("doorwarden.enable", "true", "doorwarden.zone", "LAN.Example.Test."), []map[string]any{port(80, 8080)}, nil),
+		container("def", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8081)}, nil),
+		container("unk", "running", lbl("doorwarden.enable", "true", "doorwarden.zone", "nope.test"), []map[string]any{port(80, 8082)}, nil),
+	})
+	got := list(t, newSrc(t, srv, Config{TargetIP: "192.0.2.10",
+		ZoneTargets: map[string]string{"lan.example.test": "10.0.0.5", "example.test": "192.0.2.10"}}))
+	host := map[string]string{}
+	for _, g := range got {
+		host[g.Name] = g.Backend.Host
+	}
+	if host["lan"] != "10.0.0.5" || host["def"] != "192.0.2.10" || host["unk"] != "192.0.2.10" {
+		t.Fatalf("hosts %v", host)
 	}
 }

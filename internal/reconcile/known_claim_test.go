@@ -99,8 +99,9 @@ func TestE2EInvalidLabelKnownServiceKeepsClaim(t *testing.T) {
 }
 
 func TestE2ESameSourceStoppedKnownVsPublishedNewcomer(t *testing.T) {
-	// Deterministic whichever key is smaller: the Published newcomer wins
-	// (serving tier), the stopped service's row is removed, one row remains.
+	// Final-review H1: whichever key is smaller, the stopped incumbent keeps
+	// its hostname (its persisted route serves it); the Published newcomer is
+	// a Conflict, nothing is removed, one row remains.
 	for _, keys := range [][2]string{{"docker:a_old", "docker:b_new"}, {"docker:z_old", "docker:b_new"}} {
 		t.Run(keys[0], func(t *testing.T) {
 			e := newE2E(t)
@@ -109,11 +110,10 @@ func TestE2ESameSourceStoppedKnownVsPublishedNewcomer(t *testing.T) {
 			e.now = t0.Add(time.Hour)
 			stopped := svc(oldK, "other", "example.test", model.StateStopped, "", 0) // label renamed
 			acts := e.cycle([]model.Service{stopped, pub(newK, "app", "example.test", 9090)})
-			assertSums(t, forKey(acts, oldK),
-				"Conflict example.test app.example.test "+oldK,
-				"RouteRemove example.test app.example.test "+oldK)
+			assertSums(t, forKey(acts, newK), "Conflict example.test app.example.test "+newK)
+			assertNone(t, acts, RouteRemove)
 			rs := listRoutes(t, e.st)
-			if len(rs) != 1 || rs[0].Key != newK || rs[0].Hostname != "app.example.test" {
+			if len(rs) != 1 || rs[0].Key != oldK || rs[0].Hostname != "app.example.test" {
 				t.Fatalf("rows %+v", rs)
 			}
 		})
@@ -189,7 +189,11 @@ func TestPlanPublishedInvalidBackendFallbackIsVisible(t *testing.T) {
 
 // --- fix round 3: Published holders with invalid labels -----------------
 
-func TestE2EPublishedInvalidLabelHolderLosesToRoutableNewcomer(t *testing.T) {
+// Final-review H1: a Published holder with invalid labels is the incumbent
+// of its persisted hostname, so a same-rank routable newcomer does not take
+// it: the holder stays Invalid (its route as last written), the newcomer is
+// a Conflict, nothing is removed.
+func TestE2EPublishedInvalidLabelHolderKeepsHostnameAgainstSameRankNewcomer(t *testing.T) {
 	for name, mut := range map[string]func(*model.Service){
 		"name !!!":       func(s *model.Service) { s.Name = "!!!" },
 		"zone gone.test": func(s *model.Service) { s.Zone = "gone.test" },
@@ -197,30 +201,28 @@ func TestE2EPublishedInvalidLabelHolderLosesToRoutableNewcomer(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := newE2E(t)
 			e.cycle([]model.Service{pub("docker:app", "app", "example.test", 8080)})
+			before := e.mustRoute("docker:app")
 			e.now = t0.Add(time.Hour)
 			holder := pub("docker:app", "app", "example.test", 8080)
 			mut(&holder)
 			newcomer := pub("docker:new", "app", "example.test", 9090)
-			acts := e.cycle([]model.Service{holder, newcomer})
-			got := sums(forKey(acts, "docker:app"))
-			if len(got) != 3 || !strings.HasPrefix(got[0], "Invalid ") || !strings.HasPrefix(got[1], "Conflict ") ||
-				got[2] != "RouteRemove example.test app.example.test docker:app" {
-				t.Fatalf("holder actions %v", got)
+			for i := 0; i < 2; i++ {
+				acts := e.cycle([]model.Service{holder, newcomer})
+				got := sums(forKey(acts, "docker:app"))
+				if len(got) != 1 || !strings.HasPrefix(got[0], "Invalid ") {
+					t.Fatalf("holder actions %v", got)
+				}
+				// the newcomer collides on the holder's stored hostname
+				assertSums(t, forKey(acts, "docker:new"), "Conflict example.test app.example.test docker:new")
+				assertNone(t, acts, RouteRemove, RouteWrite)
+				if r := e.mustRoute("docker:app"); !reflect.DeepEqual(r, before) {
+					t.Fatalf("holder row changed %+v", r)
+				}
+				if e.winners["app.example.test"].key != "docker:app" {
+					t.Fatalf("plan winner %+v", e.winners["app.example.test"])
+				}
+				e.now = e.now.Add(time.Hour)
 			}
-			if rw := ofKind(acts, RouteWrite); len(rw) != 1 || rw[0].Key != "docker:new" {
-				t.Fatalf("RouteWrites %v", sums(rw))
-			}
-			rs := listRoutes(t, e.st)
-			if len(rs) != 1 || rs[0].Key != "docker:new" {
-				t.Fatalf("rows %+v", rs)
-			}
-			if e.winners["app.example.test"].key != "docker:new" {
-				t.Fatalf("plan winner %+v", e.winners["app.example.test"])
-			}
-			// next cycle: forgotten holder gets Invalid only, still one row
-			e.now = t0.Add(2 * time.Hour)
-			acts = e.cycle([]model.Service{holder, newcomer})
-			assertNone(t, acts, RouteRemove)
 		})
 	}
 }
@@ -347,7 +349,10 @@ func TestE2EAbsentHigherRankKeepsRouteAgainstLowerRankNewcomer(t *testing.T) {
 	}
 }
 
-func TestE2EAbsentYieldsToSameOrHigherRankNewcomer(t *testing.T) {
+// A higher-rank newcomer takes the hostname of an absent claimant at once;
+// a same-rank one (final-review H1) waits for the absent incumbent's grace
+// period to end.
+func TestE2EAbsentYieldsToHigherRankNewcomerOnly(t *testing.T) {
 	for name, keys := range map[string][2]string{
 		"same rank":   {"docker:old", "docker:new"},
 		"higher rank": {"truenas:app", "static:app"},
@@ -358,8 +363,23 @@ func TestE2EAbsentYieldsToSameOrHigherRankNewcomer(t *testing.T) {
 			e.cycle([]model.Service{pub(oldK, "app", "example.test", 8080)})
 			e.now = t0.Add(time.Hour)
 			acts := e.cycle([]model.Service{pub(newK, "app", "example.test", 9090)})
-			assertSums(t, forKey(acts, oldK), "RouteRemove example.test app.example.test "+oldK)
-			assertNone(t, acts, Conflict, ScheduleRemoval, DNSDelete)
+			if name == "higher rank" {
+				assertSums(t, forKey(acts, oldK), "RouteRemove example.test app.example.test "+oldK)
+				assertNone(t, acts, Conflict, ScheduleRemoval, DNSDelete)
+				if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != newK {
+					t.Fatalf("rows %+v", rs)
+				}
+				return
+			}
+			assertSums(t, acts, "Conflict example.test app.example.test "+newK,
+				"ScheduleRemoval example.test app.example.test "+oldK)
+			if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != oldK {
+				t.Fatalf("rows %+v", rs)
+			}
+			e.now = t0.Add(26 * time.Hour)
+			acts = e.cycle([]model.Service{pub(newK, "app", "example.test", 9090)})
+			assertSums(t, acts, "RouteWrite example.test app.example.test "+newK+" ->198.51.100.5:9090",
+				"RouteRemove example.test app.example.test "+oldK)
 			if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != newK {
 				t.Fatalf("rows %+v", rs)
 			}
@@ -373,7 +393,8 @@ func TestE2EAbsentInGraceKeepsRouteAgainstNonRoutableNewcomer(t *testing.T) {
 	e.now = t0.Add(time.Hour)
 	pending := svc("docker:new", "app", "example.test", model.StatePending, "198.51.100.5", 9090)
 	acts := e.cycle([]model.Service{pending})
-	assertSums(t, acts, "ScheduleRemoval example.test app.example.test docker:old")
+	assertSums(t, acts, "Conflict example.test app.example.test docker:new",
+		"ScheduleRemoval example.test app.example.test docker:old")
 	if rs := listRoutes(t, e.st); len(rs) != 1 || rs[0].Key != "docker:old" {
 		t.Fatalf("rows %+v", rs)
 	}

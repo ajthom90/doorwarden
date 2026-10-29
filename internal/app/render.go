@@ -60,7 +60,11 @@ func (a *App) render(ctx context.Context, now time.Time) error {
 		msg = "traefik: " + strings.Join(ps, "; ")
 	}
 	a.logChange(ctx, "traefik-problems", "warn", msg)
-	if err := traefik.Write(a.cfg.Traefik.DynamicDir, files); err != nil {
+	mode, err := a.cfg.Traefik.Mode()
+	if err != nil {
+		return err // config.Validate rejects it at load
+	}
+	if err := traefik.WriteMode(a.cfg.Traefik.DynamicDir, files, mode); err != nil {
 		return fmt.Errorf("traefik write: %w", err)
 	}
 	a.certExpiryMetrics(rows)

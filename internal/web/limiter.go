@@ -35,7 +35,7 @@ import (
 //   - Accepted residual risk: rotating fresh (clean) sources cannot exceed
 //     the total rate, i.e. at most totalBurst + 60*totalRate = 1830 guesses
 //     in any hour (about 43k a day) against the administrator's name, each
-//     an argon2id check of a password of at least 15 characters.
+//     an argon2id check of a password of at least 12 characters (minPasswordLen).
 //   - Buckets exist for the administrator's name and one shared
 //     unknownUser (every other name), so name sprays cannot grow tables.
 //   - Setup budget: per SOURCE only (setupBurst, setupRate), no shared

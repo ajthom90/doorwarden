@@ -64,6 +64,11 @@ type Traefik struct {
 	// ExternalMiddlewares allowlists qualified references (name@provider)
 	// to middlewares defined outside doorwarden (e.g. crowdsec@docker).
 	ExternalMiddlewares []string `yaml:"external_middlewares"`
+	// FileMode is the permission of the rendered dynamic files: "0600"
+	// (default; Traefik runs as the same UID) or "0640" (Traefik reads
+	// through a dedicated shared group). The files can hold middleware
+	// secrets.
+	FileMode string `yaml:"file_mode"`
 	// TraefikTLS: tls_min_version, sni_strict, serve_expired (tls.go).
 	TraefikTLS `yaml:",inline"`
 }
@@ -182,13 +187,15 @@ func parse(raw []byte, path string, env func(string) (string, bool)) (*Config, e
 	}
 	out, err := yaml.Marshal(&root)
 	if err != nil {
-		return nil, fmt.Errorf("re-encode config %s: %w", path, err)
+		return nil, fmt.Errorf("re-encode config %s: %w", path, ScrubEnvValues(err, raw, env))
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(out))
 	dec.KnownFields(true)
 	var c Config
 	if err := dec.Decode(&c); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		// The decoder quotes (a prefix of) the offending scalar, which may
+		// be a substituted env value.
+		return nil, fmt.Errorf("parse config %s: %w", path, ScrubEnvValues(err, raw, env))
 	}
 	c.applyDefaults()
 	return &c, nil

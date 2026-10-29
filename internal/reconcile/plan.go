@@ -86,6 +86,12 @@ const (
 // records of a provider/zone are missing (Action.Alert).
 const AlertDNSMassMissing = "dns-mass-missing"
 
+// AlertPublishedInvalid marks the Invalid of a Published service whose
+// labels no longer resolve while it holds a Known route (heldInvalid): it is
+// not re-planned, so an operator must fix its labels (Action.Alert; the
+// caller notifies, deduplicated per reason).
+const AlertPublishedInvalid = "published-invalid"
+
 // RepairBreakerKey is the Key of the breaker Skip of provider/zone (zone
 // normalized): stable, and never a service key.
 func RepairBreakerKey(provider, zone string) string {
@@ -122,26 +128,28 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 	var claims []claimant
 	for _, e := range entries {
 		present[e.svc.Key] = true
+		k, isKnown := obs.Known[e.svc.Key]
+		inc := isKnown && e.host != "" && normName(k.Hostname) == e.host
 		if e.heldInvalid {
 			// not routable, so never serving and never able to evict anyone
-			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true})
+			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host, published: true, incumbent: inc})
 		} else if e.err == nil {
 			pubd := e.svc.State == model.StatePublished
 			_, routable := p.routeBackend(e.svc)
 			routable = routable && pubd
 			claims = append(claims, claimant{key: e.svc.Key, source: e.svc.Source, host: e.host,
-				published: pubd, routable: routable, serving: routable})
+				published: pubd, routable: routable, serving: routable, incumbent: inc})
 		}
 	}
 	for _, k := range sortedKnown(obs.Known) {
 		if !present[k.Key] && p.unavailable(k) && k.Hostname != "" {
 			// it is Known, i.e. it still has a route: serving tier
-			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true})
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, phantom: true, serving: true, incumbent: true})
 		} else if !present[k.Key] && k.Hostname != "" && (k.RemovedAfter == nil || !now.After(*k.RemovedAfter)) {
 			// gone from an available source, route not yet removed and grace
 			// not over: it holds its hostname as a non-serving claimant (past
 			// grace it is removed this cycle, so it must not hold the name)
-			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, absent: true})
+			claims = append(claims, claimant{key: k.Key, source: k.Source, host: k.Hostname, absent: true, incumbent: true})
 		}
 	}
 	winners, losers := resolveHostnames(claims)
@@ -153,7 +161,12 @@ func planWithWinners(desired []model.Service, obs Observed, cfg *config.Config, 
 				Reason: "service is present again"})
 		}
 		if e.err != nil {
-			p.emit(Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()})
+			x := Action{Kind: Invalid, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: e.err.Error()}
+			if e.heldInvalid {
+				x.Alert = AlertPublishedInvalid
+				x.Reason = fmt.Sprintf("published service has invalid labels (%v); it still holds %s through its persisted route, which is not updated until the labels are fixed", e.err, e.host)
+			}
+			p.emit(x)
 			if l, lost := losers[e.svc.Key]; lost && e.heldInvalid {
 				p.planLoser(e, l)
 			}
@@ -307,6 +320,16 @@ func (p *planner) middlewareProblem(s model.Service) error {
 // takes the name over, RouteRemove for its existing route (only if it has
 // one, so this does not repeat once the caller forgets the Known entry). DNS
 // is untouched.
+//
+// Known residual (T9, parked; benign): docker:app has a route, docker goes
+// down, static:app is Published and gets its own route, then static:app goes
+// Stopped and docker comes back. static:app keeps its RouteWrite (last-known
+// backend) and docker:app gets a Conflict but no RouteRemove, because a
+// Stopped winner is not Published (takesOver). Two rows share the hostname
+// while static stays Stopped; the renderer serves the higher-rank row
+// (static), which is Plan's winner, so nothing is taken over and the name is
+// never unserved. It converges once static is Published again (docker's row
+// is removed then) or static is removed.
 func (p *planner) planLoser(e entry, l loss) {
 	p.emit(Action{Kind: Conflict, Zone: e.zone, Host: e.host, Key: e.svc.Key, Svc: copySvc(e.svc), Reason: l.reason})
 	k, ok := p.obs.Known[e.svc.Key]
@@ -703,17 +726,14 @@ func breakerTrips(missing, wanted int) bool {
 
 // breakerReason is the self-describing text of a breaker Skip: what is
 // refused, why, and the two ways out (fix the configuration, or acknowledge
-// that the records really are gone). The API action lands in T20; the kv
-// fallback works before it.
+// that the records really are gone, with the UI button or the API).
 func breakerReason(rp *repairPair) string {
-	key := store.RepairMassOKKey(rp.provider, rp.zone)
 	return fmt.Sprintf("most owned records missing at %[1]s/%[2]s (%[3]d of %[4]d); refusing mass repair: check the provider and zone configuration. "+
 		"Repairs resume by themselves once most records are listed again. "+
 		"If the records really are gone, acknowledge it once to re-create them (%[5]d per cycle): "+
-		`POST /api/v1/dns/repair/ack {"provider":%[1]q,"zone":%[2]q} (API from T20), or without the API set the kv key %[6]s to the current UTC time in RFC3339 `+
-		`(sqlite3 <database> "INSERT OR REPLACE INTO kv(key,value) VALUES('%[6]s',strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now'))"); `+
-		"the acknowledgement lasts %[7]s and is cleared once the zone has recovered",
-		rp.provider, rp.zone, rp.missing, rp.wanted, RepairCapPerZone, key, "24h")
+		`use "Acknowledge and allow repair" on the DNS page of the web UI, or POST /api/v1/dns/repair/ack {"provider":%[1]q,"zone":%[2]q} (admin; no CLI or database access is needed). `+
+		"The acknowledgement lasts %[6]s and is cleared once the zone has recovered",
+		rp.provider, rp.zone, rp.missing, rp.wanted, RepairCapPerZone, "24h")
 }
 
 // driftSkip reports an owned record whose value was changed out of band.

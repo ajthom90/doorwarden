@@ -294,7 +294,9 @@ func (a *App) observe(ctx context.Context, now time.Time, unavailable map[string
 }
 
 // countAndAlert counts the plan's actions per kind and notifies an operator
-// of every Alert (and of hostname/DNS conflicts), deduplicated by key.
+// of every Alert (and of hostname/DNS conflicts), deduplicated by key; a
+// Published service gone Invalid while it holds its route
+// (AlertPublishedInvalid) is notified once per reason.
 func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 	n := map[reconcile.ActionKind]int{}
 	var skipped map[string]bool
@@ -309,6 +311,11 @@ func (a *App) countAndAlert(ctx context.Context, acts []reconcile.Action) {
 			}
 		}
 		switch {
+		case x.Alert == reconcile.AlertPublishedInvalid:
+			a.notify(ctx, notify.Event{Kind: "service.invalid", Severity: notify.Warning,
+				Subject: "doorwarden: " + x.Key + " has invalid labels", Message: x.Reason,
+				Fields:    map[string]string{"key": x.Key, "zone": x.Zone, "host": x.Host},
+				DedupeKey: "invalid/" + x.Key + "/" + x.Reason})
 		case x.Alert != "":
 			a.notify(ctx, notify.Event{Kind: "dns.alert", Severity: notify.Critical,
 				Subject: "doorwarden: " + x.Alert, Message: x.Reason,

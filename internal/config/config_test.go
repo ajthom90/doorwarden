@@ -291,3 +291,41 @@ func TestDefaultZone(t *testing.T) {
 		})
 	}
 }
+
+// More than one zone with a docker or truenas source enabled needs
+// settings.default_zone (the host discovered backends use is that zone's
+// target_ip); static-only configs do not.
+func TestDefaultZoneRequiredForMultiZoneDiscovery(t *testing.T) {
+	two := `
+zones:
+  - name: example.test
+    target_ip: 192.0.2.10
+    records: {provider: cf, mode: per-host}
+  - name: lan.test
+    target_ip: 10.0.0.5
+    records: {provider: cf, mode: per-host}
+providers:
+  cf: {type: cloudflare, api_token: tok}
+`
+	for _, tc := range []struct {
+		name, extra string
+		wantErr     bool
+	}{
+		{"static only", "", false},
+		{"docker", "sources:\n  docker: {host: unix:///var/run/docker.sock}\n", true},
+		{"truenas", "sources:\n  truenas: {url: https://192.0.2.20, api_key: k}\n", true},
+		{"docker with default", "sources:\n  docker: {host: unix:///var/run/docker.sock}\nsettings: {default_zone: lan.test}\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := mustLoad(t, two+tc.extra)
+			if got := hasErr(c.Validate(caps(true)), "default_zone"); got != tc.wantErr {
+				t.Fatalf("default_zone error = %v, want %v: %v", got, tc.wantErr, c.Validate(caps(true)))
+			}
+		})
+	}
+	// one zone: not required
+	c := mustLoad(t, base+"sources:\n  docker: {host: unix:///var/run/docker.sock}\n")
+	if hasErr(c.Validate(caps(true)), "default_zone") {
+		t.Fatal("single zone required default_zone")
+	}
+}

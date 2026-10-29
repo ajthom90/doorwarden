@@ -229,6 +229,24 @@ type Manager struct {
 	accountMu sync.Mutex // account key creation / registration
 	flightMu  sync.Mutex
 	inflight  map[string]bool
+	// orders tracks order goroutines (they outlive their caller's context
+	// and write the store): Wait lets shutdown drain them before the store
+	// is closed.
+	orders sync.WaitGroup
+}
+
+// Wait blocks until every order goroutine has finished (stored its result
+// and notified) or ctx is done, whichever comes first; it returns ctx.Err()
+// in the latter case. Call it at shutdown before closing the store.
+func (m *Manager) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { m.orders.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // order is one ACME order request.
@@ -661,7 +679,9 @@ func (m *Manager) issueSet(ctx context.Context, z config.Zone, names []string, i
 	o := order{Issuer: issuer, IssuerCfg: isCfg, Dir: dir, Names: names, Challenge: ch}
 	done := make(chan Result, 1)
 	handedOff = true
+	m.orders.Add(1)
 	go func() {
+		defer m.orders.Done()
 		bg := context.WithoutCancel(ctx)
 		released := false
 		release := func() {

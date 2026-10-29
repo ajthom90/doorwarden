@@ -341,7 +341,9 @@ func TestOrphanHostnameConflicts(t *testing.T) {
 			r := []store.DNSRecord{owned("example.test", "app.example.test", "A", val, "docker:b")}
 			obs := Observed{Foreign: listed("example.test"), Owned: r,
 				Known: knownMap(known("docker:b", "example.test", "app.example.test", nil))}
-			got := Plan([]model.Service{pub("docker:a", "app", "example.test", 80)}, obs, phCfg(), t0)
+			// a higher rank takes over at once (a same-rank one waits for
+			// the absent incumbent's grace period, final-review H1)
+			got := Plan([]model.Service{pub("static:a", "app", "example.test", 80)}, obs, phCfg(), t0)
 			want := DNSScheduleRemoval
 			if val == target {
 				want = DNSReassign
