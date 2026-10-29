@@ -54,6 +54,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,6 +128,14 @@ type auth struct {
 	tokMu      sync.Mutex
 	setupToken string
 
+	// fwdProxies is web.trusted_proxies (X-Forwarded-For for the client
+	// address); proxies above is trusted_header.proxies (identity header).
+	fwdProxies []netip.Prefix
+	xffWarn    sync.Once
+	peerMu     sync.Mutex
+	firstPeer  netip.Addr
+	peerSeen   int
+
 	// afterVerify, when set (tests), runs between a successful password
 	// check and the store write that acts on it.
 	afterVerify func()
@@ -141,6 +150,16 @@ func newAuth(ctx context.Context, st *store.Store, cfg config.Web, hasher *Hashe
 			return nil, errors.New("web.trusted_header.proxies: invalid CIDR")
 		}
 		a.proxies = append(a.proxies, pf.Masked())
+	}
+	for _, p := range cfg.TrustedProxies {
+		pf, err := netip.ParsePrefix(p)
+		if err != nil {
+			return nil, errors.New("web.trusted_proxies: invalid CIDR")
+		}
+		a.fwdProxies = append(a.fwdProxies, pf.Masked())
+	}
+	if len(a.fwdProxies) == 0 && inContainer() {
+		log.Warn("running in a container with web.trusted_proxies unset: behind a reverse proxy (Traefik) every client shares the proxy's address for login throttling and audit; set web.trusted_proxies (see docs/deploy.md)")
 	}
 	for _, o := range cfg.AllowedOrigins {
 		a.origins[strings.ToLower(o)] = true
@@ -165,6 +184,12 @@ func newAuth(ctx context.Context, st *store.Store, cfg config.Web, hasher *Hashe
 		a.setupToken = setupToken
 	}
 	return a, nil
+}
+
+// inContainer reports whether the process runs in a Docker container.
+var inContainer = func() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
 }
 
 func (a *auth) setupTokenForTest() string {
@@ -217,19 +242,86 @@ func (a *auth) trustedPeer(r *http.Request) bool {
 	return false
 }
 
-// clientKey is the throttling address: the peer, or, when the peer is a
-// trusted proxy, the last X-Forwarded-For hop it appended.
-func (a *auth) clientKey(r *http.Request) string {
-	ip, _ := peerAddr(r)
-	if a.trustedPeer(r) {
-		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
-			hops := strings.Split(xff[len(xff)-1], ",")
-			if h, err := netip.ParseAddr(strings.TrimSpace(hops[len(hops)-1])); err == nil {
-				ip = h.Unmap()
-			}
+func inPrefixes(ps []netip.Prefix, ip netip.Addr) bool {
+	for _, p := range ps {
+		if p.Contains(ip) {
+			return true
 		}
 	}
-	return "ip:" + ip.String()
+	return false
+}
+
+// singlePeerSample is how many requests, with web.trusted_proxies unset,
+// are watched for "everything comes from one peer" (a proxy in front).
+const singlePeerSample = 32
+
+// clientIP is the client address for throttling, audit and logs. When the
+// TCP peer is in web.trusted_proxies, X-Forwarded-For is read right to left
+// and the first address that is not itself a trusted proxy is the client
+// (the rightmost-untrusted rule: everything left of it was supplied by the
+// client and is never believed). If every entry is trusted the leftmost is
+// used; if an entry cannot be parsed the walk stops at the last good hop
+// (or the peer). Otherwise the peer is the client. trusted_header.proxies
+// plays no part here.
+func (a *auth) clientIP(r *http.Request) netip.Addr {
+	peer, _ := peerAddr(r)
+	if len(a.fwdProxies) == 0 {
+		a.watchUnsetProxies(r, peer)
+		return peer
+	}
+	if !inPrefixes(a.fwdProxies, peer) {
+		return peer
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		hops = append(hops, strings.Split(v, ",")...)
+	}
+	client := peer
+	for i := len(hops) - 1; i >= 0; i-- {
+		h, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			return client
+		}
+		client = h.Unmap()
+		if !inPrefixes(a.fwdProxies, client) {
+			return client
+		}
+	}
+	return client
+}
+
+// watchUnsetProxies warns, once each, when web.trusted_proxies is unset but
+// a reverse proxy seems to be in front: X-Forwarded-For arrives, or the
+// first singlePeerSample requests all come from a single peer. Behind one
+// every client shares the proxy's address, so one client's failed logins
+// would slow everyone's.
+func (a *auth) watchUnsetProxies(r *http.Request, peer netip.Addr) {
+	if r.Header.Get("X-Forwarded-For") != "" {
+		a.xffWarn.Do(func() {
+			a.log.Warn("X-Forwarded-For received but web.trusted_proxies is unset: every client behind the proxy shares one address for login throttling and audit; set web.trusted_proxies to the proxy's network")
+		})
+	}
+	a.peerMu.Lock()
+	defer a.peerMu.Unlock()
+	if a.peerSeen >= singlePeerSample {
+		return
+	}
+	if a.peerSeen == 0 {
+		a.firstPeer = peer
+	}
+	if peer != a.firstPeer {
+		a.peerSeen = singlePeerSample // more than one peer: stop watching
+		return
+	}
+	a.peerSeen++
+	if a.peerSeen == singlePeerSample && !peer.IsLoopback() {
+		a.log.Warn("every request so far came from one address with web.trusted_proxies unset; if that is a reverse proxy, set web.trusted_proxies to its network", "peer", peer.String())
+	}
+}
+
+// clientKey is the per-address throttle key of r.
+func (a *auth) clientKey(r *http.Request) string {
+	return "ip:" + a.clientIP(r).String()
 }
 
 func validIdentity(s string) bool {

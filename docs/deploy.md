@@ -195,6 +195,19 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   throttled per client address and per user name: after 5 failures the key
   is locked for 30s, doubling up to 15 minutes. Set `web.cookie_insecure:
   true` only when the UI is served over plain HTTP on a trusted LAN.
+- **Behind Traefik: set `web.trusted_proxies`.** Login throttling, audit and
+  log lines use the client address. Without `web.trusted_proxies` that is
+  the TCP peer, so behind Traefik every client looks like Traefik and one
+  client's failed logins slow down everyone's. Set it to the proxy's network
+  (for the compose file, the Docker network Traefik shares with Doorwarden,
+  e.g. `trusted_proxies: ["172.18.0.0/16"]`). When the peer is in that list
+  the client is the rightmost `X-Forwarded-For` address that is not itself a
+  trusted proxy; anything further left was written by the client and is
+  ignored. Doorwarden warns in its log when it runs in a container with the
+  setting empty, when `X-Forwarded-For` arrives while it is empty, and when
+  the first requests all come from one address. This setting only affects
+  the client address; it never authenticates anyone (that is
+  `web.trusted_header`).
 - **CSRF.** Every state-changing request needs the `X-Doorwarden-CSRF`
   header (the token returned by login, setup and `GET /api/v1/auth/me`), a
   JSON body, and an `Origin` that matches the request host or one of

@@ -22,6 +22,15 @@ type Web struct {
 	AllowedOrigins []string `yaml:"allowed_origins"`
 	// TrustedHeader is forward-auth (e.g. Authentik behind Traefik).
 	TrustedHeader TrustedHeader `yaml:"trusted_header"`
+	// TrustedProxies are CIDRs of reverse proxies (Traefik) whose
+	// X-Forwarded-For is believed when working out the client address for
+	// login throttling, audit and logs. The client is the rightmost
+	// X-Forwarded-For address that is not itself a trusted proxy. Empty
+	// (default): X-Forwarded-For is ignored and the TCP peer is the client;
+	// behind Traefik that makes every client one address, so set it. This is
+	// separate from trusted_header.proxies, which only governs identity
+	// headers.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // TrustedHeader accepts an identity header, but only from the listed proxy
@@ -85,6 +94,11 @@ func (w *Web) validate() []error {
 	for _, o := range w.AllowedOrigins {
 		if !ValidOrigin(o) {
 			add("web.allowed_origins: %q must be scheme://host[:port]", o)
+		}
+	}
+	for _, p := range w.TrustedProxies {
+		if _, err := netip.ParsePrefix(p); err != nil {
+			add("web.trusted_proxies: %q is not a CIDR", p)
 		}
 	}
 	th := w.TrustedHeader
