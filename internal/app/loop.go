@@ -1,0 +1,129 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/ajthom90/doorwarden/internal/acme"
+)
+
+// Run is the reconcile loop: one cycle at once, then one per poll interval
+// (settings.poll_interval), per Trigger, and when a certificate expires (the
+// Traefik selection changes). Ticks and triggers that arrive while a cycle
+// runs coalesce into one more cycle. With an ACME manager, Renew runs every
+// RenewEvery when the run is not dry.
+//
+// Run returns nil when ctx is cancelled, after the running cycle (aborted
+// through ctx: executors stop between actions) and the renewal goroutine
+// returned. The caller then calls Close and closes the store.
+func (a *App) Run(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("app: nil context")
+	}
+	poll := a.cfg.Settings.PollInterval
+	if poll <= 0 {
+		poll = 30 * time.Second
+	}
+	tick := time.NewTicker(poll)
+	defer tick.Stop()
+	certTimer := time.NewTimer(time.Hour)
+	certTimer.Stop()
+	defer certTimer.Stop()
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	renewStarted := a.mgr == nil
+
+	a.Trigger()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-a.trigger:
+		case <-tick.C:
+		case <-certTimer.C:
+		}
+		// Coalesce: whatever else is pending is covered by this cycle.
+		drain(a.trigger)
+		drainTick(tick.C)
+		a.RunOnce(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !renewStarted {
+			// After the first cycle, so Renew's Wanted callback sees the
+			// persisted routes.
+			renewStarted = true
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.renewLoop(ctx)
+			}()
+		}
+		a.cycleMu.Lock()
+		next := a.nextCert
+		a.cycleMu.Unlock()
+		certTimer.Stop()
+		if !next.IsZero() {
+			d := next.Sub(a.now()) + time.Second
+			if d < time.Second {
+				d = time.Second
+			}
+			certTimer.Reset(d)
+		}
+	}
+}
+
+func drain(c chan struct{}) {
+	select {
+	case <-c:
+	default:
+	}
+}
+
+func drainTick(c <-chan time.Time) {
+	select {
+	case <-c:
+	default:
+	}
+}
+
+// renewLoop calls ACME Renew right away and then every RenewEvery, unless
+// the run is dry (no ACME orders in dry run).
+func (a *App) renewLoop(ctx context.Context) {
+	t := time.NewTicker(a.renewTO)
+	defer t.Stop()
+	for {
+		a.renewOnce(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (a *App) renewOnce(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	if dry, _ := a.DryRun(ctx); dry {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, time.Hour)
+	defer cancel()
+	for _, r := range a.mgr.Renew(rctx) {
+		switch {
+		case r.Err == nil:
+			a.met.CertRenewal("ok")
+		case errors.Is(r.Err, acme.ErrDeferred), errors.Is(r.Err, acme.ErrUnwanted),
+			errors.Is(r.Err, acme.ErrImported), errors.Is(r.Err, acme.ErrNeedsSwitch):
+			// No attempt was made.
+		default:
+			a.met.CertRenewal("error")
+			a.log.WarnContext(ctx, "certificate renewal failed", "cert", r.CertID, "zone", r.Zone, "error", r.Err)
+		}
+	}
+}
