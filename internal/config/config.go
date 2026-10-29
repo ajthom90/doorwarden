@@ -37,6 +37,8 @@ type Config struct {
 	// Notifications configures alert senders (see notify.go).
 	Notifications Notifications `yaml:"notifications"`
 	ACME          ACME          `yaml:"acme"`
+	// Web configures API authentication (web.go).
+	Web Web `yaml:"web"`
 }
 
 // MiddlewareDefs returns Middlewares as name -> definition (any), the shape
@@ -153,6 +155,19 @@ func Load(path string, env func(string) (string, bool)) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	return parse(raw, path, env)
+}
+
+// Parse is Load on the file's contents: substitute, decode strictly, apply
+// defaults. It does not Validate.
+func Parse(raw []byte, env func(string) (string, bool)) (*Config, error) {
+	if env == nil {
+		env = os.LookupEnv
+	}
+	return parse(raw, "(document)", env)
+}
+
+func parse(raw []byte, path string, env func(string) (string, bool)) (*Config, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal(raw, &root); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
@@ -178,6 +193,7 @@ func Load(path string, env func(string) (string, bool)) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	c.Notifications.applyDefaults()
+	c.Web.applyDefaults()
 	for name, is := range c.Issuers {
 		if is.Directory == "" {
 			is.Directory = "staging"
