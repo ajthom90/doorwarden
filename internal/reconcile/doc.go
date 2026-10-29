@@ -437,24 +437,34 @@
 // dns/repair-mass-ok/<provider>/<zone> (store.RepairMassOKKey, zone
 // normalized) holding the acknowledgement time in RFC3339
 // (store.AcknowledgeMassRepair; the API action POST /api/v1/dns/repair/ack
-// {provider, zone} of T20 calls it; without the API the kv row can be
-// written with sqlite3, as the Skip says). GatherObserved reads every
-// acknowledgement into Observed.RepairMassOK (keyed provider+"/"+zone).
+// {provider, zone} that calls it lands in T20 and does not exist before
+// it; until then, and without the API, the kv row can be written with
+// sqlite3, as the Skip says). GatherObserved reads every acknowledgement
+// into Observed.RepairMassOK (keyed provider+"/"+zone, the zone normalized;
+// of several spellings of one pair's key a valid one wins, then the latest).
 // While the pair's acknowledgement is younger than RepairMassOKTTL (24h) and
 // not dated more than 5 minutes ahead, a tripped pair gets the CAPPED
 // repairs (same selection and cap as below; their Reason says "acknowledged
-// at <time>") instead of the Skip. The DNS executor deletes the key at the
-// end of a non-dry Apply that listed the pair successfully when at most 3 of
-// the pair's ownership rows (all of them, not only the eligible ones, so
-// it can only clear later than the plan would stop tripping) are missing
-// from that listing (kept current by the batch's own writes): the zone has
-// recovered, and a later mass loss trips the breaker again rather than ride
-// on an old acknowledgement. Its sweep (first non-dry Apply, then hourly)
-// deletes acknowledgements that are expired, dated ahead, unreadable, or
-// name a provider/zone it does not manage. A dry run never clears one. An
-// acknowledged pair whose remaining missing rows are all blocked by foreign
-// records, or not due, lists nothing and keeps its acknowledgement until it
-// expires (24h at most). Otherwise at most RepairCapPerZone (5) repairs are
+// at <time>") instead of the Skip. Clearing: MultiExecutor calls
+// DNSExecutor.Finish (the Finisher hook) at the end of EVERY non-dry Apply,
+// whether or not the plan had a DNS action. For every stored
+// acknowledgement of a managed pair (all spellings of its key grouped) it
+// lists the zone once and deletes every spelling when the breaker
+// condition no longer holds there: at most 3, or at most half, of the
+// pair's ownership rows not scheduled for removal are missing. A row is
+// present only when the listing holds OUR record at its name and type (its
+// provider ID or stored value); a foreign or drifted record there counts as
+// missing, so records that are not ours never clear it. The zone has
+// recovered (or never tripped), and a later mass loss trips the breaker
+// again rather than ride on an old acknowledgement; this holds even when
+// every remaining missing row waits for its backoff and nothing is planned.
+// A failed listing keeps it. The count covers rows the plan does not
+// count (an unavailable source's): present ones among them can clear it
+// while the plan would still trip, which only brings the Skip back. Finish
+// also runs the sweep (first non-dry Apply, then hourly), which deletes
+// acknowledgements that are expired, dated ahead, unreadable, or name a
+// provider/zone it does not manage. A dry run never lists for or clears
+// one. Otherwise at most RepairCapPerZone (5) repairs are
 // emitted per pair, chosen among the DUE rows only: GatherObservedAt reads
 // the repair backoff (below) into Observed.RepairDue (OwnedRowKey -> due at
 // the plan's time; an absent row is due; a state the clock left more than
@@ -481,6 +491,11 @@
 // update at all) while the breaker trips unless acknowledged, is a Conflict
 // when a foreign record holds the name, and is never planned while the
 // owner's source is unavailable. A drifted row is the drift Skip, as above.
+// Unlike a same-value repair, a repair-class update has NO per-row executor
+// backoff (no dns/repair/ state: it is a plain update whose not-found falls
+// back to the guarded create): a row whose re-create keeps failing is tried
+// again every cycle it is selected, bounded only by the per-pair cap of 5
+// and the rotation, which moves the window to other rows.
 //
 // The executor (DNSEnsure with Repair) does not stop at an up-to-date row:
 //  1. stale-plan check: the stored row must still exist with the action's
@@ -560,7 +575,8 @@
 // it at time.Now()); notify an operator for a Skip with
 // Action.Alert set; give the DNS executor a RepairStateStore (a
 // *store.Store as its Store is enough) or every repair is refused; register the DNS executor for every kind in DNSActionKinds
-// (RegisterDNSExecutor; it persists, reassigns and forgets ownership rows
+// (RegisterDNSExecutor, through a MultiExecutor so its Finish runs every
+// cycle; it persists, reassigns and forgets ownership rows
 // itself) and the route executor for RouteWrite, RouteRemove,
 // ScheduleRemoval and CancelRemoval (its store must implement
 // DeleteRouteIfDue); mark a source

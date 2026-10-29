@@ -696,13 +696,14 @@ func RepairRotation(pk string, now time.Time, n int) int {
 
 // breakerReason is the self-describing text of a breaker Skip: what is
 // refused, why, and the two ways out (fix the configuration, or acknowledge
-// that the records really are gone).
+// that the records really are gone). The API action lands in T20; the kv
+// fallback works before it.
 func breakerReason(rp *repairPair) string {
 	key := store.RepairMassOKKey(rp.provider, rp.zone)
 	return fmt.Sprintf("most owned records missing at %[1]s/%[2]s (%[3]d of %[4]d); refusing mass repair: check the provider and zone configuration. "+
 		"Repairs resume by themselves once most records are listed again. "+
 		"If the records really are gone, acknowledge it once to re-create them (%[5]d per cycle): "+
-		`POST /api/v1/dns/repair/ack {"provider":%[1]q,"zone":%[2]q}, or without the API set the kv key %[6]s to the current UTC time in RFC3339 `+
+		`POST /api/v1/dns/repair/ack {"provider":%[1]q,"zone":%[2]q} (API from T20), or without the API set the kv key %[6]s to the current UTC time in RFC3339 `+
 		`(sqlite3 <database> "INSERT OR REPLACE INTO kv(key,value) VALUES('%[6]s',strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now'))"); `+
 		"the acknowledgement lasts %[7]s and is cleared once the zone has recovered",
 		rp.provider, rp.zone, rp.missing, rp.wanted, RepairCapPerZone, key, "24h")
