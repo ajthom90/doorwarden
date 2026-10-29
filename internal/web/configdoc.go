@@ -43,6 +43,8 @@ var (
 	refPlaceholder = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*\}$`)
 	secretKeyRe    = regexp.MustCompile(`(?i)(pass(word|wd)?|secret|token|api_?key|access_?key|private|hmac|credential|users)`)
 	backtickRe     = regexp.MustCompile("`[^`]*`")
+	dquoteRe       = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+	squoteRe       = regexp.MustCompile(`'[^']*'`)
 )
 
 type docPath []string
@@ -280,10 +282,13 @@ func sensitiveValues(raw []byte) []string {
 	return out
 }
 
-// scrubConfigError removes values from a config error: backtick-quoted
-// excerpts (yaml.v3 echoes scalars that way) and every known secret.
+// scrubConfigError removes values from a config error so only paths and
+// reasons remain: quoted excerpts (yaml.v3 echoes scalars in backticks,
+// Validate quotes values with %q) and every known secret.
 func scrubConfigError(msg string, secrets []string) string {
 	msg = backtickRe.ReplaceAllString(msg, "`…`")
+	msg = dquoteRe.ReplaceAllString(msg, `"…"`)
+	msg = squoteRe.ReplaceAllString(msg, `'…'`)
 	for _, s := range secrets {
 		if len(s) >= 3 {
 			msg = strings.ReplaceAll(msg, s, "[redacted]")

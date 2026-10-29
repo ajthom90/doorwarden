@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ajthom90/doorwarden/internal/config"
 	"github.com/ajthom90/doorwarden/internal/dns"
 	"github.com/ajthom90/doorwarden/internal/model"
 	"github.com/ajthom90/doorwarden/internal/reconcile"
@@ -380,7 +381,11 @@ func TestEventsStream(t *testing.T) {
 	t.Cleanup(func() { sseHeartbeat = old })
 	e := newTestEnv(t)
 	c := e.setupAdmin()
-	ts := httptest.NewServer(e.h)
+	// Production-like timeouts: the stream must outlive both.
+	ts := httptest.NewUnstartedServer(e.h)
+	ts.Config.ReadTimeout = 300 * time.Millisecond
+	ts.Config.WriteTimeout = 300 * time.Millisecond
+	ts.Start()
 	t.Cleanup(ts.Close)
 	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/events", nil)
 	req.AddCookie(c.cookie)
@@ -396,9 +401,10 @@ func TestEventsStream(t *testing.T) {
 	for e.srv.events.clientCount() == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
+	time.Sleep(700 * time.Millisecond)
 	e.srv.Events().Publish("cycle", map[string]int{"actions": 3})
 	found := false
-	for i := 0; i < 20 && !found; i++ {
+	for i := 0; i < 500 && !found; i++ {
 		line, err := rd.ReadString('\n')
 		if err != nil {
 			t.Fatal(err)
@@ -431,4 +437,47 @@ func TestEventsStream(t *testing.T) {
 func storeCert(zone string) store.Cert {
 	return store.Cert{ID: zone, Zone: zone, DomainsJSON: `["*.` + zone + `"]`, Issuer: "le", NotAfter: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 		Status: "valid", Path: "/data/certs/" + zone, Managed: true}
+}
+
+// Even a validator that expanded real environment values cannot echo them:
+// config errors are reduced to paths and reasons.
+func TestConfigPutErrorsEchoNoValues(t *testing.T) {
+	const secret = "s3cr3t-env-master-key"
+	e := newTestEnv(t, func(o *Options) {
+		o.ValidateConfig = func(raw []byte) error {
+			c, err := config.Parse(raw, func(k string) (string, bool) {
+				if k == "DOORWARDEN_MASTER_KEY" {
+					return secret, true
+				}
+				return "", false
+			})
+			if err != nil {
+				return err
+			}
+			if errs := c.Validate(nil); len(errs) > 0 {
+				return errs[0]
+			}
+			return nil
+		}
+	})
+	c := e.setupAdmin()
+	for _, doc := range []string{
+		"zones:\n  - name: example.test\n    target_ip: \"${DOORWARDEN_MASTER_KEY}\"\n",
+		"settings: {grace_period: \"${DOORWARDEN_MASTER_KEY}\"}\n",
+	} {
+		w := c.do("PUT", "/api/v1/config", map[string]string{"yaml": doc})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("accepted: %d %s", w.Code, w.Body)
+		}
+		if strings.Contains(w.Body.String(), "s3cr3t") {
+			t.Fatalf("environment value echoed: %s", w.Body)
+		}
+	}
+	w := c.do("PUT", "/api/v1/config", map[string]string{"yaml": "zones:\n  - name: example.test\n    target_ip: \"${NOT_SET_VAR}\"\n"})
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "NOT_SET_VAR") {
+		t.Fatalf("unset variable: %d %s", w.Code, w.Body)
+	}
+	if strings.Contains(e.activity(), "s3cr3t") || strings.Contains(e.logBuf.String(), "s3cr3t") {
+		t.Fatal("secret in activity or log")
+	}
 }

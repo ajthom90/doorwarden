@@ -189,3 +189,41 @@ func TestValidateConfigBytes(t *testing.T) {
 		t.Fatalf("master key requirement: %v", err)
 	}
 }
+
+// A client's config document is never expanded with the real environment,
+// so a validation error cannot carry a variable's value back.
+func TestValidateConfigBytesNoEnvLeak(t *testing.T) {
+	const secret = "s3cr3t-master-key-value"
+	env := func(k string) (string, bool) {
+		switch k {
+		case "DOORWARDEN_MASTER_KEY":
+			return secret, true
+		case "OTHER_SECRET":
+			return "s3cr3t-other-value", true
+		}
+		return "", false
+	}
+	for _, doc := range []string{
+		"zones:\n  - name: example.test\n    target_ip: \"${DOORWARDEN_MASTER_KEY}\"\n",
+		"zones:\n  - name: example.test\n    target_ip: 192.0.2.10\n    records: {provider: \"${OTHER_SECRET}\", mode: per-host}\n",
+		"settings: {grace_period: \"${DOORWARDEN_MASTER_KEY}\"}\nzones:\n  - name: example.test\n    target_ip: 192.0.2.10\n",
+	} {
+		err := validateConfigBytes([]byte(doc), env, true)
+		if err == nil {
+			t.Fatalf("accepted: %s", doc)
+		}
+		if strings.Contains(err.Error(), "s3cr3t") {
+			t.Fatalf("environment value leaked: %v", err)
+		}
+	}
+	// An unset variable is reported by name only.
+	err := validateConfigBytes([]byte("zones:\n  - name: example.test\n    target_ip: \"${NOT_SET_VAR}\"\n"), env, true)
+	if err == nil || !strings.Contains(err.Error(), "NOT_SET_VAR") {
+		t.Fatalf("unset variable: %v", err)
+	}
+	// A set variable in a free-form field still validates.
+	ok := "zones:\n  - name: example.test\n    target_ip: 192.0.2.10\n    records: {provider: fk, mode: per-host}\nproviders:\n  fk: {type: fake, token: \"${OTHER_SECRET}\"}\n"
+	if err := validateConfigBytes([]byte(ok), env, true); err != nil {
+		t.Fatalf("valid document with a set variable: %v", err)
+	}
+}
