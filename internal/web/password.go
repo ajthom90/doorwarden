@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -37,12 +39,26 @@ const (
 // maxPasswordLen bounds the input to the hash.
 const maxPasswordLen = 1024
 
+// maxHashWaiters bounds the callers queued for a hashing slot. Past it a
+// caller gets ErrHasherBusy at once (the API answers 503 + Retry-After), so
+// a login flood holds at most parallel+maxHashWaiters goroutines in the
+// password path instead of an unbounded backlog.
+const maxHashWaiters = 8
+
+// ErrHasherBusy is returned when every hashing slot is busy and the wait
+// queue is full.
+var ErrHasherBusy = errors.New("password hashing is busy")
+
 // Hasher hashes and verifies passwords with argon2id. At most `parallel`
 // hashes run at once (each one allocates Params.Memory), so a login flood
-// cannot exhaust memory; callers queue instead.
+// cannot exhaust memory; at most maxHashWaiters callers queue behind them,
+// and a queued caller leaves when its context ends.
 type Hasher struct {
-	p     Argon2Params
-	sem   chan struct{}
+	p       Argon2Params
+	sem     chan struct{}
+	waiting atomic.Int32
+	// kdf derives the key (argon2.IDKey; replaced in tests).
+	kdf   func(pw, salt []byte, p Argon2Params) []byte
 	once  sync.Once
 	dummy string
 }
@@ -52,48 +68,123 @@ func NewHasher(p Argon2Params, parallel int) *Hasher {
 	if parallel < 1 {
 		parallel = 2
 	}
-	return &Hasher{p: p, sem: make(chan struct{}, parallel)}
+	return &Hasher{p: p, sem: make(chan struct{}, parallel), kdf: func(pw, salt []byte, p Argon2Params) []byte {
+		return argon2.IDKey(pw, salt, p.Time, p.Memory, p.Threads, p.KeyLen)
+	}}
 }
 
-func (h *Hasher) key(pw, salt []byte, p Argon2Params) []byte {
-	h.sem <- struct{}{}
-	defer func() { <-h.sem }()
-	return argon2.IDKey(pw, salt, p.Time, p.Memory, p.Threads, p.KeyLen)
-}
-
-// Hash returns the PHC string $argon2id$v=19$m=..,t=..,p=..$salt$key.
-func (h *Hasher) Hash(password string) (string, error) {
-	if len(password) > maxPasswordLen {
-		return "", errors.New("password too long")
+// acquire takes a hashing slot, waiting (bounded, cancellable) when all are
+// busy. The returned func releases it.
+func (h *Hasher) acquire(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	release := func() { <-h.sem }
+	select {
+	case h.sem <- struct{}{}:
+		return release, nil
+	default:
+	}
+	if h.waiting.Add(1) > maxHashWaiters {
+		h.waiting.Add(-1)
+		return nil, ErrHasherBusy
+	}
+	defer h.waiting.Add(-1)
+	select {
+	case h.sem <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// run acquires a slot, runs recheck (a non-nil error aborts before any
+// work: state such as a throttle may have changed while queued), then fn.
+func (h *Hasher) run(ctx context.Context, recheck func() error, fn func()) error {
+	release, err := h.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if recheck != nil {
+		if err := recheck(); err != nil {
+			return err
+		}
+	}
+	fn()
+	return nil
+}
+
+func (h *Hasher) newHash(password string) (string, error) {
 	salt := make([]byte, h.p.SaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	k := h.key([]byte(password), salt, h.p)
+	k := h.kdf([]byte(password), salt, h.p)
 	b64 := base64.RawStdEncoding
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, h.p.Memory, h.p.Time, h.p.Threads,
 		b64.EncodeToString(salt), b64.EncodeToString(k)), nil
 }
 
+// Hash returns the PHC string $argon2id$v=19$m=..,t=..,p=..$salt$key.
+func (h *Hasher) Hash(password string) (string, error) {
+	return h.HashContext(context.Background(), password)
+}
+
+// HashContext is Hash through the bounded queue: ErrHasherBusy or the
+// context's error when no slot could be had.
+func (h *Hasher) HashContext(ctx context.Context, password string) (string, error) {
+	if len(password) > maxPasswordLen {
+		return "", errors.New("password too long")
+	}
+	var out string
+	var herr error
+	if err := h.run(ctx, nil, func() { out, herr = h.newHash(password) }); err != nil {
+		return "", err
+	}
+	return out, herr
+}
+
 // Verify reports whether password matches encoded (constant-time compare).
 // A malformed or out-of-bounds encoding never verifies.
 func (h *Hasher) Verify(encoded, password string) bool {
+	ok, _ := h.VerifyContext(context.Background(), encoded, password, nil)
+	return ok
+}
+
+// VerifyContext is Verify through the bounded queue; recheck runs once a
+// slot is held, before the KDF, and its error aborts the attempt. err is
+// ErrHasherBusy, the context's error or recheck's.
+func (h *Hasher) VerifyContext(ctx context.Context, encoded, password string, recheck func() error) (bool, error) {
 	p, salt, want, ok := parsePHC(encoded)
 	if !ok || len(password) > maxPasswordLen {
-		return false
+		// Still take a slot so a malformed row costs the same and is
+		// throttled the same.
+		return false, h.run(ctx, recheck, func() {})
 	}
-	got := h.key([]byte(password), salt, p)
-	return subtle.ConstantTimeCompare(got, want) == 1
+	var match bool
+	err := h.run(ctx, recheck, func() {
+		got := h.kdf([]byte(password), salt, p)
+		match = subtle.ConstantTimeCompare(got, want) == 1
+	})
+	return match, err
 }
 
 // VerifyDummy spends the same work as Verify against a fixed hash, so a
 // login for an unknown user takes as long as one for the real user.
 func (h *Hasher) VerifyDummy(password string) {
+	_ = h.VerifyDummyContext(context.Background(), password, nil)
+}
+
+// VerifyDummyContext is VerifyDummy through the same bounded queue, so
+// unknown-user attempts cannot bypass it.
+func (h *Hasher) VerifyDummyContext(ctx context.Context, password string, recheck func() error) error {
 	h.once.Do(func() {
-		h.dummy, _ = h.Hash("doorwarden-dummy-password")
+		// Computed outside the queue (once per process).
+		h.dummy, _ = h.newHash("doorwarden-dummy-password")
 	})
-	_ = h.Verify(h.dummy, password)
+	_, err := h.VerifyContext(ctx, h.dummy, password, recheck)
+	return err
 }
 
 func parsePHC(s string) (Argon2Params, []byte, []byte, bool) {

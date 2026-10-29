@@ -439,15 +439,44 @@ func passwordProblem(pw string) string {
 	return ""
 }
 
-func (a *auth) locked(w http.ResponseWriter, keys ...string) bool {
+// throttledError is a throttle refusal found by the re-check made once a
+// hashing slot is held.
+type throttledError struct{ retry time.Duration }
+
+func (e throttledError) Error() string { return "throttled" }
+
+func (a *auth) refusal(keys ...string) error {
 	for _, k := range keys {
 		if ok, retry := a.thr.allowed(k); !ok {
-			w.Header().Set("Retry-After", strconv.Itoa(int(retry/time.Second)+1))
-			writeErr(w, http.StatusTooManyRequests, "too many failed attempts; try again later")
-			return true
+			return throttledError{retry}
 		}
 	}
+	return nil
+}
+
+func writeThrottled(w http.ResponseWriter, retry time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(retry/time.Second)+1))
+	writeErr(w, http.StatusTooManyRequests, "too many failed attempts; try again later")
+}
+
+func (a *auth) locked(w http.ResponseWriter, keys ...string) bool {
+	if err := a.refusal(keys...); err != nil {
+		writeThrottled(w, err.(throttledError).retry)
+		return true
+	}
 	return false
+}
+
+// hashRefused answers a password operation that never ran: the throttle
+// re-check refused it, the hashing queue is full, or the client went away.
+func hashRefused(w http.ResponseWriter, err error) {
+	var te throttledError
+	if errors.As(err, &te) {
+		writeThrottled(w, te.retry)
+		return
+	}
+	w.Header().Set("Retry-After", "1")
+	writeErr(w, http.StatusServiceUnavailable, "busy; try again shortly")
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -494,7 +523,11 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, p)
 		return
 	}
-	h, err := a.hasher.Hash(req.Password)
+	h, err := a.hasher.HashContext(r.Context(), req.Password)
+	if errors.Is(err, ErrHasherBusy) || r.Context().Err() != nil {
+		hashRefused(w, err)
+		return
+	}
 	if err != nil {
 		s.internal(w, "setup hash", err)
 		return
@@ -541,11 +574,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok := false
+	recheck := func() error { return a.refusal(ipKey, userKey) }
 	if exists && len(req.Username) == len(adm.Username) &&
 		subtle.ConstantTimeCompare([]byte(req.Username), []byte(adm.Username)) == 1 {
-		ok = a.hasher.Verify(adm.PasswordHash, req.Password)
+		ok, err = a.hasher.VerifyContext(r.Context(), adm.PasswordHash, req.Password, recheck)
 	} else {
-		a.hasher.VerifyDummy(req.Password)
+		err = a.hasher.VerifyDummyContext(r.Context(), req.Password, recheck)
+	}
+	if err != nil {
+		hashRefused(w, err)
+		return
 	}
 	if !ok {
 		a.thr.fail(ipKey)
@@ -622,7 +660,12 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "password", err)
 		return
 	}
-	if !a.hasher.Verify(adm.PasswordHash, req.Current) {
+	match, err := a.hasher.VerifyContext(r.Context(), adm.PasswordHash, req.Current, func() error { return a.refusal(userKey) })
+	if err != nil {
+		hashRefused(w, err)
+		return
+	}
+	if !match {
 		a.thr.fail(userKey)
 		writeErr(w, http.StatusUnauthorized, "current password is wrong")
 		return
@@ -631,7 +674,11 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, pp)
 		return
 	}
-	h, err := a.hasher.Hash(req.New)
+	h, err := a.hasher.HashContext(r.Context(), req.New)
+	if errors.Is(err, ErrHasherBusy) || r.Context().Err() != nil {
+		hashRefused(w, err)
+		return
+	}
 	if err != nil {
 		s.internal(w, "password hash", err)
 		return
