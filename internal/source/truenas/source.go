@@ -235,18 +235,25 @@ func (s *Source) convert(ctx context.Context, a apiApp) (model.Service, string) 
 
 	portals := a.Portals
 	if allowed := a.hostPorts(); allowed != nil && a.State == "RUNNING" && len(portals) > 0 {
-		// Final-review H2: a portal is only trusted when its port is one of
-		// the app's own published host ports; others are dropped.
+		// Final-review H2: a parsable portal is only trusted when its port is
+		// one of the app's own published host ports; others are dropped.
+		// Unparsable portals are not judged (nor used): with no parsable
+		// portal the published-ports lookup applies. The message names
+		// portals and port numbers only, never their URLs (userinfo and
+		// query tokens would reach the logs and the activity).
 		portals = map[string]string{}
 		var bad []string
 		for n, v := range a.Portals {
-			if _, p, usable := parsePortal(v); usable && allowed[p] {
+			_, p, usable := parsePortal(v)
+			switch {
+			case !usable:
+			case allowed[p]:
 				portals[n] = v
-			} else {
-				bad = append(bad, fmt.Sprintf("%s (%s)", n, v))
+			default:
+				bad = append(bad, fmt.Sprintf("%q (port %d)", n, p))
 			}
 		}
-		if len(portals) == 0 {
+		if len(portals) == 0 && len(bad) > 0 {
 			sort.Strings(bad)
 			return fail(fmt.Errorf("no portal port is one of the app's published ports: %s", strings.Join(bad, ", ")))
 		}
