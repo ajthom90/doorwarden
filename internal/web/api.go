@@ -100,11 +100,14 @@ func (s *Server) refuseInDryRun(w http.ResponseWriter, r *http.Request, what str
 
 // ServiceInfo is one service as the API shows it.
 type ServiceInfo struct {
-	Key         string            `json:"key"`
-	Source      string            `json:"source"`
-	Name        string            `json:"name"`
-	Zone        string            `json:"zone"`
-	Hostname    string            `json:"hostname,omitempty"`
+	Key      string `json:"key"`
+	Source   string `json:"source"`
+	Name     string `json:"name"`
+	Zone     string `json:"zone"`
+	Hostname string `json:"hostname,omitempty"`
+	// Apex: the hostname is the zone name itself (static apex entry); the
+	// UI offers no rename for it.
+	Apex        bool              `json:"apex,omitempty"`
 	Backend     model.Backend     `json:"backend"`
 	Websockets  bool              `json:"websockets"`
 	Middlewares []string          `json:"middlewares"`

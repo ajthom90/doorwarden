@@ -173,7 +173,7 @@ func (a *App) ServiceList() []web.ServiceInfo {
 	for _, l := range a.listing {
 		h, _ := model.Hostname(l.svc, zs, dz)
 		mws := append([]string{}, l.svc.Options.Middlewares...)
-		si := web.ServiceInfo{Key: l.raw.Key, Source: l.raw.Source, Name: l.svc.Name, Zone: l.svc.Zone, Hostname: h,
+		si := web.ServiceInfo{Key: l.raw.Key, Source: l.raw.Source, Name: l.svc.Name, Zone: l.svc.Zone, Hostname: h, Apex: l.svc.Options.Apex,
 			Backend: l.svc.Backend, Websockets: l.svc.Options.Websockets, Middlewares: mws, State: l.state, Overrides: l.ov}
 		if l.state == model.StatePending || l.state == model.StatePublished {
 			si.Fingerprint = fps[l.raw.Key]

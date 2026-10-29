@@ -69,7 +69,7 @@ func (s *Source) List(_ context.Context) ([]model.Service, error) {
 		svc := model.Service{
 			Key: key, Source: "static", Name: e.Name, Zone: e.Zone,
 			Options: model.Options{Skip: e.Skip, Websockets: e.Websockets,
-				Middlewares: append([]string(nil), e.Middlewares...), Rename: e.Rename},
+				Middlewares: append([]string(nil), e.Middlewares...), Rename: e.Rename, Apex: e.Apex},
 			State: model.StateDiscovered,
 		}
 		if probs := e.Problems(); len(probs) > 0 {

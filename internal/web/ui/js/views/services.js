@@ -191,7 +191,8 @@ export function mount(root, ctx) {
     } else if (svc.state !== "off") {
       out.push(button("Unpublish", { small: true, on: { click: () => unpublish(svc) } }));
     }
-    out.push(button("Rename", { small: true, kind: "quiet", on: { click: () => rename(svc) } }));
+    // An apex entry's hostname is the zone name itself: nothing to rename.
+    if (!svc.apex) out.push(button("Rename", { small: true, kind: "quiet", on: { click: () => rename(svc) } }));
     out.push(button("Port", { small: true, kind: "quiet", on: { click: () => port(svc) } }));
     if (svc.backend && svc.backend.Scheme === "https") {
       out.push(button("TLS check", { small: true, kind: "quiet", on: { click: () => skipVerify(svc) } }));

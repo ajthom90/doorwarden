@@ -137,6 +137,9 @@ type StaticService struct {
 	Middlewares []string `yaml:"middlewares"`
 	Rename      string   `yaml:"rename"`
 	Skip        bool     `yaml:"skip"`
+	// Apex publishes the entry at the zone name itself (the zone apex)
+	// instead of <slug(name)>.<zone>. At most one per zone; not with rename.
+	Apex bool `yaml:"apex"`
 }
 
 type Settings struct {

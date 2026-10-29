@@ -11,7 +11,7 @@ import (
 )
 
 func TestConformance(t *testing.T) {
-	dnstest.Run(t, func(t *testing.T) dns.Provider { return fake.New(true) })
+	dnstest.RunWith(t, func(t *testing.T) dns.Provider { return fake.New(true) }, dnstest.Options{Zone: "example.test", OtherZone: "other.test", Apex: true})
 }
 
 func TestConformanceNoWildcard(t *testing.T) {

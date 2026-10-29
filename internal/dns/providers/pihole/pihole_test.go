@@ -138,6 +138,7 @@ func TestConformance(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, password)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			b.mu.Lock()
 			defer b.mu.Unlock()

@@ -33,4 +33,8 @@ type Options struct {
 	Skip, Websockets bool
 	Middlewares      []string
 	Rename           string
+	// Apex publishes the service at the zone name itself (the zone apex,
+	// e.g. "example.test") instead of "<slug(name)>.<zone>". Static entries
+	// only; mutually exclusive with Rename.
+	Apex bool
 }

@@ -47,7 +47,7 @@ func (p *planner) presentOwners(entries []entry) map[string]*ownerWants {
 			continue
 		}
 		z := p.zones[e.zone]
-		if z == nil || z.mode != "per-host" {
+		if z == nil || !z.wantsHostRecord(e.host) {
 			continue // wants no per-host record
 		}
 		if z.recType == "" {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -206,6 +207,27 @@ func TestConformance(t *testing.T) {
 	b := newBackend()
 	p := newProvider(t, b, fakeToken)
 	dnstest.RunWith(t, func(*testing.T) dns.Provider { return p }, dnstest.Options{Zone: "example.test", OtherZone: "other.test",
+		Apex: true,
+		ApexForeign: func(context.Context, string) (func() error, error) {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			seeded := []rec{
+				{ID: "apex-ns", Name: "example.test", Type: "NS", Content: "ns1.example.test", TTL: 1, zone: "example.test"},
+				{ID: "apex-mx", Name: "example.test", Type: "MX", Content: "mail.example.test", TTL: 1, zone: "example.test"},
+				{ID: "apex-txt", Name: "example.test", Type: "TXT", Content: "v=spf1 -all", TTL: 1, zone: "example.test"},
+			}
+			b.recs = append(b.recs, seeded...)
+			return func() error {
+				b.mu.Lock()
+				defer b.mu.Unlock()
+				for _, w := range seeded {
+					if !slices.Contains(b.recs, w) {
+						return fmt.Errorf("foreign apex record %s %s changed or removed", w.Type, w.Content)
+					}
+				}
+				return nil
+			}, nil
+		},
 		SeedMultiValue: func(_ context.Context, _, name string, values ...string) error {
 			b.mu.Lock()
 			defer b.mu.Unlock()

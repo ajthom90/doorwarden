@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -40,7 +41,12 @@ func normZone(z string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(z), "."))
 }
 
-// Hostname returns "<slug(name)>.<zone>", lowercase. The zone is svc.Zone or
+// Hostname returns "<slug(name)>.<zone>", lowercase, or the zone itself for
+// an apex service (Options.Apex; Rename is then ignored: config validation
+// and UIOverrides.Validate refuse it, so only a stale stored UI rename can
+// reach here, and it must not unpublish the apex; the zone
+// must be a valid LDH host name: ASCII, punycode for IDN, no IP literal, no
+// wildcard). The zone is svc.Zone or
 // defaultZone when empty, and must be one of zones (case-insensitive,
 // trailing dot ignored).
 func Hostname(svc Service, zones []string, defaultZone string) (string, error) {
@@ -61,6 +67,12 @@ func Hostname(svc Service, zones []string, defaultZone string) (string, error) {
 	if !found {
 		return "", fmt.Errorf("unknown zone %q", zone)
 	}
+	if svc.Options.Apex {
+		if !ValidLDHName(zone) {
+			return "", fmt.Errorf("zone %q is not a valid host name for an apex service (letters, digits and hyphens; punycode for internationalized names)", zone)
+		}
+		return zone, nil
+	}
 	name := svc.Name
 	if svc.Options.Rename != "" {
 		name = svc.Options.Rename
@@ -70,4 +82,25 @@ func Hostname(svc Service, zones []string, defaultZone string) (string, error) {
 		return "", err
 	}
 	return label + "." + zone, nil
+}
+
+// ValidLDHName reports whether n is a DNS host name of lowercase LDH labels
+// (1-63 characters, no leading or trailing hyphen, at most 253 characters,
+// at least two labels) that is not an IP literal.
+func ValidLDHName(n string) bool {
+	if n == "" || len(n) > 253 || !strings.Contains(n, ".") || net.ParseIP(n) != nil {
+		return false
+	}
+	for _, l := range strings.Split(n, ".") {
+		if l == "" || len(l) > maxLabel || l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(l); i++ {
+			c := l[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
