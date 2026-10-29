@@ -146,9 +146,15 @@ migration `0005` ignores the quarantine mark on routes
 
 Notes for upgrading to the version with quarantine and `traefik.file_mode`:
 
-- Existing approvals are migrated to the new format once, automatically, for
-  services whose content is unchanged (`migrated approval v1->v2` in the
-  activity log); no mass re-approval is needed.
+- Existing approvals are migrated to the new format once, automatically,
+  only for services whose current content is exactly what their route serves
+  (`migrated approval v1->v2` in the activity log); no mass re-approval is
+  needed. Any other service is quarantined (or Pending, if it has no route)
+  and needs one re-approval ([labels.md](labels.md#approval)). Nothing is
+  migrated in dry run, and dry run does not show which approvals would be
+  written.
+- Configs that use YAML anchors or aliases no longer load; write the values
+  out in full ([configuration.md](configuration.md)).
 - Generated Traefik files with another mode than `traefik.file_mode` (default
   `0600`) are rewritten once, which makes Traefik reload once.
 - With several zones, set `settings.default_zone` if you use Docker or

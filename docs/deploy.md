@@ -358,9 +358,10 @@ file and whose destination is unchanged, and an existing reference is
 refused when its entry's destination changes. `DOORWARDEN_*` variables
 (such as `DOORWARDEN_MASTER_KEY`) can never be referenced from the editor.
 To add a new entry that takes its secret from the environment, or to move
-one to another destination, edit the config file itself. YAML aliases are refused by the editor, and YAML
-merge keys (`<<`) are refused everywhere, including in a config file
-written by hand (the error names the line). The document is validated like at
+one to another destination, edit the config file itself. YAML anchors,
+aliases and merge keys (`<<`) are refused everywhere, in the editor and in a
+config file written by hand (the error names the line; see
+[configuration.md](configuration.md) for the other limits). The document is validated like at
 start-up and written atomically (mode 0600), so the config file must be
 writable by the container (it cannot be a read-only mount for this). Changes
 take effect at the next restart: the running reconciler, DNS providers and

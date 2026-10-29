@@ -5,13 +5,25 @@ Doorwarden reads one YAML file at start-up: `-config` flag, else
 changes (including those saved from the UI's config editor) take effect at the
 next restart.
 
-The decoder is strict: an unknown key anywhere is an error, and YAML merge
-keys (`<<`) are refused. Every problem found by validation is reported at once
-at start-up, and Doorwarden does not start until the file is valid. Errors
-name the key path and line (for example `static[0].port (line 4): invalid
-value: a string where an integer is expected`) and never repeat the value:
-values from the environment, and quoted values derived from them, appear as
-`[redacted]` or `(value elided)`.
+The decoder is strict: an unknown key anywhere is an error. Every problem
+found by validation is reported at once at start-up, and Doorwarden does not
+start until the file is valid. Errors name the key path and line (for example
+`static[0].port (line 4): invalid value: a string where an integer is
+expected`) and never repeat the value: values from the environment, and quoted
+values derived from them, appear as `[redacted]` or `(value elided)`. At most
+20 problems are described (then `and N more problems`), and the message is
+cut at 8 KiB.
+
+The file must be plain YAML. The same check applies at start-up and in the
+UI's config editor:
+
+- YAML anchors (`&name`), aliases (`*name`) and merge keys (`<<`) are refused;
+  write each value out in full.
+- Mapping keys must be plain scalars (no list or mapping used as a key).
+- A mapping may have at most 4096 keys, and the document may be nested at
+  most 64 levels deep.
+
+These limits are far above what a real config needs.
 
 All names in the examples are placeholders (`example.test`, `192.0.2.x`).
 
@@ -253,7 +265,12 @@ source and removes its existing routes after the grace period.
 The backend host of a Docker or TrueNAS service is the `target_ip` of its
 zone: the zone named by its `doorwarden.zone` label, else the default zone
 (`settings.default_zone`, or the only zone). Details in
-[labels.md](labels.md).
+[labels.md](labels.md). The backend host is always that `target_ip`: there is
+no option to reach Docker containers on a Docker network instead.
+
+Switching a source from `auto` to `approve` does not take down what is already
+served: see [labels.md](labels.md#approval) (services served with unchanged
+content are approved automatically, "grandfathered on mode switch").
 
 ## static
 
@@ -351,7 +368,11 @@ Alerts can be sent to webhooks, ntfy and e-mail. Event kinds:
 `cert.adoption_blocked`, `dns.conflict`, `dns.alert`, `source.unavailable`,
 `reconcile.error`, `service.invalid` (a published service whose labels became
 invalid; it keeps its last route) and `service.quarantined` (an approved
-service whose content changed; see [labels.md](labels.md#approval)).
+service whose content changed; see [labels.md](labels.md#approval)). A
+quarantined service raises `service.quarantined` again every cycle; the
+`dedupe_window` keeps that to one notification per service and backend per
+window, and a notification dropped because the queue was full is retried at
+the next cycle.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

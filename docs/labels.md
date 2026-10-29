@@ -80,8 +80,21 @@ services:
 ```
 
 A running container whose chosen port is not published is in the error state
-(`no published host port`). A stopped container stays listed as stopped: its
-route and records are kept, so a restart never causes churn.
+(`no published host port`). If the zone has no `target_ip`, the error names it
+(`zone example.test (the default zone) has no target_ip: set its target_ip ...`;
+for a `doorwarden.zone` label, `zone X has no target_ip (nor does the default
+zone) ...`). A stopped container stays listed as stopped: its route and
+records are kept, so a restart never causes churn.
+
+There is no Docker network mode: the backend is always `target_ip` plus the
+published host port.
+
+**Pin the host port in `approve` mode.** The published host port is part of
+what is approved. A port published without a fixed host port (`ports:
+["80"]`, or `-P`) gets a new random host port when the container is
+recreated, which changes the backend and quarantines the service until it is
+approved again ([Approval](#approval)). Publish a fixed host port
+(`"8081:80"`, as above), or use `approval: auto` for the docker source.
 
 Two containers with the same `doorwarden.name` are a
 [host name conflict](#host-name-conflicts): the one that holds the name keeps
@@ -180,19 +193,32 @@ middleware list in order.
   - its route stops being served at once, while its host name, DNS record and
     certificate are kept, and a same-source newcomer cannot take the name;
   - the Services page shows `backend changed; re-approve to resume: ...` and
-    one `service.quarantined` notification is sent;
+    a `service.quarantined` notification is sent (raised every cycle while
+    quarantined, sent once per `notifications.dedupe_window`);
   - approving it again resumes serving immediately, with the new content.
   A higher-ranked source can still take the host name, as always. A changed
   host name reserves nothing new: the old name stays reserved, the new one is
   not claimed until it is approved.
-- **Revoking an approval, or switching a source from `auto` to `approve`**,
-  leaves the service Pending but does not quarantine it (there is no approved
-  content to compare against): its existing route keeps serving until its
-  content changes or it is removed.
+- **Switching a source from `auto` to `approve`.** A service that has a route
+  but no stored approval is compared with what its route serves:
+  - unchanged content is approved automatically (activity log: `service K:
+    grandfathered on mode switch ...`, kind `approval`);
+  - changed content, or a route that is already quarantined, is quarantined;
+  - a service that never had a route is simply Pending.
+  The same applies if an approval row is missing for any other reason. There
+  is no revoke action in the UI or API yet.
 - **Upgrades**: approvals stored by versions before the quarantine change are
-  migrated automatically, once, when the service's content is unchanged
-  (logged as `migrated approval v1->v2`). An older approval for content that
-  has changed since is treated as a change, so the service is quarantined.
+  migrated automatically, once (logged as `migrated approval v1->v2`), but
+  only when the service's current content is exactly what its route serves
+  (host name, backend scheme, host, port and skip-verify, websockets, and the
+  middlewares in order). Otherwise, including when the route is gone, the
+  service is quarantined (or Pending without a route) and needs one
+  re-approval.
+- **Dry run writes no approval.** No migration or grandfathering happens in
+  dry run: a service that would be migrated or grandfathered is shown as
+  Published, and nothing in the activity log or the logs says an approval
+  would be written. The write happens at the first cycle once dry run is
+  off.
 
 In `auto` mode nothing is ever quarantined.
 
