@@ -1,0 +1,45 @@
+# Traefik static configuration for Doorwarden.
+# Doorwarden owns routing (file provider) and certificates (it writes cert
+# files and references them from the dynamic config), so there is deliberately
+# no certificatesResolvers section and no docker provider here.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+accessLog:
+  format: json
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+          # Lowest priority, so the exact-host HTTP-01 challenge router that
+          # Doorwarden renders (doorwarden-acme-http01.yml, only when a zone
+          # uses certificate.challenge http-01) wins for
+          # /.well-known/acme-challenge/ requests. Traefik's default is
+          # MaxInt-1, above any router priority a provider can set. Every
+          # other request on :80 is still redirected to HTTPS.
+          priority: 1
+  websecure:
+    address: ":443"
+  # Internal-only entry point for the container healthcheck. Not published.
+  ping:
+    address: ":8082"
+
+ping:
+  entryPoint: ping
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# api / dashboard intentionally absent (disabled).

@@ -1,11 +1,11 @@
-# proxypilot — design (draft for review)
+# doorwarden — design (draft for review)
 
 Status: DRAFT, awaiting approval. No product code exists yet.
 
 ## 1. Intent
 Self-hosted control plane that publishes Docker containers and TrueNAS SCALE apps at
 `https://<app>.<zone>` with Let's Encrypt certs (wildcards included) and managed DNS.
-Traefik v3 is the data plane (file provider only). proxypilot owns discovery, DNS, certs, and
+Traefik v3 is the data plane (file provider only). doorwarden owns discovery, DNS, certs, and
 all Traefik config. Traefik's own ACME is never used.
 
 Goals: "install an app, nothing else"; safe by default (staging CA, dry-run, ownership-tracked
@@ -49,7 +49,7 @@ so images are multi-arch with CGO off). Packages:
 - `internal/store`: SQLite, migrations via embedded SQL.
 - `internal/web`: REST+SSE JSON API, auth, UI. `internal/notify`: webhook/ntfy/SMTP.
 - `internal/importer/npm`: optional, reads NPM SQLite (read-only copy) → mapping table.
-- `internal/secrets`: AES-256-GCM envelope with master key from env (`PROXYPILOT_MASTER_KEY`),
+- `internal/secrets`: AES-256-GCM envelope with master key from env (`DOORWARDEN_MASTER_KEY`),
   per-secret nonce; secrets are a distinct Go type whose `String()/MarshalJSON` redact.
 
 Loop: sources polled every 30s (TrueNAS) / Docker events + resync; any change enqueues a
@@ -61,7 +61,7 @@ removed (grace).
 
 ## 4. DNS provider interface
 ```go
-type Record struct{ ID, Name, Type, Value string; TTL int } // Name relative-FQDN normalized
+type Record struct{ ID, Name, Type, Value string; TTL int } // Name: fully-qualified, lowercase, no trailing dot; one managed record per (name,type); Update/Delete target Record.ID when set, else (name,type) / exact (name,type,value), and a non-matching Delete is a no-op
 type Capabilities struct{ WildcardA, MultiZone, Update, TTL bool }
 type Provider interface {
     Type() string
@@ -100,13 +100,20 @@ challenge provider; zone's challenge provider must be defined.
 Strategies per zone: `wildcard` (default: `*.zone` + `zone`), `per-host`, `san` (grouped).
 Renewal at ≤30 days, exponential backoff with jitter, LE rate-limit awareness (track failures
 per set and new-orders per week; refuse to loop), configurable propagation timeout/resolvers.
-Storage: `certs/<id>/{fullchain,privkey}.pem` mode 0600, dir 0700; metadata (domains, issuer,
-not_after, last_result, staging flag) in SQLite. `tls.yml` lists certs and per-zone default
-cert (`tls.stores.default` is single-valued in Traefik; per-zone defaults are done with
-`tls.certificates` + SNI matching, and a documented limitation for the global default store,
-decided during implementation spike).
+Storage: `certs/<id>/v<N>/{fullchain,privkey}.pem` mode 0600, dir 0700 (a new version dir per
+issuance, so the dynamic file changes and Traefik reloads); metadata (domains, issuer,
+not_after, last_result, staging flag) in SQLite. `doorwarden-tls.yml` lists the selected certs
+(`tls.certificates`, SNI-matched: this is the per-zone selection), `tls.options.default`
+(`minVersion`, default VersionTLS12; `sniStrict` opt-in) and `tls.stores.default.defaultCertificate`.
+Decision (T17): Traefik has ONE default certificate (no SNI / unmatched SNI); it is the best
+valid production cert (wildcard first) of `settings.default_zone`, else of the only zone, else
+none (Traefik's self-signed default). Selection (internal/traefik/tls.go): one cert per exact
+name set (valid > production > later expiry > managed > id); expired certs are not rendered
+(opt-in `traefik.serve_expired`), and a staging or expired cert is dropped when it could take a
+name away from a better one (an exact name beats a wildcard in Traefik's SNI match). Routes
+whose host no rendered cert covers are reported (`no-certificate-for-host`).
 Import: PEM files or NPM's `/etc/letsencrypt/live/npm-N` dirs → stored as `imported` certs,
-renewed through proxypilot only once an issuer is set for the zone (renewal switches them to
+renewed through doorwarden only once an issuer is set for the zone (renewal switches them to
 managed, never silently).
 "Switch staging → production" re-issues all certs for that issuer after confirmation.
 Notifications: renewal failure, expiry <14d, conflicts: webhook, ntfy, SMTP.
@@ -126,10 +133,10 @@ trusted-header / forward-auth (configurable header names + trusted proxy CIDRs).
 Endpoints: `/healthz`, `/metrics` (Prometheus), `/api/v1/...`, SSE `/api/v1/events`.
 
 ## 8. Deployment
-Compose for TrueNAS Custom Apps: `proxypilot`, `traefik:v3` (80/443, file provider on shared
+Compose for TrueNAS Custom Apps: `doorwarden`, `traefik:v3` (80/443, file provider on shared
 volume), `tecnativa/docker-socket-proxy` (CONTAINERS=1, read-only). Image: multi-arch
 (amd64/arm64) to GHCR via GitHub Actions (build, test, Pebble integration job, release).
-Traefik's own dashboard off; proxypilot's UI is itself published as a route.
+Traefik's own dashboard off; doorwarden's UI is itself published as a route.
 
 ## 9. Migration from NPM (optional tool + docs)
 1. Read-only import of proxy hosts/certs → mapping table classifying each: `auto` (TrueNAS
@@ -155,7 +162,8 @@ providers. 7. API + UI. 8. Notifications, metrics. 9. NPM importer + cutover scr
 
 ## 12. Open decisions
 - License (proposal: Apache-2.0). Repo/GHCR owner and name.
-- Per-zone default cert strategy given Traefik's single default store (spike).
+- ~~Per-zone default cert strategy given Traefik's single default store (spike).~~ Decided in T17
+  (section 5): SNI-matched certificates per zone, one global default from the default zone.
 - UI stack (proposal: Preact + Vite, embedded).
 - Whether the UniFi record provider targets 11.0.97's DNS-policies endpoint only
   (proposal: yes, document minimum version).

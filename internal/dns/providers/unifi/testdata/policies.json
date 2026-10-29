@@ -1,0 +1,5 @@
+{"offset":0,"limit":25,"count":3,"totalCount":3,"data":[
+{"type":"A_RECORD","id":"aaaaaaaa-0000-4000-8000-000000000001","enabled":true,"metadata":{"origin":"USER_DEFINED"},"domain":"app.example.test","ipv4Address":"192.0.2.10","ttlSeconds":0},
+{"type":"CNAME_RECORD","id":"aaaaaaaa-0000-4000-8000-000000000002","enabled":true,"metadata":{"origin":"USER_DEFINED"},"domain":"alias.example.test","targetDomain":"app.example.test","ttlSeconds":0},
+{"type":"FORWARD_DOMAIN","id":"aaaaaaaa-0000-4000-8000-000000000003","enabled":true,"metadata":{"origin":"USER_DEFINED"},"domain":"corp.example.test","ipAddress":"198.51.100.53"}
+]}

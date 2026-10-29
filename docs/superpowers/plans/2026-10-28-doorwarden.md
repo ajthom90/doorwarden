@@ -1,24 +1,24 @@
-# proxypilot Implementation Plan
+# doorwarden Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build proxypilot, a self-hosted control plane that discovers Docker/TrueNAS services and publishes them through Traefik with managed DNS records and ACME certificates.
+**Goal:** Build doorwarden, a self-hosted control plane that discovers Docker/TrueNAS services and publishes them through Traefik with managed DNS records and ACME certificates.
 
 **Architecture:** One Go binary (pure-Go SQLite, embedded Preact SPA). Sources emit normalized `Service`s; a pure `Plan` function diffs desired vs. observed state into actions; executors apply DNS changes (ownership-tracked), issue/renew certs via lego, and atomically write Traefik file-provider YAML.
 
 **Tech Stack:** Go 1.23+, `modernc.org/sqlite`, `go-acme/lego/v4`, `libdns/*`, `gopkg.in/yaml.v3`, `gorilla/websocket`, `prometheus/client_golang`, Preact+Vite, Pebble for integration tests, GitHub Actions + GHCR.
 
-**Spec:** `docs/superpowers/specs/2026-10-28-proxypilot-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-28-doorwarden-design.md`
 
 ## Global Constraints
 
-- Module path `github.com/ajthom90/proxypilot`; license Apache-2.0; images `ghcr.io/ajthom90/proxypilot`, multi-arch amd64+arm64, CGO off.
+- Module path `github.com/ajthom90/doorwarden`; license Apache-2.0; images `ghcr.io/ajthom90/doorwarden`, multi-arch amd64+arm64, CGO off.
 - Nothing environment-specific in the repo: tests/fixtures/docs use `example.test`, `*.example.test` and RFC 5737 addresses (192.0.2.0/24, 198.51.100.0/24); never the author's domains, IPs or email.
 - Default ACME issuer is Let's Encrypt **staging**; global dry-run is available and defaults off but is honored by every executor.
 - Renew when ≤30 days remain; DNS grace period before record deletion defaults to 24h; TrueNAS poll interval 30s.
-- proxypilot only modifies/deletes DNS records recorded in its `dns_records` ownership table.
+- doorwarden only modifies/deletes DNS records recorded in its `dns_records` ownership table.
 - Container stop/restart never removes DNS records, routes or certs.
-- Cert/key files mode 0600 (dirs 0700); secrets AES-256-GCM at rest with master key from `PROXYPILOT_MASTER_KEY`; secrets never logged.
+- Cert/key files mode 0600 (dirs 0700); secrets AES-256-GCM at rest with master key from `DOORWARDEN_MASTER_KEY`; secrets never logged.
 - Config validation: wildcard cert ⇒ DNS-01; `unifi` cannot be a challenge provider; `wildcard` record mode requires provider capability `WildcardA`.
 - Traefik v3, file provider only; Traefik ACME never used.
 - TrueNAS API: JSON-RPC 2.0 over WebSocket at `/api/current` with API-key auth; REST not used.
@@ -40,12 +40,12 @@
 
 ### Task 1: Skeleton, license, CI test job
 
-**Files:** Create `go.mod`, `LICENSE`, `cmd/proxypilot/main.go`, `.github/workflows/ci.yml`, `.gitignore`, `Makefile`.
+**Files:** Create `go.mod`, `LICENSE`, `cmd/doorwarden/main.go`, `.github/workflows/ci.yml`, `.gitignore`, `Makefile`.
 
 **Interfaces:** Produces `main()` calling `app.Run(ctx, args []string) error` (stub until Task 9).
 
-- [ ] **Step 1:** `go mod init github.com/ajthom90/proxypilot`; add Apache-2.0 `LICENSE`; `.gitignore` excludes `data/`, `*.key`, `.env`.
-- [ ] **Step 2:** Test `TestMainVersionFlag` in `cmd/proxypilot/main_test.go` runs `run([]string{"--version"})` and asserts output contains `proxypilot`. Run: FAIL (undefined).
+- [ ] **Step 1:** `go mod init github.com/ajthom90/doorwarden`; add Apache-2.0 `LICENSE`; `.gitignore` excludes `data/`, `*.key`, `.env`.
+- [ ] **Step 2:** Test `TestMainVersionFlag` in `cmd/doorwarden/main_test.go` runs `run([]string{"--version"})` and asserts output contains `doorwarden`. Run: FAIL (undefined).
 - [ ] **Step 3:** Implement `run(args []string, out io.Writer) int`. CI workflow runs `go vet ./... && go test ./... -race` on push/PR.
 - [ ] **Step 4:** `go test ./...` PASS. Commit `chore: project skeleton`.
 
@@ -102,9 +102,9 @@ func Hostname(svc Service, zones []string, defaultZone string) (string, error)
 
 **Files:** Create `internal/source/source.go` (interface), `internal/source/docker/docker.go`, test with fake Docker HTTP server.
 
-**Interfaces:** Produces `type Source interface{ Name() string; List(ctx) ([]model.Service, error) }`; docker impl reads labels `proxypilot.enable|name|port|scheme|zone|skip-verify|websockets|middlewares`, connects to `tcp://socket-proxy:2375` or unix path (configurable). Backend host = container name on shared network if configured, else `target_ip` + published port. Returns `ErrSourceUnavailable` (typed) when the daemon is unreachable.
+**Interfaces:** Produces `type Source interface{ Name() string; List(ctx) ([]model.Service, error) }`; docker impl reads labels `doorwarden.enable|name|port|scheme|zone|skip-verify|websockets|middlewares`, connects to `tcp://socket-proxy:2375` or unix path (configurable). Backend host = container name on shared network if configured, else `target_ip` + published port. Returns `ErrSourceUnavailable` (typed) when the daemon is unreachable.
 
-- [ ] Tests: opt-in only when `proxypilot.enable=true`; defaults (name = container name slug, port = single exposed port, error if ambiguous); stopped container remains listed with state `stopped` (never dropped); daemon down → `ErrSourceUnavailable`. Implement; commit.
+- [ ] Tests: opt-in only when `doorwarden.enable=true`; defaults (name = container name slug, port = single exposed port, error if ambiguous); stopped container remains listed with state `stopped` (never dropped); daemon down → `ErrSourceUnavailable`. Implement; commit.
 
 ### Task 7: TrueNAS source
 
@@ -112,7 +112,7 @@ func Hostname(svc Service, zones []string, defaultZone string) (string, error)
 
 **Interfaces:** Produces `NewClient(url string, apiKey secrets.Secret, insecureTLS bool)`; `Call(ctx, method string, params ...any) (json.RawMessage, error)`; source `List` calls `app.query`, maps `name,state,portals` → Services with `Backend.Host=target_ip`, port parsed from portal URL (host `0.0.0.0` ignored); empty portals fall back to a `PortLookup` interface (Docker published ports by `ix-<app>-` prefix); `state != RUNNING` → `stopped`.
 
-- [ ] **Step 1 (spike, first):** against the real box (`https://<truenas-host>:9463`, key `<truenas-api-key-file>`, TLS verify off, read-only `core.ping`, `system.version`, `app.query`) record the auth handshake (`auth.login_with_api_key`) and one sanitized `app.query` response into `testdata/app_query.json` (replace names/ports with `example` values before commit).
+- [ ] **Step 1 (spike, first):** against a real TrueNAS box (URL and API-key file path supplied by the operator at run time, never committed; TLS verify off, read-only `core.ping`, `system.version`, `app.query`) record the auth handshake (`auth.login_with_api_key`) and one sanitized `app.query` response into `testdata/app_query.json` (replace names/ports with `example` values before commit).
 - [ ] Tests: portal `http://0.0.0.0:30088/` → port 30088 host target_ip; `https` portals set scheme; two portals → first "Web UI" wins; empty portals + lookup hit/miss (`error: no port`); API down → `ErrSourceUnavailable`. Implement; commit.
 
 ### Task 8: Static source and approval gate
@@ -196,7 +196,7 @@ type Executor interface{ Apply(ctx, []Action, dryRun bool) error }
 
 **Files:** `internal/notify/{webhook,ntfy,smtp}.go`, `internal/metrics/metrics.go`, tests.
 
-- [ ] Tests with `httptest`/fake SMTP: payload shape, retry once, no secrets in payload, expiry-warning dedupe (one per cert per threshold). Metrics: `proxypilot_services{state}`, `proxypilot_cert_expiry_seconds{zone}`, `proxypilot_reconcile_total{result}`, `proxypilot_dns_ops_total{provider,op}`. Commit.
+- [ ] Tests with `httptest`/fake SMTP: payload shape, retry once, no secrets in payload, expiry-warning dedupe (one per cert per threshold). Metrics: `doorwarden_services{state}`, `doorwarden_cert_expiry_seconds{zone}`, `doorwarden_reconcile_total{result}`, `doorwarden_dns_ops_total{provider,op}`. Commit.
 
 ### Task 19: Orchestrator (`app.Run`), health, dry-run
 
@@ -220,7 +220,7 @@ type Executor interface{ Apply(ctx, []Action, dryRun bool) error }
 
 ### Task 22: NPM importer and verify script
 
-**Files:** `internal/importer/npm/npm.go`, `cmd/proxypilot/import_npm.go`, `scripts/verify.sh`, tests with a synthetic NPM sqlite.
+**Files:** `internal/importer/npm/npm.go`, `cmd/doorwarden/import_npm.go`, `scripts/verify.sh`, tests with a synthetic NPM sqlite.
 
 - [ ] Tests: classifies auto/label/static by matching host:port against discovered services; flags custom nginx config, access lists, streams, non-wildcard certs, off-box upstreams; hostname-based upstreams resolved/flagged; never writes to the NPM DB (opened `mode=ro` on a copy). `verify.sh <hostlist>` curls each host with `--resolve`, prints status, issuer, SANs, days-to-expiry; exits non-zero on any failure. Commit.
 
@@ -228,7 +228,7 @@ type Executor interface{ Apply(ctx, []Action, dryRun bool) error }
 
 **Files:** `Dockerfile`, `deploy/compose.truenas.yml`, `deploy/traefik/traefik.yml`, `docs/{README,labels,providers,cert-troubleshooting,migration,rollback}.md`, `.github/workflows/release.yml`.
 
-- [ ] Compose: proxypilot + `traefik:v3` (80→443 redirect, file provider on shared volume, no ACME) + docker-socket-proxy (read-only). Docs: "install it, nothing else", label reference, "add a DNS provider" (one file + `all.go` import + conformance test), staging→production flow, rollback (stop Traefik, start NPM; keep NPM ≥ 1 week). Release workflow: buildx amd64+arm64 to GHCR on tag. Test: `docker build` succeeds and container passes `/healthz`. Commit.
+- [ ] Compose: doorwarden + `traefik:v3` (80→443 redirect, file provider on shared volume, no ACME) + docker-socket-proxy (read-only). Docs: "install it, nothing else", label reference, "add a DNS provider" (one file + `all.go` import + conformance test), staging→production flow, rollback (stop Traefik, start NPM; keep NPM ≥ 1 week). Release workflow: buildx amd64+arm64 to GHCR on tag. Test: `docker build` succeeds and container passes `/healthz`. Commit.
 
 ### Task 24: Live cutover on the author's NAS (manual, gated)
 

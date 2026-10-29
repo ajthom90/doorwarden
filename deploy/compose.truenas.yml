@@ -1,0 +1,118 @@
+# Doorwarden + Traefik + allowlisting Docker socket proxy.
+# Paste into a TrueNAS Custom App (YAML) or run with `docker compose`.
+# Paths are relative to this file; on TrueNAS replace them with dataset paths
+# (host path volumes), e.g. /mnt/<pool>/apps/doorwarden/...
+#
+# Layout expected next to this file:
+#   config/doorwarden.yaml   Doorwarden config
+#   data/                    SQLite state
+#   certs/                   certificates (Doorwarden rw, Traefik ro)
+#   traefik-dynamic/         file-provider output written by Doorwarden
+#   traefik/traefik.yml      static config (deploy/traefik/traefik.yml)
+#
+# One-time init (doorwarden and traefik both run as UID/GID 65532 so
+# Doorwarden's 0600 key files stay readable by Traefik without loosening
+# their permissions):
+#   mkdir -p data certs traefik-dynamic
+#   chown -R 65532:65532 ./data ./traefik-dynamic ./certs
+
+name: doorwarden
+
+services:
+  doorwarden:
+    image: ghcr.io/ajthom90/doorwarden:${DOORWARDEN_TAG:?set DOORWARDEN_TAG to a release version, e.g. 1.0.0}
+    restart: unless-stopped
+    # Shutdown waits up to ~10s for HTTP and ~30s for running ACME orders;
+    # Docker's default of 10s would kill it mid-order.
+    stop_grace_period: 45s
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      DOORWARDEN_MASTER_KEY: ${DOORWARDEN_MASTER_KEY:?set DOORWARDEN_MASTER_KEY}
+      TRUENAS_API_KEY: ${TRUENAS_API_KEY:-}
+      DNS_API_TOKEN: ${DNS_API_TOKEN:-}
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+      - ./certs:/data/certs
+      - ./traefik-dynamic:/etc/traefik/dynamic:rw
+    networks:
+      - default   # outbound: DNS provider APIs, ACME, TrueNAS API
+      - socket    # internal-only path to the Docker socket proxy
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/doorwarden", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  traefik:
+    image: traefik:v3.5
+    restart: unless-stopped
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    # If the host's net.ipv4.ip_unprivileged_port_start is not 0, binding
+    # :80/:443 as non-root fails: uncomment (see docs/deploy.md).
+    # cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-80}:80"
+      - "${TRAEFIK_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik-dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro   # certificates written by Doorwarden
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # Allowlist proxy in front of the Docker socket. Doorwarden's Docker source
+  # makes exactly one call: GET /containers/json?all=1. The proxy permits
+  # only that (path-only match, auto-anchored by the proxy; every other
+  # method or path gets 403/405) and only from the doorwarden container.
+  #
+  # The :ro on the socket mount does NOT restrict API calls (a read-only bind
+  # of a unix socket can still be written to). The allowlist is what protects.
+  # The socket is root-equivalent for whoever can reach an allowed endpoint,
+  # so keep this proxy off every network except the isolated one below.
+  # Allowlist changes must be explicit (see docs/deploy.md).
+  docker-socket-proxy:
+    image: wollomatic/socket-proxy:1.13.2
+    restart: unless-stopped
+    # Must be able to open the socket: set DOCKER_GID to the group owning
+    # /var/run/docker.sock on the host.
+    user: "65534:${DOCKER_GID:-999}"
+    command:
+      - "-listenip=0.0.0.0"          # container-internal; no ports published
+      - "-allowfrom=doorwarden"      # only the doorwarden service (by name)
+      - "-allowGET=^/containers/json$$"   # $$ is compose's escape for a literal $
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket
+    # No ports. Doorwarden's docker source host: tcp://docker-socket-proxy:2375
+
+networks:
+  default: {}
+  socket:
+    internal: true

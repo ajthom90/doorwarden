@@ -1,0 +1,13 @@
+.git
+.github
+bin
+docs
+deploy
+*.md
+!THIRD_PARTY_NOTICES.md
+**/*_test.go
+.env
+.superpowers
+*.key
+*.pem
+**/.env*

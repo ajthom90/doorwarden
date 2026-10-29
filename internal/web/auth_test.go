@@ -1,0 +1,483 @@
+package web
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ajthom90/doorwarden/internal/config"
+)
+
+// Everything but /healthz and the login/setup/status endpoints needs auth,
+// /metrics and SSE included; unknown paths are 401, not 404. The embedded
+// UI's exact files ("/" among them) are public; see ui_test.go.
+func TestUnauthenticated401(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.anon()
+	for _, p := range []string{"/api/v1/services", "/api/v1/config", "/metrics", "/api/v1/events",
+		"/api/v1/activity", "/api/v1/auth/me", "/api/v1/nope", "/nope", "/index.html/", "/js/", "/healthz/../api/v1/services"} {
+		if w := c.do("GET", p, nil); w.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s = %d", p, w.Code)
+		}
+	}
+	if w := c.do("POST", "/api/v1/settings/dry-run", map[string]bool{"enabled": true}); w.Code != http.StatusUnauthorized {
+		t.Errorf("POST dry-run = %d", w.Code)
+	}
+	if w := c.do("GET", "/healthz", nil); w.Code != 200 {
+		t.Errorf("healthz = %d", w.Code)
+	}
+	w := c.do("GET", "/api/v1/auth/status", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"setup_required":true`) {
+		t.Errorf("status = %d %s", w.Code, w.Body)
+	}
+	// Security headers on every response, even errors.
+	w = c.do("GET", "/api/v1/services", nil)
+	for k, v := range map[string]string{"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"} {
+		if w.Header().Get(k) != v {
+			t.Errorf("%s = %q", k, w.Header().Get(k))
+		}
+	}
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") || !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Errorf("CSP = %q", csp)
+	}
+}
+
+func TestFirstRunSetup(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.anon()
+	// Wrong or missing token.
+	for _, tok := range []string{"", "wrong", testToken + "x"} {
+		w := c.do("POST", "/api/v1/auth/setup", map[string]string{"username": "admin", "password": testPassword, "token": tok})
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("token %q: %d %s", tok, w.Code, w.Body)
+		}
+	}
+	// Weak password.
+	if w := c.do("POST", "/api/v1/auth/setup", map[string]string{"username": "admin", "password": "short", "token": testToken}); w.Code != http.StatusBadRequest {
+		t.Fatalf("short password: %d", w.Code)
+	}
+	admin := e.setupAdmin()
+	if w := admin.do("GET", "/api/v1/auth/me", nil); w.Code != 200 || !strings.Contains(w.Body.String(), `"user":"admin"`) {
+		t.Fatalf("me = %d %s", w.Code, w.Body)
+	}
+	// Second setup fails: an admin exists.
+	w := e.anon().do("POST", "/api/v1/auth/setup", map[string]string{"username": "evil", "password": testPassword, "token": testToken})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("second setup = %d", w.Code)
+	}
+	a, _, _ := e.st.GetAdmin(context.Background())
+	if a.Username != "admin" || strings.Contains(a.PasswordHash, testPassword) {
+		t.Fatalf("admin = %+v", a)
+	}
+	if strings.Contains(e.logBuf.String(), testPassword) {
+		t.Fatal("password in log")
+	}
+}
+
+// Two concurrent setups create exactly one admin.
+func TestFirstRunRace(t *testing.T) {
+	e := newTestEnv(t)
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := e.anon().do("POST", "/api/v1/auth/setup", map[string]string{"username": []string{"a", "b"}[i], "password": testPassword, "token": testToken})
+			codes[i] = w.Code
+		}()
+	}
+	wg.Wait()
+	ok, conflict := 0, 0
+	for _, c := range codes {
+		switch c {
+		case 200:
+			ok++
+		case http.StatusConflict, http.StatusForbidden:
+			conflict++
+		}
+	}
+	if ok != 1 || conflict != 1 {
+		t.Fatalf("codes = %v", codes)
+	}
+}
+
+// With an admin present at start no setup token is generated and setup
+// is closed.
+func TestSetupTokenLoggedOnlyWithoutAdmin(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) { o.SetupToken = "" })
+	if !strings.Contains(e.logBuf.String(), "setup token") {
+		t.Fatalf("no setup token logged: %s", e.logBuf)
+	}
+	tok := e.srv.auth.setupTokenForTest()
+	if len(tok) < 20 || !strings.Contains(e.logBuf.String(), tok) {
+		t.Fatalf("token %q not in log", tok)
+	}
+	h, _ := e.srv.auth.hasher.Hash(testPassword)
+	_ = e.st.CreateAdmin(context.Background(), "admin", h, time.Now())
+	buf := &syncBuf{}
+	e2 := newTestEnv(t, func(o *Options) {
+		o.SetupToken = ""
+		o.Store = e.st
+		o.Log = slogTo(buf)
+	})
+	if strings.Contains(buf.String(), "setup token") || e2.srv.auth.setupTokenForTest() != "" {
+		t.Fatalf("setup token generated with an admin present: %s", buf)
+	}
+}
+
+func TestLoginLogoutAndFixation(t *testing.T) {
+	e := newTestEnv(t)
+	first := e.setupAdmin()
+	// Login with an existing session cookie rotates it (no fixation) and
+	// the old one stops working.
+	c := &client{e: e, cookie: first.cookie}
+	old := first.cookie.Value
+	w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword})
+	if w.Code != 200 || c.cookie == nil || c.cookie.Value == old {
+		t.Fatalf("login: %d cookie=%v", w.Code, c.cookie)
+	}
+	ck := c.cookie
+	if !ck.HttpOnly || !ck.Secure || ck.SameSite != http.SameSiteStrictMode || ck.Path != "/" {
+		t.Fatalf("cookie flags: %+v", ck)
+	}
+	if w := first.do("GET", "/api/v1/services", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("old session still valid: %d", w.Code)
+	}
+	var resp struct {
+		CSRF string `json:"csrf_token"`
+	}
+	decodeJSONT(t, w, &resp)
+	c.csrf = resp.CSRF
+	if w := c.do("GET", "/api/v1/services", nil); w.Code != 200 {
+		t.Fatalf("new session: %d", w.Code)
+	}
+	saved := *c.cookie
+	if w := c.do("POST", "/api/v1/auth/logout", nil); w.Code != 200 {
+		t.Fatalf("logout: %d %s", w.Code, w.Body)
+	}
+	// Replaying the old cookie after logout fails: invalidated server side.
+	replay := &client{e: e, cookie: &saved, csrf: c.csrf}
+	if w := replay.do("GET", "/api/v1/services", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("session valid after logout: %d", w.Code)
+	}
+}
+
+func TestLoginNoEnumerationAndLockout(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	_, w1 := e.login("admin", "wrong-password-xyz")
+	_, w2 := e.login("nobody", "wrong-password-xyz")
+	if w1.Code != http.StatusUnauthorized || w2.Code != http.StatusUnauthorized || w1.Body.String() != w2.Body.String() {
+		t.Fatalf("enumeration: %d %q vs %d %q", w1.Code, w1.Body, w2.Code, w2.Body)
+	}
+	for i := 0; i < pairThreshold-1; i++ {
+		e.login("admin", "wrong-password-xyz")
+	}
+	// The (admin, address) pair is locked: even the right password is
+	// refused from there.
+	_, w := e.login("admin", testPassword)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("not locked out: %d", w.Code)
+	}
+	// From another, clean address the administrator gets in.
+	c := e.anon()
+	c.remote = "203.0.113.9:1"
+	if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != 200 {
+		t.Fatalf("clean address refused: %d", w.Code)
+	}
+	e.advance(limiterBase + time.Second)
+	if _, w := e.login("admin", testPassword); w.Code != 200 {
+		t.Fatalf("after backoff: %d %s", w.Code, w.Body)
+	}
+	if strings.Contains(e.logBuf.String(), "wrong-password-xyz") || strings.Contains(e.logBuf.String(), testPassword) {
+		t.Fatal("password logged")
+	}
+}
+
+// One address spraying user names is backed off for all names after
+// ipThreshold failures.
+func TestLoginAddressSprayBackoff(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	for i := range ipThreshold {
+		e.login(fmt.Sprintf("user%d", i), "wrong-password-xyz")
+	}
+	if _, w := e.login("someone-else", "wrong-password-xyz"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("spraying address not backed off: %d", w.Code)
+	}
+}
+
+func TestSessionExpiry(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	e.advance(e.cfg.Web.SessionIdle - time.Minute)
+	if w := c.do("GET", "/api/v1/services", nil); w.Code != 200 {
+		t.Fatalf("active session: %d", w.Code)
+	}
+	e.advance(e.cfg.Web.SessionIdle + time.Minute)
+	if w := c.do("GET", "/api/v1/services", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("idle session: %d", w.Code)
+	}
+	// Absolute expiry even when used.
+	c2, _ := e.login("admin", testPassword)
+	for i := 0; i < 30; i++ {
+		e.advance(e.cfg.Web.SessionMax / 25)
+		c2.do("GET", "/api/v1/services", nil)
+	}
+	if w := c2.do("GET", "/api/v1/services", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("session past max age: %d", w.Code)
+	}
+}
+
+func TestCSRFAndOrigin(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	body := map[string]bool{"enabled": true}
+	if w := c.do("POST", "/api/v1/settings/dry-run", body, noCSRF()); w.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF: %d", w.Code)
+	}
+	if w := c.do("POST", "/api/v1/settings/dry-run", body, withHeader(CSRFHeader, "wrong")); w.Code != http.StatusForbidden {
+		t.Fatalf("wrong CSRF: %d", w.Code)
+	}
+	for _, o := range []string{"https://evil.example", "null", "https://dw.example.test.evil.example"} {
+		if w := c.do("POST", "/api/v1/settings/dry-run", body, withHeader("Origin", o)); w.Code != http.StatusForbidden {
+			t.Fatalf("origin %s: %d", o, w.Code)
+		}
+	}
+	if w := c.do("POST", "/api/v1/settings/dry-run", body, withHeader("Sec-Fetch-Site", "cross-site")); w.Code != http.StatusForbidden {
+		t.Fatalf("cross-site fetch: %d", w.Code)
+	}
+	// Login is checked for Origin too (login CSRF).
+	if w := e.anon().do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword},
+		withHeader("Origin", "https://evil.example")); w.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin login: %d", w.Code)
+	}
+	// A form post (not JSON) is refused.
+	if w := c.do("POST", "/api/v1/settings/dry-run", "enabled=true", withHeader("Content-Type", "application/x-www-form-urlencoded")); w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("form post: %d", w.Code)
+	}
+	// Same origin (scheme may differ behind a TLS proxy) works.
+	if w := c.do("POST", "/api/v1/settings/dry-run", body, withHeader("Origin", "https://dw.example.test")); w.Code != 200 {
+		t.Fatalf("same origin: %d %s", w.Code, w.Body)
+	}
+	if !e.ctl.dry {
+		t.Fatal("dry run not set")
+	}
+}
+
+func TestAllowedOrigins(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) {
+		o.Config.Web.AllowedOrigins = []string{"https://ui.example.test"}
+	})
+	c := e.setupAdmin()
+	if w := c.do("POST", "/api/v1/settings/dry-run", map[string]bool{"enabled": true}, withHeader("Origin", "https://ui.example.test")); w.Code != 200 {
+		t.Fatalf("allowed origin: %d", w.Code)
+	}
+}
+
+func TestTrustedHeader(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	// From an untrusted peer the header is ignored (and X-Forwarded-For
+	// does not make it trusted).
+	c := e.anon()
+	for _, opts := range [][]reqOpt{
+		{withHeader("X-Auth-User", "mallory")},
+		{withHeader("X-Auth-User", "mallory"), withHeader("X-Forwarded-For", "192.0.2.100")},
+		{withHeader("X-Auth-User", "mallory"), withHeader("X-Real-Ip", "192.0.2.100")},
+	} {
+		if w := c.do("GET", "/api/v1/services", nil, opts...); w.Code != http.StatusUnauthorized {
+			t.Fatalf("spoofed header accepted: %d", w.Code)
+		}
+	}
+	// From the trusted proxy it authenticates with the configured role.
+	p := e.anon()
+	p.remote = "192.0.2.100:40000"
+	w := p.do("GET", "/api/v1/auth/me", nil, withHeader("X-Auth-User", "alice"))
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"user":"alice"`) || !strings.Contains(w.Body.String(), `"role":"admin"`) {
+		t.Fatalf("trusted header: %d %s", w.Code, w.Body)
+	}
+	var me struct {
+		CSRF string `json:"csrf_token"`
+	}
+	decodeJSONT(t, w, &me)
+	// State changes need its CSRF token like a session.
+	if w := p.do("POST", "/api/v1/settings/dry-run", map[string]bool{"enabled": true}, withHeader("X-Auth-User", "alice")); w.Code != http.StatusForbidden {
+		t.Fatalf("header auth without CSRF: %d", w.Code)
+	}
+	if w := p.do("POST", "/api/v1/settings/dry-run", map[string]bool{"enabled": true}, withHeader("X-Auth-User", "alice"), withHeader(CSRFHeader, me.CSRF)); w.Code != 200 {
+		t.Fatalf("header auth with CSRF: %d %s", w.Code, w.Body)
+	}
+	// The audit entry names the header identity.
+	act, _ := e.st.ListActivity(context.Background(), 10)
+	found := false
+	for _, a := range act {
+		if strings.Contains(a.Message, "header:alice") && strings.Contains(a.Message, "dry") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no audit entry: %+v", act)
+	}
+	// Trusted peer without the header: no auth.
+	if w := p.do("GET", "/api/v1/services", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("trusted peer without header: %d", w.Code)
+	}
+}
+
+func TestTrustedHeaderViewerReadOnly(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) { o.Config.Web.TrustedHeader.Role = "viewer" })
+	p := e.anon()
+	p.remote = "192.0.2.100:1"
+	w := p.do("GET", "/api/v1/auth/me", nil, withHeader("X-Auth-User", "bob"))
+	var me struct {
+		CSRF string `json:"csrf_token"`
+	}
+	decodeJSONT(t, w, &me)
+	if w := p.do("GET", "/api/v1/services", nil, withHeader("X-Auth-User", "bob")); w.Code != 200 {
+		t.Fatalf("viewer read: %d", w.Code)
+	}
+	if w := p.do("POST", "/api/v1/settings/dry-run", map[string]bool{"enabled": true}, withHeader("X-Auth-User", "bob"), withHeader(CSRFHeader, me.CSRF)); w.Code != http.StatusForbidden {
+		t.Fatalf("viewer write: %d", w.Code)
+	}
+	if w := p.do("GET", "/api/v1/config", nil, withHeader("X-Auth-User", "bob")); w.Code != http.StatusForbidden {
+		t.Fatalf("viewer config read: %d", w.Code)
+	}
+}
+
+// Empty proxies turns trusted-header auth off entirely.
+func TestTrustedHeaderOff(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) {
+		o.Config.Web.TrustedHeader = config.TrustedHeader{UserHeader: "X-Auth-User", Role: "admin"}
+	})
+	p := e.anon()
+	p.remote = "192.0.2.100:1"
+	if w := p.do("GET", "/api/v1/services", nil, withHeader("X-Auth-User", "alice")); w.Code != http.StatusUnauthorized {
+		t.Fatalf("header honoured with no proxies: %d", w.Code)
+	}
+}
+
+func TestPasswordChangeInvalidatesSessions(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	other, _ := e.login("admin", testPassword)
+	if w := c.do("POST", "/api/v1/auth/password", map[string]string{"current": "nope-nope-nope", "new": "another-long-password"}); w.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong current: %d", w.Code)
+	}
+	if w := c.do("POST", "/api/v1/auth/password", map[string]string{"current": testPassword, "new": "another-long-password"}); w.Code != 200 {
+		t.Fatalf("change: %d %s", w.Code, w.Body)
+	}
+	if w := other.do("GET", "/api/v1/services", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("other session survived: %d", w.Code)
+	}
+	if _, w := e.login("admin", "another-long-password"); w.Code != 200 {
+		t.Fatalf("new password: %d", w.Code)
+	}
+}
+
+// A password change that commits between a login's password check and its
+// session insert wins: the login mints no session and answers the generic
+// 401 (the old password must not yield a session).
+func TestLoginRacesPasswordChange(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	ctx := context.Background()
+	e.srv.auth.afterVerify = func() {
+		adm, _, _ := e.st.GetAdmin(ctx)
+		h, _ := e.srv.auth.hasher.Hash("an-entirely-new-password")
+		if _, err := e.st.ChangeAdminPassword(ctx, h, adm.Generation); err != nil {
+			t.Error(err)
+		}
+	}
+	c := e.anon()
+	w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("login racing a password change = %d %s", w.Code, w.Body)
+	}
+	if c.cookie != nil {
+		t.Fatalf("stale login set a cookie: %v", c.cookie)
+	}
+	if strings.Contains(w.Body.String(), "csrf") {
+		t.Fatalf("stale login body: %s", w.Body)
+	}
+}
+
+// Two password changes racing: the one whose verified generation is stale
+// is refused (409) and leaves no session behind.
+func TestPasswordChangeRace(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.setupAdmin()
+	ctx := context.Background()
+	e.srv.auth.afterVerify = func() {
+		adm, _, _ := e.st.GetAdmin(ctx)
+		h, _ := e.srv.auth.hasher.Hash("winner-password-123")
+		if _, err := e.st.ChangeAdminPassword(ctx, h, adm.Generation); err != nil {
+			t.Error(err)
+		}
+	}
+	w := c.do("POST", "/api/v1/auth/password", map[string]string{"current": testPassword, "new": "loser-password-1234"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("stale password change = %d %s", w.Code, w.Body)
+	}
+	e.srv.auth.afterVerify = nil
+	adm, _, _ := e.st.GetAdmin(ctx)
+	if !e.srv.auth.hasher.Verify(adm.PasswordHash, "winner-password-123") {
+		t.Fatal("the losing change overwrote the winner")
+	}
+	if w := c.do("GET", "/api/v1/auth/me", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("session after a concurrent password change = %d", w.Code)
+	}
+}
+
+func withCtx(ctx context.Context) reqOpt {
+	return func(r *http.Request) { *r = *r.WithContext(ctx) }
+}
+
+// Fix round 2: a login whose client disconnects (during the delay or the
+// hashing queue) is a failure for its source, so dropping connections
+// cannot drain the clean budget for free.
+func TestLoginDisconnectCountsAsFailure(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	lim := e.srv.auth.lim
+	c := e.anon()
+	c.remote = "203.0.113.30:1"
+	// Empty bucket: the attempt is delayed, and the client hangs up then.
+	lim.bucket(lim.login, "admin", e.clock()).tokens = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	e.srv.auth.sleep = func(context.Context, time.Duration) { cancel() }
+	c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}, withCtx(ctx))
+	if pe := lim.login.pairs["admin\x00203.0.113.30"]; pe == nil || pe.fails != 1 {
+		t.Fatalf("abandoned login not recorded: %+v", pe)
+	}
+	// Now dirty: it cannot spend the clean reserve; a clean source can.
+	e.srv.auth.sleep = func(context.Context, time.Duration) {}
+	lim.bucket(lim.login, "admin", e.clock()).tokens = cleanReserve
+	if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("dirty source spent the clean reserve: %d", w.Code)
+	}
+	if _, w := e.login("admin", testPassword); w.Code != 200 {
+		t.Fatalf("clean login refused: %d", w.Code)
+	}
+}
+
+// POST /setup after setup is done answers 409 without charging the limiter.
+func TestSetupDoneNoCharge(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	c := e.anon()
+	c.remote = "203.0.113.31:1"
+	for range 50 {
+		if w := c.do("POST", "/api/v1/auth/setup", map[string]string{"username": "admin", "password": testPassword, "token": "x"}); w.Code != http.StatusConflict {
+			t.Fatalf("setup after done = %d", w.Code)
+		}
+	}
+	if n := len(e.srv.auth.lim.setup.buckets) + len(e.srv.auth.lim.setup.pairs); n != 0 {
+		t.Fatalf("finished setup charged the limiter (%d entries)", n)
+	}
+}
