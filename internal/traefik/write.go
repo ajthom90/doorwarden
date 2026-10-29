@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // fileNameRe is the only shape of file name Write creates: no separators,
@@ -26,8 +27,9 @@ var fileNameRe = regexp.MustCompile(`^doorwarden-[a-z0-9]+(-[a-z0-9]+)*\.yml$`)
 //     WriteMode with 0640 and a shared group), rename over the target. A symlink at the target is replaced
 //     by the rename; its target is never written.
 //   - A file whose current content is byte-identical is not rewritten, so its
-//     mtime is kept and Traefik does not reload; its permissions are
-//     corrected in place when they differ.
+//     mtime is kept and Traefik does not reload. A file with the wrong
+//     permissions is rewritten through the same temp + rename (never
+//     chmod by path), so it gets the configured mode.
 //   - Stale owned files are removed: regular files in dir named
 //     "doorwarden-*.yml" or "doorwarden-*.yaml" whose content starts with
 //     Header and that are not in files. Nothing else in dir is touched.
@@ -133,23 +135,24 @@ func ownedFile(p string) (bool, error) {
 	return string(buf) == Header, nil
 }
 
+// afterLstat is a test seam to simulate a target swapped after the Lstat.
+var afterLstat = func(string) {}
+
 func writeIfChanged(dir, name string, content []byte, mode os.FileMode) (bool, error) {
 	target := filepath.Join(dir, name)
 	fi, err := os.Lstat(target)
+	afterLstat(target)
 	switch {
 	case err == nil && fi.Mode().IsRegular():
-		cur, err := os.ReadFile(target)
+		same, err := sameRegular(target, fi, content, mode)
 		if err != nil {
 			return false, fmt.Errorf("traefik: read %s: %w", name, err)
 		}
-		if bytes.Equal(cur, content) {
-			if fi.Mode().Perm() != mode {
-				if err := os.Chmod(target, mode); err != nil {
-					return false, fmt.Errorf("traefik: chmod %s: %w", name, err)
-				}
-			}
+		if same {
 			return false, nil
 		}
+		// different content or mode: rewritten through temp + rename below
+		// (never chmod by path, which could follow a swapped-in symlink)
 	case err == nil && fi.Mode()&fs.ModeSymlink != 0:
 		// replaced by the rename below; the link target is never opened
 	case err == nil:
@@ -187,6 +190,36 @@ func writeIfChanged(dir, name string, content []byte, mode os.FileMode) (bool, e
 	}
 	ok = true
 	return true, nil
+}
+
+// sameRegular reports whether target, opened without following a symlink
+// and still the regular file fi described, has exactly content and mode. A
+// target that changed in between (swapped for a symlink or another file)
+// reports false, so it is replaced by the rename.
+func sameRegular(target string, fi os.FileInfo, content []byte, mode os.FileMode) (bool, error) {
+	f, err := os.OpenFile(target, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	cur, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !cur.Mode().IsRegular() || !os.SameFile(fi, cur) {
+		return false, nil
+	}
+	if cur.Mode().Perm() != mode || cur.Size() != int64(len(content)) {
+		return false, nil
+	}
+	b, err := io.ReadAll(io.LimitReader(f, int64(len(content))+1))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(b, content), nil
 }
 
 // syncDir makes renames and removals durable; best effort (not every
