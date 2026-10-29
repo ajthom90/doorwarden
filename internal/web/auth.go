@@ -36,10 +36,12 @@ package web
 // setups exactly one wins. Localhost binding was rejected: in a container
 // behind Traefik every request comes from the proxy.
 //
-// Login throttling: per client IP and per user name (see throttle); a
-// locked key answers 429 with Retry-After without checking the password.
-// Unknown users cost the same argon2 work as the real one, and every
-// failure has the same body.
+// Login limiting: see limiter.go (per user+address backoff, per address
+// backoff, a per-user global rate that only ever delays clean addresses).
+// A refused attempt answers 429 with Retry-After without checking the
+// password. Unknown users cost the same argon2 work as the real one, and
+// every failure has the same body. The client address is clientIP (see
+// web.trusted_proxies).
 
 import (
 	"context"
@@ -121,7 +123,9 @@ type auth struct {
 	hasher  *Hasher
 	now     func() time.Time
 	log     *slog.Logger
-	thr     *throttle
+	lim     *limiter
+	// sleep waits out a limiter delay (sleepCtx; replaced in tests).
+	sleep   func(ctx context.Context, d time.Duration)
 	hdrKey  []byte
 	origins map[string]bool
 
@@ -142,7 +146,7 @@ type auth struct {
 }
 
 func newAuth(ctx context.Context, st *store.Store, cfg config.Web, hasher *Hasher, now func() time.Time, log *slog.Logger, setupToken string) (*auth, error) {
-	a := &auth{st: st, cfg: cfg, hasher: hasher, now: now, log: log, thr: newThrottle(now),
+	a := &auth{st: st, cfg: cfg, hasher: hasher, now: now, log: log, lim: newLimiter(now), sleep: sleepCtx,
 		header: http.CanonicalHeaderKey(cfg.TrustedHeader.UserHeader), origins: map[string]bool{}}
 	for _, p := range cfg.TrustedHeader.Proxies {
 		pf, err := netip.ParsePrefix(p)
@@ -173,7 +177,7 @@ func newAuth(ctx context.Context, st *store.Store, cfg config.Web, hasher *Hashe
 		return nil, err
 	}
 	if exists {
-		a.thr.pin(userThrottleKey(adm.Username))
+		a.lim.observeGeneration(adm.Generation)
 	}
 	if !exists {
 		if setupToken == "" {
@@ -317,11 +321,6 @@ func (a *auth) watchUnsetProxies(r *http.Request, peer netip.Addr) {
 	if a.peerSeen == singlePeerSample && !peer.IsLoopback() {
 		a.log.Warn("every request so far came from one address with web.trusted_proxies unset; if that is a reverse proxy, set web.trusted_proxies to its network", "peer", peer.String())
 	}
-}
-
-// clientKey is the per-address throttle key of r.
-func (a *auth) clientKey(r *http.Request) string {
-	return "ip:" + a.clientIP(r).String()
 }
 
 func validIdentity(s string) bool {
@@ -516,9 +515,12 @@ func validUsername(u string) bool {
 	return true
 }
 
-// userThrottleKey is the throttle key of a user name.
-func userThrottleKey(name string) string {
-	return "user:" + strings.ToLower(truncate(name, maxUsernameLen))
+// limitUser is the limiter's name for a submitted user name.
+func limitUser(name string) string {
+	if name == "" {
+		name = "\x00empty" // "" is the setup scope
+	}
+	return strings.ToLower(truncate(name, maxUsernameLen))
 }
 
 func passwordProblem(pw string) string {
@@ -537,26 +539,25 @@ type throttledError struct{ retry time.Duration }
 
 func (e throttledError) Error() string { return "throttled" }
 
-func (a *auth) refusal(keys ...string) error {
-	for _, k := range keys {
-		if ok, retry := a.thr.allowed(k); !ok {
-			return throttledError{retry}
-		}
-	}
-	return nil
-}
-
 func writeThrottled(w http.ResponseWriter, retry time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(int(retry/time.Second)+1))
 	writeErr(w, http.StatusTooManyRequests, "too many failed attempts; try again later")
 }
 
-func (a *auth) locked(w http.ResponseWriter, keys ...string) bool {
-	if err := a.refusal(keys...); err != nil {
+// beginAttempt reserves a password attempt for user from r's client
+// address and waits out any delay; on refusal it answers 429 and returns
+// nil.
+func (a *auth) beginAttempt(w http.ResponseWriter, r *http.Request, user string) *attempt {
+	at, err := a.lim.begin(user, a.clientIP(r).String())
+	if err != nil {
 		writeThrottled(w, err.(throttledError).retry)
-		return true
+		return nil
 	}
-	return false
+	if at.delay > 0 {
+		a.sleep(r.Context(), at.delay)
+	}
+	at.undelay()
+	return at
 }
 
 // hashRefused answers a password operation that never ran: the throttle
@@ -590,23 +591,25 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := s.auth
-	ipKey := a.clientKey(r)
-	if a.locked(w, ipKey, "setup") {
+	// Per address only: wrong tokens never block setup globally.
+	at := a.beginAttempt(w, r, "")
+	if at == nil {
 		return
 	}
 	a.tokMu.Lock()
 	tok := a.setupToken
 	a.tokMu.Unlock()
 	if tok == "" {
+		at.cancel()
 		writeErr(w, http.StatusConflict, "setup is already done")
 		return
 	}
 	if req.Token == "" || subtle.ConstantTimeCompare([]byte(req.Token), []byte(tok)) != 1 {
-		a.thr.fail(ipKey)
-		a.thr.fail("setup")
+		at.done(false)
 		writeErr(w, http.StatusForbidden, "invalid setup token")
 		return
 	}
+	at.done(true)
 	if !validUsername(req.Username) {
 		writeErr(w, http.StatusBadRequest, "username must be 1-64 characters of letters, digits and . _ - @")
 		return
@@ -635,8 +638,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	a.tokMu.Lock()
 	a.setupToken = ""
 	a.tokMu.Unlock()
-	a.thr.success(ipKey)
-	a.thr.pin(userThrottleKey(req.Username))
+	a.lim.observeGeneration(0)
 	csrf, err := a.newSession(w, r, req.Username, 0)
 	if err != nil {
 		s.internal(w, "setup session", err)
@@ -655,18 +657,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := s.auth
-	ipKey := a.clientKey(r)
-	userKey := userThrottleKey(req.Username)
-	if a.locked(w, ipKey, userKey) {
-		return
-	}
 	adm, exists, err := s.st.GetAdmin(r.Context())
 	if err != nil {
 		s.internal(w, "login", err)
 		return
 	}
+	if exists {
+		a.lim.observeGeneration(adm.Generation) // unlock/reset clears limits
+	}
+	at := a.beginAttempt(w, r, limitUser(req.Username))
+	if at == nil {
+		return
+	}
 	ok := false
-	recheck := func() error { return a.refusal(ipKey, userKey) }
+	recheck := at.recheck
 	if exists && len(req.Username) == len(adm.Username) &&
 		subtle.ConstantTimeCompare([]byte(req.Username), []byte(adm.Username)) == 1 {
 		ok, err = a.hasher.VerifyContext(r.Context(), adm.PasswordHash, req.Password, recheck)
@@ -674,21 +678,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		err = a.hasher.VerifyDummyContext(r.Context(), req.Password, recheck)
 	}
 	if err != nil {
+		at.cancel()
 		hashRefused(w, err)
 		return
 	}
+	at.done(ok)
 	if !ok {
-		a.thr.fail(ipKey)
-		a.thr.fail(userKey)
-		a.log.Warn("login failed", "client", ipKey)
+		a.log.Warn("login failed", "client", a.clientIP(r).String())
 		writeErr(w, http.StatusUnauthorized, "invalid user name or password")
 		return
 	}
 	if a.afterVerify != nil {
 		a.afterVerify()
 	}
-	a.thr.success(ipKey)
-	a.thr.success(userKey)
 	csrf, err := a.newSession(w, r, adm.Username, adm.Generation)
 	if errors.Is(err, store.ErrStaleCredentials) {
 		// The password changed after it was read: the old password must not
@@ -743,22 +745,24 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := s.auth
-	userKey := userThrottleKey(p.User)
-	if a.locked(w, userKey) {
-		return
-	}
 	adm, ok, err := s.st.GetAdmin(r.Context())
 	if err != nil || !ok {
 		s.internal(w, "password", err)
 		return
 	}
-	match, err := a.hasher.VerifyContext(r.Context(), adm.PasswordHash, req.Current, func() error { return a.refusal(userKey) })
+	a.lim.observeGeneration(adm.Generation)
+	at := a.beginAttempt(w, r, limitUser(p.User))
+	if at == nil {
+		return
+	}
+	match, err := a.hasher.VerifyContext(r.Context(), adm.PasswordHash, req.Current, at.recheck)
 	if err != nil {
+		at.cancel()
 		hashRefused(w, err)
 		return
 	}
+	at.done(match)
 	if !match {
-		a.thr.fail(userKey)
 		writeErr(w, http.StatusUnauthorized, "current password is wrong")
 		return
 	}

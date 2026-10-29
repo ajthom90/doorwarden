@@ -174,37 +174,40 @@ func TestLoginNoEnumerationAndLockout(t *testing.T) {
 	if w1.Code != http.StatusUnauthorized || w2.Code != http.StatusUnauthorized || w1.Body.String() != w2.Body.String() {
 		t.Fatalf("enumeration: %d %q vs %d %q", w1.Code, w1.Body, w2.Code, w2.Body)
 	}
-	for i := 0; i < throttleThreshold; i++ {
-		e.login("nobody", "wrong-password-xyz")
+	for i := 0; i < pairThreshold-1; i++ {
+		e.login("admin", "wrong-password-xyz")
 	}
-	// The address is locked: even the right password is refused.
+	// The (admin, address) pair is locked: even the right password is
+	// refused from there.
 	_, w := e.login("admin", testPassword)
 	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("not locked out: %d", w.Code)
 	}
-	// The lock is per user too: failures for admin spread over addresses
-	// lock admin everywhere.
-	for i := 0; i < throttleThreshold; i++ {
-		c := e.anon()
-		c.remote = fmt.Sprintf("203.0.113.%d:1", 10+i)
-		c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": "wrong-password-xyz"})
-	}
+	// From another, clean address the administrator gets in.
 	c := e.anon()
 	c.remote = "203.0.113.9:1"
-	if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("user lock not applied from another IP: %d", w.Code)
+	if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != 200 {
+		t.Fatalf("clean address refused: %d", w.Code)
 	}
-	// Other users from a fresh address are not affected by admin's lock.
-	c.remote = "203.0.113.50:1"
-	if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "someone", "password": "wrong-password-xyz"}); w.Code != http.StatusUnauthorized {
-		t.Fatalf("unrelated login: %d", w.Code)
-	}
-	e.advance(throttleMax + time.Second)
+	e.advance(limiterBase + time.Second)
 	if _, w := e.login("admin", testPassword); w.Code != 200 {
 		t.Fatalf("after backoff: %d %s", w.Code, w.Body)
 	}
 	if strings.Contains(e.logBuf.String(), "wrong-password-xyz") || strings.Contains(e.logBuf.String(), testPassword) {
 		t.Fatal("password logged")
+	}
+}
+
+// One address spraying user names is backed off for all names after
+// ipThreshold failures.
+func TestLoginAddressSprayBackoff(t *testing.T) {
+	e := newTestEnv(t)
+	e.setupAdmin()
+	for i := range ipThreshold {
+		e.login(fmt.Sprintf("user%d", i), "wrong-password-xyz")
+	}
+	if _, w := e.login("someone-else", "wrong-password-xyz"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("spraying address not backed off: %d", w.Code)
 	}
 }
 
@@ -373,33 +376,6 @@ func TestPasswordChangeInvalidatesSessions(t *testing.T) {
 	}
 	if _, w := e.login("admin", "another-long-password"); w.Code != 200 {
 		t.Fatalf("new password: %d", w.Code)
-	}
-}
-
-// Flooding the throttle table with locked addresses does not open an
-// unthrottled path to the administrator.
-func TestLoginThrottleSaturation(t *testing.T) {
-	e := newTestEnv(t)
-	e.setupAdmin()
-	th := e.srv.auth.thr
-	th.mu.Lock()
-	th.maxKeys = 20
-	th.mu.Unlock()
-	for k := 0; k < 20; k++ {
-		for i := 0; i < throttleThreshold; i++ {
-			th.fail(fmt.Sprintf("ip:198.51.100.%d", 100+k))
-		}
-	}
-	// A new address trying the admin is refused, right password or not.
-	for i := 0; i < throttleThreshold+2; i++ {
-		c := e.anon()
-		c.remote = fmt.Sprintf("203.0.113.%d:1", 60+i)
-		if w := c.do("POST", "/api/v1/auth/login", map[string]string{"username": "admin", "password": testPassword}); w.Code != http.StatusTooManyRequests {
-			t.Fatalf("attempt %d from a new address while saturated: %d", i, w.Code)
-		}
-	}
-	if th.pinned[userThrottleKey("admin")] == nil {
-		t.Fatal("admin key not pinned")
 	}
 }
 

@@ -107,6 +107,7 @@ func TestHasherQueueBounded(t *testing.T) {
 func TestLoginBurstBounded(t *testing.T) {
 	e := newTestEnv(t)
 	e.setupAdmin()
+	e.srv.auth.sleep = func(context.Context, time.Duration) {} // limiter delays are not under test here
 	release, running := blockKDF(e.srv.auth.hasher)
 	defer release()
 	ctx, cancel := context.WithCancel(context.Background())

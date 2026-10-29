@@ -192,9 +192,14 @@ trusted-header proxy) and the event stream `/api/v1/events`.
   (`__Host-doorwarden_session`: HttpOnly, Secure, SameSite=Strict) expires
   after `web.session_idle` (8h) without use and `web.session_max` (7d) in
   all. Logout and a password change end sessions server side. Login is
-  throttled per client address and per user name: after 5 failures the key
-  is locked for 30s, doubling up to 15 minutes. Set `web.cookie_insecure:
-  true` only when the UI is served over plain HTTP on a trusted LAN.
+  throttled per (user name, client address): after 5 failures that pair
+  waits 30s, doubling up to 15 minutes; one address failing for 20 user
+  names is backed off the same way. Across all addresses a user name gets
+  about 30 attempts a minute, but that limit only refuses addresses that
+  have failed recently: an address with no failures is at most delayed a
+  few seconds, so failures from elsewhere can never lock the administrator
+  out. Set `web.cookie_insecure: true` only when the UI is served over plain
+  HTTP on a trusted LAN.
 - **Behind Traefik: set `web.trusted_proxies`.** Login throttling, audit and
   log lines use the client address. Without `web.trusted_proxies` that is
   the TCP peer, so behind Traefik every client looks like Traefik and one
