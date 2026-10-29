@@ -13,8 +13,21 @@ The host name is `<slug>.<zone>`, where the slug is the name (or its rename)
 lowercased, with every run of characters other than `a-z0-9` replaced by one
 `-`, trimmed of `-` and cut to 63 characters. `My App_2` becomes `my-app-2`.
 
-When two services claim the same host name, the higher-ranked source wins
-(static, then TrueNAS, then Docker) and the other is reported as a conflict.
+When two services claim the same host name, see
+[Host name conflicts](#host-name-conflicts).
+
+## Host name conflicts
+
+- **Different sources:** the higher-ranked source wins (static, then TrueNAS,
+  then Docker), even against a service that already holds the name. The other
+  service is reported as a conflict and gets no route.
+- **Same source:** the service that already holds the host name keeps it. A
+  newcomer from the same source that claims it (for example a second container
+  with the same `doorwarden.name`) is reported as a conflict instead of taking
+  over the route and DNS record (lands with the final-fix wave).
+
+Resolve a conflict by renaming one of the services (label, static `rename`,
+or Rename in the UI).
 
 ## Docker labels
 
@@ -40,8 +53,9 @@ with the reason in the UI; nothing is published for it.
 ### How the backend is found
 
 The container's port must be **published on the host**. Traefik reaches the
-service at `<target_ip of the default zone>:<published host port>`, not on a
-Docker network. For example:
+service at `<target_ip of its zone>:<published host port>`, not on a Docker
+network. Its zone is the one named by `doorwarden.zone`, else the default
+zone. For example:
 
 ```yaml
 services:
@@ -58,8 +72,9 @@ A running container whose chosen port is not published is in the error state
 (`no published host port`). A stopped container stays listed as stopped: its
 route and records are kept, so a restart never causes churn.
 
-Two containers with the same `doorwarden.name` are both reported and the
-conflict is resolved like any other host name conflict.
+Two containers with the same `doorwarden.name` are a
+[host name conflict](#host-name-conflicts): the one that holds the name keeps
+it.
 
 ## TrueNAS apps
 
@@ -67,7 +82,8 @@ With `sources.truenas` set, Doorwarden calls the TrueNAS JSON-RPC API
 (`app.query`, read-only) every poll interval. Each installed app becomes a
 service named after the app:
 
-- The backend is `<target_ip of the default zone>:<portal port>`. The portal
+- The backend is `<target_ip of the app's zone>:<portal port>` (TrueNAS apps
+  have no zone label, so that is the default zone). The portal
   named `Web UI` is used when present, otherwise the first portal in name
   order. The portal's host is ignored, its scheme (`http`/`https`) and port
   are used.
@@ -123,8 +139,15 @@ removes its route after the grace period.
 UI overrides are stored in the database and win over the config, which wins
 over labels. Unpublishing in the UI removes the service like a disappearance:
 route and records go after `settings.grace_period`, and publishing again
-within the grace cancels the removal. In `approve` mode, a rename or
-skip-verify change needs a new approval.
+within the grace cancels the removal.
+
+In `approve` mode an approval covers the host name, the ordered middleware
+list and the backend (scheme, host and port). When the source changes any of
+them (a new label value, a different TrueNAS portal port, a dropped auth
+middleware), the stored approval no longer applies and the service is Pending
+again until it is re-approved. An
+override an administrator sets in the UI is approved together with the change
+(lands with the final-fix wave).
 
 ## Middlewares
 

@@ -3,7 +3,9 @@
 Doorwarden uses DNS providers for two separate jobs:
 
 1. **Record providers** (`zones[].records.provider`) create the A/AAAA records
-   that point published host names at Traefik. Eight types are built in.
+   that point published host names at Traefik. Seven types are built in
+   (plus `fake`, an in-memory provider for tests and demos that keeps nothing
+   across restarts; do not use it for real zones).
 2. **ACME challenge providers** (`zones[].certificate.dns_provider`) publish the
    temporary `_acme-challenge` TXT records for DNS-01 certificate validation.
    These come from lego's catalog of about 190 providers and are configured

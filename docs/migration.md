@@ -17,8 +17,9 @@ versions; treat the ones here as examples.
 
 - DNS for your zone is managed by a provider Doorwarden supports, and you have
   an API token with DNS edit rights for that zone only.
-- Certificates: Doorwarden obtains its own via ACME. Keep NPM's certificates
-  untouched (they remain the rollback path).
+- Certificates: Doorwarden obtains its own via ACME, or imports NPM's
+  ([below](#import-npms-certificates)). Importing copies them; NPM's own files
+  stay untouched (they remain the rollback path).
 - A dataset for Doorwarden (config, data, traefik-dynamic), e.g.
   `/mnt/<pool>/apps/doorwarden/`.
 - Copy `database.sqlite` access: you only need read access to NPM's data
@@ -35,6 +36,8 @@ TRAEFIK_HTTPS_PORT=8443
 
 Deploy `deploy/compose.truenas.yml` as described in [deploy.md](deploy.md).
 Keep `settings.dry_run: true` and the staging issuer (the default) for now.
+Add the static route for Doorwarden's own UI, and use the loopback port for the
+UI while dry run is on ([deploy.md](deploy.md#first-run)).
 
 ## 2. Run the importer
 
@@ -57,16 +60,25 @@ the database kept changing or is corrupt, stop NPM briefly or copy its data
 directory while it is stopped and point `--db` at that copy.
 
 The image is distroless (no shell), so run the subcommand directly, mounting
-NPM's data volume read-only:
+NPM's data volume read-only. `--config` reads the Doorwarden config to know
+your zones, and the config's `${VAR}` placeholders must resolve: pass the same
+variables with `-env-file` (lines of `KEY=VALUE`, such as `deploy/.env`; lands
+with the final-fix wave):
 
 ```
 docker run --rm \
     -v <npm-data>:/npm:ro \
-    -v <config-dir>:/config:ro \
+    -v <dataset>/config:/config:ro \
+    -v <dataset>/.env:/run/doorwarden.env:ro \
     ghcr.io/ajthom90/doorwarden:<tag> \
     import-npm --db /npm/database.sqlite \
-    --config /config/doorwarden.yaml --discovered /config/discovered.json
+    --config /config/doorwarden.yaml -env-file /run/doorwarden.env \
+    --discovered /config/discovered.json
 ```
+
+`<npm-data>` is the host directory of NPM's `/data` volume (the one holding
+`database.sqlite`), `<dataset>` the directory with Doorwarden's `config/`.
+Without `--discovered`, leave that flag out.
 
 Add `--yaml` for the paste-ready entries. Hosts with an access list, hosts
 disabled in NPM and hosts with custom nginx config are never emitted as live
@@ -106,15 +118,43 @@ imported; handle them separately.
 Use `--yaml` to get paste-ready `static:` entries for the `static` class, and
 add them to the config.
 
-Wildcard certificates in NPM live under `letsencrypt/live/npm-<N>/` inside
-NPM's data volume; the importer lists them. A `doorwarden certs import-npm
-DIR` command to import them is planned by the ACME work (TODO: not yet
-available); until then Doorwarden issues its own.
+### Import NPM's certificates
+
+NPM keeps its Let's Encrypt certificates (including wildcard ones) under
+`live/npm-<N>/` of its `letsencrypt` volume. Importing them lets Doorwarden
+serve valid production certificates from the cutover on, without new orders;
+it renews them itself when they come due. Run it with Doorwarden stopped, as
+the Doorwarden user, with its data and certificate directories mounted (lands
+with the final-fix wave):
+
+```
+docker run --rm --user 65532:65532 \
+    -v <npm-letsencrypt>:/npm-le:ro \
+    -v <dataset>/config:/config:ro \
+    -v <dataset>/data:/data \
+    -v <dataset>/certs:/data/certs \
+    ghcr.io/ajthom90/doorwarden:<tag> \
+    certs import-npm -npm-dir /npm-le/live -dry-run
+```
+
+Mount the whole `letsencrypt` volume, not only `live/`: the files in `live/`
+are links into `archive/`. `-npm-dir` is either that `live/` directory (every
+`npm-*` directory in it is imported) or one `npm-<N>` directory. Each
+certificate is assigned to the configured zone that contains all its names.
+`-dry-run` lists what would be imported; run it again without `-dry-run` to
+import. `-db` (default `$DOORWARDEN_DB`, then `/data/doorwarden.db`) and
+`-certs-dir` (default `/data/certs`) select where it writes. NPM's files are
+only read. A staging issuer never replaces an imported production
+certificate.
 
 ## 4. Dry run, staging issuer, verify on the alternate port
 
-With `dry_run: true` review the plan Doorwarden reports. Then set
-`dry_run: false` with the **staging** issuer. Staging certificates are not
+With dry run on, review the plan on the Services page and in the activity log;
+dry run plans and logs every cycle but changes nothing, and the UI refuses
+Renew now, Switch to production and Adopt with `409 Conflict` until it is off.
+Then turn dry run off (remove `settings.dry_run: true` from the config and
+restart, or use the switch on the Settings page if the config does not set
+it), keeping the **staging** issuer. Staging certificates are not
 trusted by browsers, so verify with `--insecure` (chain checks are skipped;
 SAN and expiry are still checked):
 
@@ -129,16 +169,28 @@ targets the `websecure` entry point (port 443), not the trial's published
 NPM. Test the trial with `https://` and `--port 8443` directly, as above, not
 by following redirects. Fix every FAIL before continuing.
 
-When satisfied, switch the issuer to production, let certificates issue, and
-re-run `verify.sh` without `--insecure`: the issuer should no longer be
-STAGING and every host must pass.
+When satisfied, switch to production **from the UI**: on the Certificates
+page choose **Switch to production...** and confirm (or
+`POST /api/v1/certs/switch-production` with
+`{"issuer": "<issuer>", "confirm": true}`, which needs an administrator session
+and the CSRF header). This re-issues every staging certificate from the
+production CA. Only editing `directory: production` in the config and
+restarting does **not** re-issue existing staging certificates, so the
+cutover would still serve staging certificates. After the switch, set
+`directory: production` in the config too
+([cert-troubleshooting.md](cert-troubleshooting.md#from-staging-to-production)).
+Wait until the certificates are issued, then re-run `verify.sh` without
+`--insecure`: the issuer should no longer be STAGING and every host must
+pass.
 
 ## 5. Cutover
 
 Each step below changes TrueNAS state. Show the command/action to the
 operator and wait for confirmation before running it.
 
-1. Announce a short window. Confirm Doorwarden's plan is clean.
+1. Announce a short window. Confirm Doorwarden's plan is clean. Make sure
+   the TrueNAS web interface no longer uses 80/443 (it does by default; see
+   [deploy.md](deploy.md#layout)), and that you know the port it moved to.
 2. **Stop the NPM app** (do not delete it; keep its dataset and config).
 3. Change Traefik's published ports from 8080/8443 to 80/443 (edit
    `TRAEFIK_HTTP_PORT` / `TRAEFIK_HTTPS_PORT` in the app's environment) and
@@ -152,7 +204,7 @@ If anything is wrong, follow [rollback.md](rollback.md) immediately.
 
 ## 6. After cutover
 
-Keep NPM **stopped but intact for at least a week**. DNS records and
-certificates are untouched by stopping NPM, so rollback stays a two-step
-operation. Only after that period, and a clean renewal observation if
+Keep NPM **stopped but intact for at least a week**. Stopping NPM touches no
+DNS record or certificate, so rollback stays a short operation
+([rollback.md](rollback.md)). Only after that period, and a clean renewal observation if
 possible, consider archiving NPM.

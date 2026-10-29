@@ -46,8 +46,12 @@ Other environment variables:
 
 Subcommands: `doorwarden --version`, `doorwarden healthcheck [-url URL]
 [-timeout 3s]`, `doorwarden admin reset-password|unlock` (see
-[security.md](security.md#recovering-access)) and `doorwarden import-npm` (see
-[migration.md](migration.md)).
+[security.md](security.md#recovering-access)), `doorwarden admin secret
+set|list|delete` ([below](#secrets-and-the-master-key)),
+`doorwarden import-npm` and `doorwarden certs import-npm` (see
+[migration.md](migration.md)). In the container call the binary as
+`/doorwarden` (`docker exec <container> /doorwarden ...`); the image has no
+shell.
 
 ## Environment variable substitution
 
@@ -83,9 +87,26 @@ Put credentials in the environment and reference them with `${VAR}`; keep the
 real values in an `.env` file or the app's environment settings, never in a
 committed file.
 
-`secret:<name>` values are reserved for secrets stored encrypted in the
-database. This release has no command or API to store such a secret, so a
-`secret:` reference cannot be resolved yet: use `${VAR}`.
+Alternatively, store a credential in Doorwarden's database, sealed with the
+master key, and reference it as `secret:<name>` (lands with the final-fix
+wave). Names are 1-128 characters of `[A-Za-z0-9._-]`. `secret:` references
+work in DNS provider settings, ACME challenge provider settings and
+`sources.truenas.api_key`.
+
+```
+docker exec -it <container> /doorwarden admin secret set <name>      # prompts without echo
+docker exec -i  <container> /doorwarden admin secret set <name> < file  # or the value on stdin
+docker exec     <container> /doorwarden admin secret list               # names only, never values
+docker exec     <container> /doorwarden admin secret delete <name>
+```
+
+The value is read from standard input or a prompt, never from the command
+line or the environment. `set` refuses to overwrite an existing secret
+without `-force`. The commands use the database from `-db` (default
+`$DOORWARDEN_DB`, then `/data/doorwarden.db`) and the master key from
+`DOORWARDEN_MASTER_KEY`, both already set in the Doorwarden container.
+Restart Doorwarden after storing a secret that the config references (the
+providers are built at start-up).
 
 TLS private keys of issued certificates are files on disk (mode `0600`), not
 encrypted with the master key, because Traefik must read them.
@@ -216,15 +237,19 @@ service until an administrator approves it in the UI (or
 `POST /api/v1/services/{key}/approve`); `off` publishes nothing from the
 source and removes its existing routes after the grace period.
 
-The backend host of Docker and TrueNAS services is the `target_ip` of the
-default zone (`settings.default_zone`, or the only zone). Details in
+The backend host of a Docker or TrueNAS service is the `target_ip` of its
+zone: the zone named by its `doorwarden.zone` label, else the default zone
+(`settings.default_zone`, or the only zone). Details in
 [labels.md](labels.md).
 
 ## static
 
 A list of services you define by hand. Static entries always use approval
 `auto`. When services from different sources claim the same host name, the
-higher-ranked source wins: static, then TrueNAS, then Docker.
+higher-ranked source wins: static, then TrueNAS, then Docker (see
+[labels.md](labels.md#host-name-conflicts)). Add an entry for Doorwarden's own
+UI (`host: doorwarden`, `port: 8080`, as in the example above): nothing else
+routes to it ([deploy.md](deploy.md#first-run)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -249,7 +274,7 @@ higher-ranked source wins: static, then TrueNAS, then Docker.
 | `grace_period` | duration | `24h` | how long a service that disappeared from its source, or was unpublished, keeps its route and DNS records before they are removed (a stopped container or app is not removed) |
 | `poll_interval` | duration | `30s` | how often sources are listed and the plan is reconciled |
 | `renew_before` | duration | `720h` (30 days) | renew a certificate this long before it expires |
-| `default_zone` | zone name | the only zone | zone for services that name none |
+| `default_zone` | zone name | the only zone | zone for services that name none. **Required** when more than one zone is configured and a `docker` or `truenas` source is enabled (lands with the final-fix wave) |
 
 Durations use Go syntax (`90s`, `15m`, `24h`).
 
@@ -291,6 +316,7 @@ with, so a typo never removes authentication that was in place.
 | `tls_min_version` | `VersionTLS12` \| `VersionTLS13` | `VersionTLS12` | rendered as `tls.options.default.minVersion` |
 | `sni_strict` | bool | false | reject TLS handshakes without SNI or with an unknown name |
 | `serve_expired` | bool | false | keep serving an expired certificate when nothing valid covers its names |
+| `file_mode` | `0600` \| `0640` | `0600` | permissions of the generated dynamic files, which can contain middleware secrets (lands with the final-fix wave) |
 
 Do not define `tls.options.default` or `tls.stores.default` in another file of
 the dynamic directory; see [deploy.md](deploy.md#certificates-in-traefik).

@@ -119,9 +119,10 @@ in the database, encrypted with `DOORWARDEN_MASTER_KEY`.
 
 ## Importing existing certificates
 
-Importing existing certificates, such as Nginx Proxy Manager's wildcard
-certificate, is **not available in this release**: no command or API exposes
-it. Doorwarden issues its own certificates; keep NPM's certificates untouched
-as your rollback path ([migration.md](migration.md)). To avoid hitting
-duplicate-certificate limits during a migration, test with the staging issuer
-first.
+Nginx Proxy Manager's certificates, wildcard ones included, can be imported
+with `doorwarden certs import-npm -npm-dir <dir>` (see
+[migration.md](migration.md#import-npms-certificates)), so a cutover needs no
+new orders. NPM's files are only read and stay your rollback path. A staging
+issuer never replaces an imported production certificate. Without importing,
+test with the staging issuer first to stay clear of duplicate-certificate
+limits.
