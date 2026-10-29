@@ -18,6 +18,16 @@ func get(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRe
 	return rec
 }
 
+// getAuth is get with an authenticated principal (full body).
+func getAuth(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, &Principal{User: "admin", Role: RoleViewer}))
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
 func decode(t *testing.T, rec *httptest.ResponseRecorder) HealthStatus {
 	t.Helper()
 	var hs HealthStatus
@@ -30,7 +40,7 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder) HealthStatus {
 func TestHealthOK(t *testing.T) {
 	h := Health{Probe: func(context.Context) error { return nil },
 		Status: func() HealthStatus { return HealthStatus{Sources: map[string]bool{"docker": true}} }}
-	rec := get(t, h, http.MethodGet, "/healthz")
+	rec := getAuth(t, h, http.MethodGet, "/healthz")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code %d", rec.Code)
 	}
@@ -74,7 +84,7 @@ func TestHealthFailsWhenStoreUnusable(t *testing.T) {
 	secret := "sqlite: disk I/O error at /very/secret/path"
 	h := Health{Probe: func(context.Context) error { return errors.New(secret) },
 		Status: func() HealthStatus { return HealthStatus{} }}
-	rec := get(t, h, http.MethodGet, "/healthz")
+	rec := getAuth(t, h, http.MethodGet, "/healthz")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("code %d", rec.Code)
 	}
@@ -135,5 +145,46 @@ func TestNewMuxMountsMetricsWhenGiven(t *testing.T) {
 	mux := NewMux(MuxOptions{Health: Health{Probe: func(context.Context) error { return nil }}, Metrics: m})
 	if rec := get(t, mux, http.MethodGet, "/metrics"); rec.Code != http.StatusOK || rec.Body.String() != "m" {
 		t.Fatalf("/metrics code %d body %q", rec.Code, rec.Body.String())
+	}
+}
+
+// The public /healthz body is only status and degraded: source names,
+// dry-run state and reconcile times need an authenticated caller.
+func TestHealthPublicBodyMinimal(t *testing.T) {
+	when := time.Unix(1_800_000_000, 0)
+	h := Health{Probe: func(context.Context) error { return nil },
+		Status: func() HealthStatus {
+			return HealthStatus{DryRun: true, Sources: map[string]bool{"truenas-nas1": false}, LastReconcile: &when, LastResult: "error"}
+		}}
+	rec := get(t, h, http.MethodGet, "/healthz")
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 2 || m["status"] != "ok" || m["degraded"] != true {
+		t.Fatalf("public body = %s", rec.Body)
+	}
+
+	rec = getAuth(t, h, http.MethodGet, "/healthz")
+	hs := decode(t, rec)
+	if !hs.DryRun || hs.Store != "ok" || len(hs.Sources) != 1 || hs.LastResult != "error" {
+		t.Fatalf("authenticated body = %s", rec.Body)
+	}
+}
+
+// Through the server: anonymous callers get the minimal body, a signed-in
+// session the full one.
+func TestHealthDetailNeedsAuth(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) {
+		o.Health = Health{Probe: func(context.Context) error { return nil },
+			Status: func() HealthStatus { return HealthStatus{Sources: map[string]bool{"docker": true}} }}
+	})
+	if w := e.anon().do("GET", "/healthz", nil); strings.Contains(w.Body.String(), "docker") || w.Code != 200 {
+		t.Fatalf("anonymous healthz = %d %s", w.Code, w.Body)
+	}
+	e.setupAdmin()
+	c, _ := e.login("admin", testPassword)
+	if w := c.do("GET", "/healthz", nil); !strings.Contains(w.Body.String(), "docker") {
+		t.Fatalf("authenticated healthz = %s", w.Body)
 	}
 }
