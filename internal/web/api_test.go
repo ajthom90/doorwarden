@@ -575,3 +575,55 @@ func TestEventsHeaderStreamExpires(t *testing.T) {
 		t.Fatal("header stream outlived sseHeaderMaxAge")
 	}
 }
+
+// Logout and a password change end the affected session streams at once,
+// not at the next heartbeat.
+func TestEventsEndOnLogoutAndPasswordChange(t *testing.T) {
+	e := newTestEnv(t) // default heartbeat (25s): only invalidation ends them
+	c := e.setupAdmin()
+	stream := func(cl *client) chan struct{} {
+		r := httptest.NewRequest("GET", "http://dw.example.test/api/v1/events", nil)
+		r.RemoteAddr = "198.51.100.20:5555"
+		r.AddCookie(cl.cookie)
+		done := make(chan struct{})
+		n := e.srv.events.clientCount()
+		go func() {
+			defer close(done)
+			e.h.ServeHTTP(httptest.NewRecorder(), r)
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for e.srv.events.clientCount() == n && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return done
+	}
+	ended := func(done chan struct{}) bool {
+		select {
+		case <-done:
+			return true
+		case <-time.After(2 * time.Second):
+			return false
+		}
+	}
+	other, _ := e.login("admin", testPassword)
+	s1, s2 := stream(c), stream(other)
+	if w := c.do("POST", "/api/v1/auth/logout", nil); w.Code != 200 {
+		t.Fatalf("logout = %d", w.Code)
+	}
+	if !ended(s1) {
+		t.Fatal("stream outlived its session's logout")
+	}
+	select {
+	case <-s2:
+		t.Fatal("logout ended another session's stream")
+	default:
+	}
+	third, _ := e.login("admin", testPassword)
+	s3 := stream(third)
+	if w := third.do("POST", "/api/v1/auth/password", map[string]string{"current": testPassword, "new": "another-password-456"}); w.Code != 200 {
+		t.Fatalf("password change = %d %s", w.Code, w.Body)
+	}
+	if !ended(s2) || !ended(s3) {
+		t.Fatal("streams outlived a password change")
+	}
+}

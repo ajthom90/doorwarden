@@ -766,6 +766,9 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if p.Method == "session" {
+		s.events.endSessions(p.sessionHash)
+	}
 	s.auth.clearCookie(w)
 	s.audit(r, "logged out")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -839,6 +842,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "password set", err)
 		return
 	}
+	s.events.endSessions("") // every session was deleted with the change
 	csrf, err := a.newSession(w, r, adm.Username, gen)
 	if errors.Is(err, store.ErrStaleCredentials) {
 		a.clearCookie(w)
