@@ -343,3 +343,27 @@ func TestMergeEnvRefDestinationBinding(t *testing.T) {
 		}
 	}
 }
+
+// The editor applies the loader's document check: anchors, aliases and
+// complex keys are refused with the same message.
+func TestEditorSharesLoaderDocumentCheck(t *testing.T) {
+	old := "providers:\n  cf:\n    type: cloudflare\n    api_token: x\n"
+	for name, doc := range map[string]string{
+		"anchor":      old + "settings: &s {default_zone: example.test}\n",
+		"complex key": old + "settings:\n  ? [a]\n  : 1\n",
+	} {
+		_, err := MergeMasked([]byte(doc), []byte(old))
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+			continue
+		}
+		_, lerr := config.Parse([]byte(doc), nil)
+		if lerr == nil {
+			t.Fatalf("%s: loader accepted", name)
+		}
+		le := lerr.Error()[strings.Index(lerr.Error(), "settings"):]
+		if !strings.Contains(err.Error(), le) {
+			t.Errorf("%s: editor %q, loader %q", name, err, lerr)
+		}
+	}
+}

@@ -289,3 +289,22 @@ func TestNoTargetIPAppsAreNoZoneErrors(t *testing.T) {
 		t.Fatalf("%+v %v", out[0], s.Warnings())
 	}
 }
+
+// settings.default_zone is set but that zone has no target_ip: the error
+// names the zone instead of asking for settings.default_zone.
+func TestDefaultZoneWithoutTargetIPNamesTheZone(t *testing.T) {
+	f := newFake(t, appsJSON(appJSON("a", "RUNNING", `{"Web UI":"http://0.0.0.0:30088/"}`)))
+	s, err := New(Config{URL: f.url(), APIKey: secrets.Secret(testKey), DefaultZone: "example.test"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	out, err := s.List(context.Background())
+	if err != nil || len(out) != 1 || out[0].State != model.StateError {
+		t.Fatalf("out=%v err=%v", out, err)
+	}
+	if ws := strings.Join(s.Warnings(), "\n"); strings.Contains(ws, "set settings.default_zone") ||
+		!strings.Contains(ws, "zone example.test (the default zone) has no target_ip") {
+		t.Fatalf("warnings: %s", ws)
+	}
+}

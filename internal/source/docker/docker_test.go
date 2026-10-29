@@ -410,3 +410,23 @@ func TestUnlabelledWithoutDefaultZoneIsNoZoneError(t *testing.T) {
 		t.Fatalf("def: %+v %v", d, src.Warnings())
 	}
 }
+
+// settings.default_zone is set but that zone has no target_ip: the error
+// names the zone, not "set settings.default_zone". A labelled zone without a
+// target_ip (and no default one) is named the same way.
+func TestDefaultZoneWithoutTargetIPNamesTheZone(t *testing.T) {
+	srv := fake(t, []ctr{
+		container("def", "running", lbl("doorwarden.enable", "true"), []map[string]any{port(80, 8081)}, nil),
+		container("lan", "running", lbl("doorwarden.enable", "true", "doorwarden.zone", "lan.example.test"), []map[string]any{port(80, 8080)}, nil),
+	})
+	src := newSrc(t, srv, Config{DefaultZone: "example.test"})
+	got := list(t, src)
+	if len(got) != 2 || got[0].State != model.StateError || got[1].State != model.StateError {
+		t.Fatalf("%+v", got)
+	}
+	ws := strings.Join(src.Warnings(), "\n")
+	if strings.Contains(ws, "set settings.default_zone") ||
+		!strings.Contains(ws, "zone example.test (the default zone) has no target_ip") || !strings.Contains(ws, "zone lan.example.test has no target_ip") {
+		t.Fatalf("warnings: %s", ws)
+	}
+}
