@@ -28,6 +28,7 @@ type Config struct {
 	APIKey      secrets.Secret
 	InsecureTLS bool
 	TargetIP    string // host every backend uses; portal hosts are ignored; "" (no default zone) makes running apps errors
+	DefaultZone string // normalized settings.default_zone ("" if none), for error messages
 	Name        string // source name, default "truenas"
 }
 
@@ -40,6 +41,7 @@ type Config struct {
 type Source struct {
 	name     string
 	targetIP string
+	defZone  string
 	client   *Client
 	ports    PortLookup
 
@@ -60,7 +62,7 @@ func New(cfg Config, ports PortLookup) (*Source, error) {
 	if name == "" {
 		name = "truenas"
 	}
-	return &Source{name: name, targetIP: cfg.TargetIP, client: c, ports: ports}, nil
+	return &Source{name: name, targetIP: cfg.TargetIP, defZone: cfg.DefaultZone, client: c, ports: ports}, nil
 }
 
 // Name returns the configured source name.
@@ -269,8 +271,11 @@ func (s *Source) convert(ctx context.Context, a apiApp) (model.Service, string) 
 	}
 
 	if a.State == "RUNNING" && strings.TrimSpace(s.targetIP) == "" {
-		// Several zones and no settings.default_zone: apps cannot name a
-		// zone, so none has a zone or a backend host.
+		// No default zone with a target_ip: apps cannot name a zone, so
+		// none has a backend host.
+		if s.defZone != "" {
+			return fail(fmt.Errorf("zone %s (the default zone) has no target_ip: set its target_ip", s.defZone))
+		}
 		return fail(errors.New("no zone: set settings.default_zone"))
 	}
 	if a.State != "RUNNING" {
