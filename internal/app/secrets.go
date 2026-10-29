@@ -39,6 +39,10 @@ type SecretStore struct {
 
 var _ dns.SecretResolver = (*SecretStore)(nil)
 
+// ValidSecretName reports whether n can name a stored secret: 1-128 of
+// [A-Za-z0-9._-].
+func ValidSecretName(n string) bool { return validSecretName(n) }
+
 func validSecretName(n string) bool {
 	if n == "" || len(n) > 128 {
 		return false
