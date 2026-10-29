@@ -343,62 +343,103 @@ func (e *DNSExecutor) Apply(ctx context.Context, actions []Action, dryRun bool) 
 			errs = append(errs, fmt.Errorf("%s %s: %w", a.Kind, describe(a), err))
 		}
 	}
-	if !dryRun {
-		b.clearRecoveredAcks(ctx)
-	}
 	return errors.Join(errs...)
 }
 
-// clearRecoveredAcks deletes the mass-repair acknowledgement of every
-// provider/zone this batch listed successfully (the listing kept current by
-// the batch's own writes) whose owned rows are now missing there no more
-// than repairBreakerMinMissing times: the zone has recovered, and a later
-// mass loss trips the breaker again instead of riding on an old
-// acknowledgement. Counting every row of the pair (not only the plan's
-// eligible ones) can only keep an acknowledgement longer, never clear it
-// while the plan would still trip. Best effort, logged.
-func (b *dnsBatch) clearRecoveredAcks(ctx context.Context) {
-	e := b.e
-	if e.repairKV == nil {
+// Finish implements Finisher: MultiExecutor calls it once at the end of
+// every non-dry Apply, whether or not the plan had a DNS action. It runs the
+// repair-state sweep (at most hourly) and clearRecoveredAcks.
+func (e *DNSExecutor) Finish(ctx context.Context) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sweepRepairState(ctx)
+	e.clearRecoveredAcks(ctx)
+}
+
+// clearRecoveredAcks deletes every stored mass-repair acknowledgement of a
+// managed provider/zone whose breaker condition no longer holds: it lists
+// the zone once (one call per acknowledged pair, every spelling of its key
+// grouped), and when no more than repairBreakerMinMissing, or no more than
+// half, of the pair's ownership rows not scheduled for removal are missing
+// there, it deletes every spelling of the key. A row counts as present only
+// when the listing holds OUR record at its name and type (its provider ID,
+// or its stored value), as the plan's gather does; a foreign record there,
+// or a drifted one, counts as missing, so the acknowledgement is never
+// cleared because of records that are not ours. A failed listing keeps the
+// acknowledgement. Never called in dry run. Best effort, logged.
+func (e *DNSExecutor) clearRecoveredAcks(ctx context.Context) {
+	l, ok := e.repairKV.(repairStateLister)
+	if !ok {
 		return
 	}
-	pks := make([]string, 0, len(b.listings))
-	for pk := range b.listings {
+	kv, err := l.ListSettingsWithPrefix(ctx, store.RepairMassOKPrefix)
+	if err != nil {
+		e.log.WarnContext(ctx, "clearing mass-repair acknowledgements: listing keys failed", "error", err)
+		return
+	}
+	byPair := map[string][]string{}
+	for k := range kv {
+		p, z, ok := store.ParseRepairMassOKKey(k)
+		zn := normName(z)
+		if zc, managed := e.zones[zn]; !ok || !managed || zc.provider != p {
+			continue // the sweep removes it
+		}
+		byPair[p+"/"+zn] = append(byPair[p+"/"+zn], k)
+	}
+	pks := make([]string, 0, len(byPair))
+	for pk := range byPair {
 		pks = append(pks, pk)
 	}
 	sort.Strings(pks)
 	for _, pk := range pks {
-		l := b.listings[pk]
 		i := strings.LastIndexByte(pk, '/')
-		if l == nil || l.err != nil || i <= 0 {
+		provider, zone := pk[:i], pk[i+1:]
+		prov := e.providers[provider]
+		if prov == nil {
 			continue
 		}
-		provider, zone := pk[:i], pk[i+1:]
-		key := store.RepairMassOKKey(provider, zone)
-		if _, ok, err := e.repairKV.GetSetting(ctx, key); err != nil || !ok {
+		var recs []dns.Record
+		if err := e.call(ctx, func(c context.Context) (err error) { recs, err = prov.ListRecords(c, zone); return }); err != nil {
+			e.log.WarnContext(ctx, "clearing mass-repair acknowledgements: listing failed", "provider", provider, "zone", zone, "error", err)
 			continue
 		}
 		rows, err := e.st.ListOwnedRecords(ctx, provider, zone)
 		if err != nil {
+			e.log.WarnContext(ctx, "clearing mass-repair acknowledgements: reading ownership rows failed", "provider", provider, "zone", zone, "error", err)
 			continue
 		}
-		at := map[string]bool{}
-		for _, r := range l.recs {
-			at[normName(r.Name)+" "+normType(r.Type)] = true
-		}
-		missing := 0
+		total, missing := 0, 0
 		for _, r := range rows {
-			if !at[normName(r.Name)+" "+normType(r.Type)] {
+			if r.RemovedAfter != nil {
+				continue
+			}
+			total++
+			if !ownRecordListed(recs, r) {
 				missing++
 			}
 		}
-		if missing > repairBreakerMinMissing {
+		if missing > repairBreakerMinMissing && 2*missing > total {
 			continue
 		}
-		e.clearKV(ctx, key)
+		keys := byPair[pk]
+		sort.Strings(keys)
+		e.clearKV(ctx, keys...)
 		e.activity(ctx, "info", fmt.Sprintf("mass-repair acknowledgement of %s/%s cleared: %d of %d owned records missing there now (the breaker applies again)",
-			provider, zone, missing, len(rows)))
+			provider, zone, missing, total))
 	}
+}
+
+// ownRecordListed reports whether recs holds row r's own record: same name
+// and type, and r's provider ID or stored value.
+func ownRecordListed(recs []dns.Record, r store.DNSRecord) bool {
+	name, typ, id := normName(r.Name), normType(r.Type), strings.TrimSpace(r.ProviderRecordID)
+	for _, x := range recs {
+		if normName(x.Name) == name && normType(x.Type) == typ &&
+			((id != "" && strings.TrimSpace(x.ID) == id) || sameValue(x.Value, r.Value)) {
+			return true
+		}
+	}
+	return false
 }
 
 // DNSActionKinds are every kind the DNS executor applies. Register the DNS
@@ -1701,7 +1742,7 @@ func GatherObservedAt(ctx context.Context, providers map[string]dns.Provider, st
 		return obs, []error{fmt.Errorf("reading ownership rows: %w", err)}
 	}
 	obs.Owned = all
-	obs.RepairMassOK, err = readRepairMassOK(ctx, st)
+	obs.RepairMassOK, err = readRepairMassOK(ctx, st, now)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("reading mass-repair acknowledgements: %w", err))
 	}
@@ -1765,7 +1806,7 @@ func GatherObservedAt(ctx context.Context, providers map[string]dns.Provider, st
 
 // readRepairMassOK reads every parsable mass-repair acknowledgement from st's
 // kv (empty when st cannot list kv keys).
-func readRepairMassOK(ctx context.Context, st any) (map[string]time.Time, error) {
+func readRepairMassOK(ctx context.Context, st any, now time.Time) (map[string]time.Time, error) {
 	out := map[string]time.Time{}
 	l, ok := st.(repairStateLister)
 	if !ok {
@@ -1778,9 +1819,17 @@ func readRepairMassOK(ctx context.Context, st any) (map[string]time.Time, error)
 	for k, v := range kv {
 		p, z, ok := store.ParseRepairMassOKKey(k)
 		at, perr := time.Parse(time.RFC3339, strings.TrimSpace(v))
-		if ok && perr == nil {
-			out[p+"/"+normName(z)] = at
+		if !ok || perr != nil {
+			continue
 		}
+		// several spellings of one pair: a valid one wins, then the latest
+		pk := p + "/" + normName(z)
+		if old, seen := out[pk]; seen {
+			if ov, nv := massOKValid(old, now), massOKValid(at, now); ov && !nv || ov == nv && !at.After(old) {
+				continue
+			}
+		}
+		out[pk] = at
 	}
 	return out, nil
 }

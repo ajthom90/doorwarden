@@ -175,8 +175,7 @@ func TestDNSE2ERepairMassOKOverride(t *testing.T) {
 }
 
 // The acknowledgement lapses after 24h: the breaker holds again. (The key is
-// removed by the executor's sweep, see TestDNSExecSweepRepairMassOK; this
-// plan has no DNS action, so the executor does not run.)
+// removed by the executor's sweep, see TestDNSExecSweepRepairMassOK.)
 func TestDNSE2ERepairMassOKExpires(t *testing.T) {
 	w, desired := ackWorld(t, 12)
 	ctx := context.Background()
@@ -303,7 +302,7 @@ func TestDNSExecClearRecoveredAcks(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			name := fmt.Sprintf("s%02d.example.test", i)
 			r.addRow(t, name, "A", ip1, "gone-"+name, "docker:"+name)
-			if i < 5 {
+			if i < 4 {
 				as = append(as, repairOf(name, ip1, "gone-"+name, "docker:"+name))
 			}
 		}
@@ -313,18 +312,20 @@ func TestDNSExecClearRecoveredAcks(t *testing.T) {
 		if err := r.apply(t, false, as...); err != nil {
 			t.Fatal(err)
 		}
+		r.exec.Finish(ctx)
 		if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); !ok {
-			t.Fatal("cleared with 5 of 10 still missing")
+			t.Fatal("cleared with 6 of 10 still missing (tripped)")
 		}
-		// the next 5: none missing, cleared
+		// the other 6: none missing, cleared
 		as = nil
-		for i := 5; i < 10; i++ {
+		for i := 4; i < 10; i++ {
 			name := fmt.Sprintf("s%02d.example.test", i)
 			as = append(as, repairOf(name, ip1, "gone-"+name, "docker:"+name))
 		}
 		if err := r.apply(t, false, as...); err != nil {
 			t.Fatal(err)
 		}
+		r.exec.Finish(ctx)
 		if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); ok {
 			t.Fatal("not cleared after recovery")
 		}
@@ -339,12 +340,14 @@ func TestDNSExecClearRecoveredAcks(t *testing.T) {
 			t.Fatal(err)
 		}
 		r.fk.FailNext("ListRecords", fmt.Errorf("down"))
+		r.fk.FailNext("ListRecords", fmt.Errorf("down"))
 		_ = r.apply(t, false, repairOf("a.example.test", ip1, "gone-a", "docker:a"))
+		r.exec.Finish(ctx)
 		if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); !ok {
 			t.Fatal("cleared without a listing")
 		}
 	})
-	t.Run("no listing in the batch: kept", func(t *testing.T) {
+	t.Run("not listed in the batch: Finish lists it and clears", func(t *testing.T) {
 		r := newClockRig(t)
 		if err := r.st.SetRepairMassOK(ctx, dzp, dz, t0); err != nil {
 			t.Fatal(err)
@@ -352,6 +355,24 @@ func TestDNSExecClearRecoveredAcks(t *testing.T) {
 		if err := r.apply(t, false); err != nil {
 			t.Fatal(err)
 		}
+		if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); !ok {
+			t.Fatal("cleared by Apply without a listing")
+		}
+		r.exec.Finish(ctx)
+		if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); ok {
+			t.Fatal("not cleared by Finish")
+		}
+		if got := ops(r.fk, 0); len(got) != 1 || got[0] != "ListRecords" {
+			t.Fatalf("calls %v", got)
+		}
+	})
+	t.Run("Finish listing failed: kept", func(t *testing.T) {
+		r := newClockRig(t)
+		if err := r.st.SetRepairMassOK(ctx, dzp, dz, t0); err != nil {
+			t.Fatal(err)
+		}
+		r.fk.FailNext("ListRecords", fmt.Errorf("down"))
+		r.exec.Finish(ctx)
 		if _, ok, _ := r.st.GetSetting(ctx, store.RepairMassOKKey(dzp, dz)); !ok {
 			t.Fatal("cleared without a listing")
 		}
