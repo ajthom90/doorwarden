@@ -30,6 +30,18 @@ func (s *Store) UpsertService(ctx context.Context, v Service) error {
 	return err
 }
 
+// TouchService records that a source reported key in state at now: it
+// updates source, state and last_seen only (overrides_json and
+// removed_after are never touched); a new key is inserted with empty
+// overrides, first_seen = now and no scheduled removal.
+func (s *Store) TouchService(ctx context.Context, key, source, state string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO services (key, source, state, overrides_json, first_seen, last_seen, removed_after)
+		VALUES (?, ?, ?, '{}', ?, ?, NULL)
+		ON CONFLICT(key) DO UPDATE SET source=excluded.source, state=excluded.state, last_seen=excluded.last_seen`,
+		key, source, state, toUnix(now), toUnix(now))
+	return err
+}
+
 // ListServices returns all services ordered by key.
 func (s *Store) ListServices(ctx context.Context) ([]Service, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT key, source, state, overrides_json, first_seen, last_seen, removed_after FROM services ORDER BY key`)

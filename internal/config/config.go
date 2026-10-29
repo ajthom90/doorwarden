@@ -107,12 +107,12 @@ type Sources struct {
 type TrueNASSource struct {
 	URL      string `yaml:"url"`
 	APIKey   string `yaml:"api_key"`
-	Approval string `yaml:"approval"` // auto|approve|off
+	Approval string `yaml:"approval"` // auto|approve|off; default approve
 }
 
 type DockerSource struct {
 	Host     string `yaml:"host"`
-	Approval string `yaml:"approval"` // auto|approve|off
+	Approval string `yaml:"approval"` // auto|approve|off; default auto
 }
 
 // StaticService is a statically configured service. Without ID the service
@@ -194,6 +194,12 @@ func (c *Config) applyDefaults() {
 		c.Traefik.CertPathPrefix = "/certs"
 	}
 	c.Traefik.TraefikTLS.applyDefaults()
+	// TrueNAS apps have no opt-in of their own: an unset approval fails
+	// closed (every app waits for approval). Docker opts in per container
+	// with labels, so its unset approval stays auto.
+	if c.Sources.TrueNAS != nil && c.Sources.TrueNAS.Approval == "" {
+		c.Sources.TrueNAS.Approval = "approve"
+	}
 	if c.Settings.GracePeriod == 0 {
 		c.Settings.GracePeriod = 24 * time.Hour
 	}

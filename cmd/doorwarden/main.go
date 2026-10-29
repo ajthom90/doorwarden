@@ -29,6 +29,7 @@ func run(args []string, out io.Writer) int {
 			return 0
 		}
 	}
+	app.Version = version
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := app.Run(ctx, args); err != nil {
