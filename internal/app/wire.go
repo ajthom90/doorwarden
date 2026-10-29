@@ -74,7 +74,9 @@ func ParseFlags(args []string, env func(string) (string, bool)) (Flags, error) {
 // ACME, notifications and metrics, serve /healthz, and run the loop. On
 // cancellation it shuts down gracefully: the running cycle is aborted
 // through ctx, the HTTP server drains, sources and the notifier are closed,
-// then the store.
+// then the store. Shutdown deletes nothing: no route, DNS record,
+// certificate or Traefik file is removed (the next start resumes from the
+// persisted state; see docs/rollback.md).
 func Run(ctx context.Context, args []string) error {
 	f, err := ParseFlags(args, nil)
 	if err != nil {
@@ -213,7 +215,18 @@ func RunWith(ctx context.Context, f Flags, env func(string) (string, bool), log 
 			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn)}
 		go func() { srvErr <- srv.Serve(ln) }()
 	}
-	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers))
+	dry, dryErr := a.DryRun(ctx)
+	log.InfoContext(ctx, "doorwarden started", "version", Version, "sources", len(srcs), "dns_providers", len(providers), "dry_run", dry)
+	if dry {
+		why := "the dry-run toggle (UI/API) is on"
+		switch {
+		case cfg.Settings.DryRun:
+			why = "settings.dry_run is true in the config"
+		case dryErr != nil:
+			why = "the dry-run toggle could not be read: " + dryErr.Error()
+		}
+		log.WarnContext(ctx, "DRY RUN: no DNS record, certificate, Traefik file or route is changed; the plan is only recorded as activity", "reason", why)
+	}
 
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	loopDone := make(chan error, 1)
