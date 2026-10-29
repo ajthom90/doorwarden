@@ -27,10 +27,15 @@ func TestPlanRepairBreakerSkipNamesTheWayOut(t *testing.T) {
 	if s.Key != "repair-breaker:dnsp/example.test" || s.Key != RepairBreakerKey("dnsp", "Example.Test.") || s.Host != "example.test" {
 		t.Fatalf("skip %+v", s)
 	}
-	for _, want := range []string{"(6 of 10)", "dns/repair-mass-ok/dnsp/example.test", "POST /api/v1/dns/repair/ack",
-		`{"provider":"dnsp","zone":"example.test"}`, "INSERT OR REPLACE INTO kv", "24h", "5 per cycle"} {
+	for _, want := range []string{"(6 of 10)", "Acknowledge and allow repair", "DNS page", "POST /api/v1/dns/repair/ack",
+		`{"provider":"dnsp","zone":"example.test"}`, "24h", "5 per cycle"} {
 		if !strings.Contains(s.Reason, want) {
 			t.Fatalf("reason lacks %q: %s", want, s.Reason)
+		}
+	}
+	for _, bad := range []string{"sqlite3", "INSERT", "T20", "kv key"} {
+		if strings.Contains(s.Reason, bad) {
+			t.Fatalf("reason still has %q: %s", bad, s.Reason)
 		}
 	}
 }

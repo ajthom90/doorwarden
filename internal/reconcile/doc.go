@@ -453,10 +453,9 @@
 // operator acknowledges it once per provider/zone: kv key
 // dns/repair-mass-ok/<provider>/<zone> (store.RepairMassOKKey, zone
 // normalized) holding the acknowledgement time in RFC3339
-// (store.AcknowledgeMassRepair; the API action POST /api/v1/dns/repair/ack
-// {provider, zone} that calls it lands in T20 and does not exist before
-// it; until then, and without the API, the kv row can be written with
-// sqlite3, as the Skip says). GatherObserved reads every acknowledgement
+// (store.AcknowledgeMassRepair, called by the web UI's "Acknowledge and
+// allow repair" button on the DNS page through POST /api/v1/dns/repair/ack
+// {provider, zone}, as the Skip says). GatherObserved reads every acknowledgement
 // into Observed.RepairMassOK (keyed provider+"/"+zone, the zone normalized;
 // of several spellings of one pair's key a valid one wins, then the latest).
 // While the pair's acknowledgement is younger than RepairMassOKTTL (24h) and
