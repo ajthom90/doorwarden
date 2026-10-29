@@ -4,8 +4,9 @@ package web
 //
 // Default deny: Server wraps the whole mux. Only the paths in publicPaths
 // (exact match: /healthz, /api/v1/auth/status, /api/v1/auth/login,
-// /api/v1/auth/setup) are served without a principal; everything else,
-// /metrics, SSE and unknown paths included, answers 401 first.
+// /api/v1/auth/setup) are served without a principal, plus the embedded UI
+// files (staticPaths in ui.go: exact paths, GET/HEAD only); everything
+// else, /metrics, SSE and unknown paths included, answers 401 first.
 //
 // Principals:
 //   - Local admin: argon2id password, session cookie (random 256-bit ID,
@@ -467,7 +468,7 @@ func (a *auth) middleware(next http.Handler) http.Handler {
 			writeErr(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		public := publicPaths[r.URL.Path] && r.URL.RawPath == ""
+		public := (publicPaths[r.URL.Path] || (safeMethod(r.Method) && staticPaths[r.URL.Path])) && r.URL.RawPath == ""
 		if !safeMethod(r.Method) {
 			if !a.originOK(r) {
 				writeErr(w, http.StatusForbidden, "cross-origin request refused")

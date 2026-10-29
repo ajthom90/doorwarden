@@ -241,6 +241,7 @@ func NewServer(ctx context.Context, o Options) (*Server, error) {
 	route("GET /api/v1/config", s.adminOnly(s.handleGetConfig))
 	route("PUT /api/v1/config", s.adminOnly(s.handlePutConfig))
 	route("GET /api/v1/events", s.handleEvents)
+	mountUI(mux)
 
 	s.handler = recoverer(s.log, securityHeaders(limitBody(a.middleware(mux))))
 	return s, nil
