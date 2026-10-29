@@ -23,6 +23,21 @@
 // approved. Reapprove carries an approval over to content an administrator
 // changed through a UI override (the admin is the authority).
 //
+// Quarantine: in approve mode, a service whose stored approval no longer
+// matches its content (a backend or middleware change reported by the
+// source after it was approved) is Pending and reported in
+// Result.Quarantined; the stored approval is kept as it is. The caller
+// stops serving it while its hostname stays reserved, and an Approve of
+// the new content resumes it. A service with no stored approval is only
+// Pending. Auto mode never reads approvals, so never quarantines.
+//
+// Legacy approvals: approvals stored before the backend and the
+// middleware order were fingerprinted carry FingerprintV1. At its first
+// Resolve, a v1 approval equal to FingerprintV1 of the current content is
+// rewritten to Fingerprint (Result.Migrated; the caller records "migrated
+// approval v1->v2"); any other v1 approval is treated as changed content
+// (Pending, quarantined).
+//
 // Approve takes the fingerprint of the service the caller displayed and only
 // stores the approval if it still equals the Gate's snapshot (ErrStale
 // otherwise), so a service that changed after it was shown cannot be approved
@@ -45,6 +60,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/ajthom90/doorwarden/internal/model"
@@ -92,25 +108,57 @@ func Fingerprint(s model.Service) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// FingerprintV1 is the legacy fingerprint (before final-review H2/H3): no
+// backend host or port, middlewares sorted. Only Resolve's one-time
+// migration uses it.
+func FingerprintV1(s model.Service) string {
+	mw := append([]string{}, s.Options.Middlewares...)
+	sort.Strings(mw)
+	b, _ := json.Marshal([]any{s.Key, s.Name, s.Options.Rename, s.Zone,
+		s.Backend.Scheme, s.Backend.SkipVerify, s.Options.Websockets, mw})
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// Result is ResolveDetail's output.
+type Result struct {
+	// Services are the input services with their State decided.
+	Services []model.Service
+	// Quarantined are the Pending keys whose stored approval no longer
+	// matches their content (approve mode only).
+	Quarantined map[string]bool
+	// Migrated are the keys whose v1 approval was rewritten to v2.
+	Migrated []string
+}
+
 // Resolve returns svcs with their State decided; see the package comment.
 // Services dropped by Skip or ModeOff are not part of the snapshot, so they
 // cannot be approved.
 func (g *Gate) Resolve(ctx context.Context, mode Mode, svcs []model.Service) ([]model.Service, error) {
+	r, err := g.ResolveDetail(ctx, mode, svcs)
+	return r.Services, err
+}
+
+// ResolveDetail is Resolve that also reports quarantined and migrated keys.
+// A failed migration write leaves the service Pending (not quarantined);
+// it is retried at the next Resolve.
+func (g *Gate) ResolveDetail(ctx context.Context, mode Mode, svcs []model.Service) (Result, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if mode != ModeAuto && mode != ModeApprove && mode != ModeOff {
-		return nil, fmt.Errorf("approval: unknown mode %q", mode)
+		return Result{}, fmt.Errorf("approval: unknown mode %q", mode)
 	}
 	var approved map[string]string
 	if mode == ModeApprove {
 		var err error
 		if approved, err = g.st.ListApprovals(ctx); err != nil {
-			return nil, err // snapshot untouched
+			return Result{}, err // snapshot untouched
 		}
 	}
 	if mode == ModeOff {
-		return nil, nil
+		return Result{}, nil
 	}
+	res := Result{Quarantined: map[string]bool{}}
 	seen := map[string]string{} // key -> fingerprint; "" = not approvable
 	var out []model.Service
 	for _, s := range svcs {
@@ -125,11 +173,22 @@ func (g *Gate) Resolve(ctx context.Context, mode Mode, svcs []model.Service) ([]
 		}
 		fp := Fingerprint(s)
 		seen[s.Key] = fp
-		if mode == ModeAuto {
+		stored, has := approved[s.Key]
+		switch {
+		case mode == ModeAuto:
 			s.State = model.StatePublished
-		} else if stored, ok := approved[s.Key]; ok && stored == fp {
+		case has && stored == fp:
 			s.State = model.StatePublished
-		} else {
+		case has && stored == FingerprintV1(s):
+			s.State = model.StatePending
+			if err := g.st.SetApproval(ctx, s.Key, fp); err == nil {
+				s.State = model.StatePublished
+				res.Migrated = append(res.Migrated, s.Key)
+			}
+		case has:
+			s.State = model.StatePending
+			res.Quarantined[s.Key] = true
+		default:
 			s.State = model.StatePending
 		}
 		out = append(out, s)
@@ -141,7 +200,8 @@ func (g *Gate) Resolve(ctx context.Context, mode Mode, svcs []model.Service) ([]
 			g.snap[k] = fp
 		}
 	}
-	return out, nil
+	res.Services = out
+	return res, nil
 }
 
 // Fingerprints returns a copy of the snapshot (key -> fingerprint).
